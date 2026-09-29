@@ -115,7 +115,7 @@ CLIParser::CLIParser() {
         {"r", "ratio", true, "X[,X...]", "read/write ratios in percent; comma-separated list (GPU: whole percentages)"},
         {"", "gpu", false, "", "run the NVIDIA GPU bandwidth/latency benchmark"},
         {"", "dry-run", false, "", "detect system and print configuration without running benchmark"},
-        {"", "profile", false, "", "save bw/lat files to measuring/ directory"},
+        {"", "no-profile", false, "", "discard measurement files after the run (saved by default)"},
         {"", "folder", true, "DIR", "root output folder (default: measuring)"},
         {"v", "verbose", true, "N", "verbosity level (0-4, default: 1); also -v N or -vN"},
         {"", "version", false, "", "print version and exit"},
@@ -214,8 +214,8 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
                 return false;
             }
             point_count_flag_seen = true;
-        } else if (arg == "--profile") {
-            config.profile_output = true;
+        } else if (arg == "--no-profile") {
+            config.profile_output = false;
 
         } else if (arg == "--dry-run") {
             config.dry_run = true;
@@ -363,7 +363,7 @@ void CLIParser::print_help(const char* argv0) {
     print_usage(argv0);
 
     std::cout << "\nBasic Options:\n";
-    std::vector<std::string> basic_opts = {"ratio", "gpu", "dry-run", "profile", "folder", "verbose", "tier", "version", "help"};
+    std::vector<std::string> basic_opts = {"ratio", "gpu", "dry-run", "no-profile", "folder", "verbose", "tier", "version", "help"};
 
     for (const auto& spec : specs_) {
         if (std::find(basic_opts.begin(), basic_opts.end(), spec.long_opt) != basic_opts.end()) {
@@ -404,10 +404,10 @@ void CLIParser::print_help(const char* argv0) {
 
     std::cout << "\nExamples:\n";
     std::cout << "  " << argv0 << " --ratio=10,50,90\n";
-    std::cout << "  " << argv0 << " --profile\n";
+    std::cout << "  " << argv0 << " --no-profile\n";
     std::cout << "  " << argv0 << " --dry-run\n";
-    std::cout << "  " << argv0 << " --profile --ratio=100 --tier=lite\n";
-    std::cout << "  " << argv0 << " --gpu --profile --ratio=0,50,100 --tier=lite\n";
+    std::cout << "  " << argv0 << " --ratio=100 --tier=lite\n";
+    std::cout << "  " << argv0 << " --gpu --ratio=0,50,100 --tier=lite\n";
 }
 
 void CLIParser::print_usage(const char* argv0) {

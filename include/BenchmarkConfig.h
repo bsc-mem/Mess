@@ -142,7 +142,7 @@ struct BenchmarkConfig {
     std::string output_file;
     int verbosity = 1;
 
-    bool profile_output = false;
+    bool profile_output = true;
     bool dry_run = false;
     bool run_gpu = false;
     bool generate_multiseq = true;

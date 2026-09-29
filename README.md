@@ -344,14 +344,17 @@ The examples below use the Linux/macOS `make` build. On Windows, use
 `.\build\cmake\windows-mingw\bin\Release\mess.exe` with the same supported
 options. See [System Availability](#system-availability) for platform limits.
 
+Profiling is enabled by default: CPU and GPU runs save measurement files under
+`measuring/` (or `--folder=DIR`). Use `--no-profile` to discard them after the run.
+
 ```bash
 ./build/bin/mess --dry-run --verbose=2
 
 ./build/bin/mess
 
-./build/bin/mess --profile
+./build/bin/mess --no-profile
 
-./build/bin/mess --profile --tier=lite
+./build/bin/mess --tier=lite
 ```
 
 Common options:
@@ -363,7 +366,7 @@ Common options:
 | `--pause=N[,N...]` | Pause bubble values | `--pause=0,10,100,1000` |
 | `--tier=TIER` | Adaptive pause discovery preset (`lite/standard/detailed`) | `--tier=lite` |
 | `--point-count=N` | Custom adaptive point budget | `--point-count=75` |
-| `--profile` | Save measurement files | `--profile` |
+| `--no-profile` | Discard measurement files after the run (saved by default) | `--no-profile` |
 | `--verbose=N` | Verbosity level `0-4` | `--verbose=3` |
 | `--measurer=TYPE` | Counter backend (`auto/perf/likwid/pcm/vtune/ioreport/imc/uprof`) | `--measurer=perf` |
 | `--inst-lat` | Linux: use supported PEBS/SPE instruction sampling for latency | `--inst-lat` |
@@ -412,15 +415,15 @@ backend for every measurement.
 ### Single-Point Sanity Check
 
 ```bash
-./build/bin/mess --profile --ratio=100 --pause=0 --verbose=3 --repetitions=1
-./build/bin/mess --profile --ratio=0 --pause=0 --verbose=3 --repetitions=1
+./build/bin/mess --ratio=100 --pause=0 --verbose=3 --repetitions=1
+./build/bin/mess --ratio=0 --pause=0 --verbose=3 --repetitions=1
 ```
 
 ### Adaptive Curve Discovery
 
 ```bash
-./build/bin/mess --profile --tier=standard
-./build/bin/mess --profile --point-count=75
+./build/bin/mess --tier=standard
+./build/bin/mess --point-count=75
 ```
 
 ### Instruction-Latency Sampling
@@ -428,7 +431,7 @@ backend for every measurement.
 Linux only, on CPUs with supported PEBS/SPE sampling events:
 
 ```bash
-./build/bin/mess --profile --inst-lat --tier=lite
+./build/bin/mess --inst-lat --tier=lite
 ```
 
 ### Backend Selection
@@ -436,10 +439,10 @@ Linux only, on CPUs with supported PEBS/SPE sampling events:
 Linux examples; available backends vary by platform:
 
 ```bash
-./build/bin/mess --profile --measurer=likwid --bind=0
-./build/bin/mess --profile --measurer=pcm --bind=0
-./build/bin/mess --profile --measurer=vtune --tier=lite
-./build/bin/mess --profile --measurer=perf --add-counters=cycles,instructions
+./build/bin/mess --measurer=likwid --bind=0
+./build/bin/mess --measurer=pcm --bind=0
+./build/bin/mess --measurer=vtune --tier=lite
+./build/bin/mess --measurer=perf --add-counters=cycles,instructions
 ```
 
 ### NUMA Comparison
@@ -447,15 +450,15 @@ Linux examples; available backends vary by platform:
 Linux only, on systems with multiple memory nodes:
 
 ```bash
-./build/bin/mess --profile --bind=0 --folder=numa0
-./build/bin/mess --profile --bind=1 --folder=numa1
+./build/bin/mess --bind=0 --folder=numa0
+./build/bin/mess --bind=1 --folder=numa1
 ```
 
 ### Core-Scaling Sweep
 
 ```bash
 for c in 2 4 8 16; do
-  ./build/bin/mess --profile --total-cores=$c --folder=cores_$c
+  ./build/bin/mess --total-cores=$c --folder=cores_$c
 done
 ```
 

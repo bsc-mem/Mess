@@ -51,6 +51,7 @@ _September 29th 2026_
 
 ### Improved
 
+- **Profiling by Default**: CPU and GPU runs now save measurement files automatically. Use `--no-profile` to discard them after the run; this replaces `--profile`.
 - **Instruction-Latency Sampling**: Expanded the optional `--inst-lat` workflow for measuring latency directly from traffic-generator loads using Intel PEBS or ARM SPE on supported Linux systems, with latency statistics and percentile plots. Improved memory-source filtering for HBM and CXL measurements.
 - **ISA Tuning and Assembly Generation**:
   - Expanded scalar and vector kernel choices, including SSE2, AVX, AVX2 and AVX-512 on x86, and native/paired NEON modes on ARM.
