@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -39,8 +41,10 @@
 #include "arch/x86/counters/IntelGraniteRapidsCounters.h"
 #include "arch/x86/counters/AmdZenCounters.h"
 #include "arch/x86/counters/AmdZen4Counters.h"
+#include "arch/x86/counters/AmdZen5Counters.h"
 #include "arch/x86/X86Counters.h"
 #include "architecture/ArchitectureRegistry.h"
+#include "utils/StringUtils.h"
 #include <algorithm>
 #include <string>
 #include <cctype>
@@ -66,21 +70,14 @@ public:
 
 
 
-std::string toLower(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return result;
-}
-
-bool modelContains(const std::string& model, const std::string& token) {
-    return toLower(model).find(toLower(token)) != std::string::npos;
-}
-
 std::unique_ptr<BandwidthCounterStrategy> makeLatestIntelCounterStrategy() {
     // Keep unknown Intel fallback pinned to latest supported Intel server generation.
     // Update this helper when adding a newer Intel counter implementation.
     return std::make_unique<IntelGraniteRapidsCounters>();
+}
+
+std::unique_ptr<BandwidthCounterStrategy> makeLatestAmdCounterStrategy() {
+    return std::make_unique<AmdZen5Counters>();
 }
 
 }
@@ -97,28 +94,30 @@ std::unique_ptr<BandwidthCounterStrategy> X86Architecture::createCounterStrategy
     std::string model = caps.model_name;
     
     if (caps.vendor == CPUVendor::INTEL) {
-        if (modelContains(model, "granite") || modelContains(model, "gnr")) {
+        if (string_utils::contains_ci(model, "granite") || string_utils::contains_ci(model, "gnr")) {
             return std::make_unique<IntelGraniteRapidsCounters>();
-        } else if (modelContains(model, "emerald") || modelContains(model, "emr")) {
+        } else if (string_utils::contains_ci(model, "emerald") || string_utils::contains_ci(model, "emr")) {
             return std::make_unique<IntelEmeraldRapidsCounters>();
-        } else if (modelContains(model, "sapphire") || modelContains(model, "spr")) {
+        } else if (string_utils::contains_ci(model, "sapphire") || string_utils::contains_ci(model, "spr")) {
             return std::make_unique<IntelSPRCounters>();
-        } else if (modelContains(model, "skylake")) {
+        } else if (string_utils::contains_ci(model, "skylake")) {
             return std::make_unique<IntelSkylakeCounters>();
         }
         
         return makeLatestIntelCounterStrategy();
         
     } else if (caps.vendor == CPUVendor::AMD) {
-        if (modelContains(model, "genoa") || modelContains(model, "bergamo") || modelContains(model, "zen4") || modelContains(model, "zen 4")) {
+        if (string_utils::contains_ci(model, "turin") || string_utils::contains_ci(model, "zen5") || string_utils::contains_ci(model, "zen 5")) {
+            return std::make_unique<AmdZen5Counters>();
+        } else if (string_utils::contains_ci(model, "genoa") || string_utils::contains_ci(model, "bergamo") || string_utils::contains_ci(model, "zen4") || string_utils::contains_ci(model, "zen 4")) {
             return std::make_unique<AmdZen4Counters>();
-        } else if (modelContains(model, "milan") || modelContains(model, "rome") || modelContains(model, "zen3") || modelContains(model, "zen 3") || modelContains(model, "zen2") || modelContains(model, "zen 2")) {
+        } else if (string_utils::contains_ci(model, "milan") || string_utils::contains_ci(model, "rome") || string_utils::contains_ci(model, "zen3") || string_utils::contains_ci(model, "zen 3") || string_utils::contains_ci(model, "zen2") || string_utils::contains_ci(model, "zen 2")) {
             return std::make_unique<AmdZenCounters>();
         }
         
-        return std::make_unique<AmdZen4Counters>();
+        return makeLatestAmdCounterStrategy();
     }
-    
+
     return std::make_unique<X86Counters>();
 }
 

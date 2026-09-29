@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,16 +36,19 @@
 
 #include "Utils.h"
 #include "utils/CpuTopology.h"
+#include "utils/FileUtils.h"
+#include "utils/StringUtils.h"
 #include "utils/SubprocessCapture.h"
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <unistd.h>
-#include <sys/file.h>
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
+#include "platform/Fs.h"
+#include "platform/Sys.h"
+#include "platform/Ipc.h"
+#if defined(_WIN32)
+#include "platform/SysInfoBackend.h"
+#endif
 #ifdef __linux__
 #include <sched.h>
 #endif
@@ -55,47 +61,8 @@
 
 namespace {
 
-#ifdef __linux__
-std::string str_tolower(const std::string& s) {
-    std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return out;
-}
-#endif
-
 bool command_exists_in_path(const std::string& command) {
-    if (command.empty()) {
-        return false;
-    }
-
-    const char* path_env = std::getenv("PATH");
-    if (!path_env) {
-        return false;
-    }
-
-    std::stringstream path_stream(path_env);
-    std::string path_entry;
-    while (std::getline(path_stream, path_entry, ':')) {
-        if (path_entry.empty()) {
-            path_entry = ".";
-        }
-        std::filesystem::path candidate = std::filesystem::path(path_entry) / command;
-        if (access(candidate.c_str(), X_OK) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool read_int_file(const std::filesystem::path& file_path, int& value) {
-    std::ifstream file(file_path);
-    if (!file.is_open()) {
-        return false;
-    }
-    file >> value;
-    return file.good() || file.eof();
+    return platform::which(command).has_value();
 }
 
 #ifdef __linux__
@@ -159,6 +126,7 @@ void upsert_plotter_key(std::string& content, const std::string& key, const std:
     content += '\n';
 }
 
+#if !defined(_WIN32)
 std::map<int, CpuTopology> get_cpu_topology_from_sysfs() {
     std::map<int, CpuTopology> cpu_topo;
     std::error_code ec;
@@ -195,9 +163,9 @@ std::map<int, CpuTopology> get_cpu_topology_from_sysfs() {
         }
 
         int socket = 0;
-        read_int_file(entry.path() / "topology" / "physical_package_id", socket);
+        file_utils::read_int_file(entry.path() / "topology" / "physical_package_id", socket);
         int core_id = cpu;
-        read_int_file(entry.path() / "topology" / "core_id", core_id);
+        file_utils::read_int_file(entry.path() / "topology" / "core_id", core_id);
 
         int node = -1;
         std::error_code node_ec;
@@ -236,6 +204,7 @@ std::map<int, CpuTopology> get_cpu_topology_from_sysfs() {
 
     return cpu_topo;
 }
+#endif // !_WIN32
 
 }
 
@@ -249,48 +218,59 @@ int get_numa_node_of_cpu(int cpu) {
     return node >= 0 ? node : 0;
 }
 
-std::filesystem::path get_project_root() {
-    std::error_code ec;
-    std::filesystem::path exe_path = std::filesystem::canonical("/proc/self/exe", ec);
-    if (ec) {
-        return std::filesystem::current_path();
-    }
-    
-    std::filesystem::path p = exe_path.parent_path(); 
-    
-    if (p.filename() == "bin") {
-        p = p.parent_path(); 
-    }
-    
-    if (p.filename() == "build") {
-        p = p.parent_path(); 
-    }
-    
-    return p;
+std::filesystem::path get_executable_path() {
+    return platform::executable_path();
 }
 
-void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns) {
+std::filesystem::path get_project_root() {
+    std::filesystem::path exe_path = get_executable_path();
+    if (exe_path.empty()) {
+        return std::filesystem::current_path();
+    }
+
+    // Locate resources independently of Make/CMake configuration nesting.
+    auto p = exe_path.parent_path();
+    for (auto candidate = p; !candidate.empty(); candidate = candidate.parent_path()) {
+        if (std::filesystem::exists(candidate / "templates" / "ptr_chase_template.c"))
+            return candidate;
+        if (candidate == candidate.parent_path()) break;
+    }
+#ifdef MESS_SOURCE_ROOT
+    if (std::filesystem::exists(std::filesystem::path(MESS_SOURCE_ROOT) / "templates"))
+        return MESS_SOURCE_ROOT;
+#endif
+    // Retain the installed bin/ convention when sources are not available.
+    return p.filename() == "bin" ? p.parent_path() : p;
+}
+
+void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) {
     if (plotter_path.has_parent_path()) {
         std::filesystem::create_directories(plotter_path.parent_path());
     }
     
-    int fd = open(plotter_path.c_str(), O_RDWR | O_CREAT, 0644);
-    if (fd == -1) return;
+    platform::FileLock lock = platform::FileLock::acquire(plotter_path);
+    if (!lock.valid()) return;
 
-    if (flock(fd, LOCK_EX) == -1) {
-        close(fd);
-        return;
-    }
+    std::string content = lock.read_all();
 
-    std::string content;
-    {
-        lseek(fd, 0, SEEK_SET);
-        char buffer[4096];
-        ssize_t bytes_read;
-        while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
-            content.append(buffer, bytes_read);
+    auto remove_plotter_key = [&content](const std::string& key) {
+        const std::string prefix = key + "=";
+        size_t line_start = 0;
+        while (line_start < content.size()) {
+            size_t line_end = content.find('\n', line_start);
+            const size_t compare_len = (line_end == std::string::npos) ? (content.size() - line_start)
+                                                                       : (line_end - line_start);
+            if (content.compare(line_start, prefix.size(), prefix) == 0) {
+                const size_t erase_len = (line_end == std::string::npos) ? compare_len : compare_len + 1;
+                content.erase(line_start, erase_len);
+                continue;
+            }
+            if (line_end == std::string::npos) {
+                break;
+            }
+            line_start = line_end + 1;
         }
-    }
+    };
 
     upsert_plotter_key(content, "TLB_NS", std::to_string(tlb_ns));
     if (page_walk_lat_ns > 0.0) {
@@ -299,7 +279,16 @@ void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, 
     upsert_plotter_key(content, "CACHE_LINE_SIZE", std::to_string(cache_line_size));
     upsert_plotter_key(content, "MEMORY_BINDING", binding_type);
 
+#if defined(_WIN32)
+    upsert_plotter_key(content, "HUGEPAGES",
+                       platform::large_pages_available() ? "1" : "0");
+    upsert_plotter_key(content, "TLB_SOURCE", "default");
+#endif
+
     if (binding_type == "remote") {
+        remove_plotter_key("MEM_FREQ");
+        remove_plotter_key("N_CHANNELS");
+        remove_plotter_key("BUS_WIDTH");
         if (caps.upi_freq > 0) {
             upsert_plotter_key(content, "UPI_FREQ", std::to_string(caps.upi_freq));
             upsert_plotter_key(content, "N_DATA_LANES", std::to_string(caps.n_data_lanes));
@@ -313,21 +302,36 @@ void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, 
             upsert_plotter_key(content, "NVLINK_BW_GB_S", std::to_string(caps.nvlink_bw_gb_s));
         }
     } else {
-        upsert_plotter_key(content, "MEM_FREQ", caps.memory_frequency);
-        upsert_plotter_key(content, "N_CHANNELS", std::to_string(caps.memory_channels));
-        upsert_plotter_key(content, "BUS_WIDTH", std::to_string(caps.bus_width));
+        remove_plotter_key("UPI_FREQ");
+        remove_plotter_key("N_DATA_LANES");
+        remove_plotter_key("FLIT_BIT");
+        remove_plotter_key("DATA_FLIT_BIT");
+        remove_plotter_key("N_UPI_CHANNELS");
+        remove_plotter_key("UPI_SCALING_FACTOR");
+        remove_plotter_key("NVLINK_BW_GB_S");
+        if (gpu_caps && gpu_caps->has_gpu && !gpu_caps->gpus.empty() && gpu_caps->gpus[0].max_mem_clock_mhz > 0.0) {
+            upsert_plotter_key(content, "MEM_FREQ", std::to_string(gpu_caps->gpus[0].max_mem_clock_mhz) + " MT/s");
+            upsert_plotter_key(content, "N_CHANNELS", "2");
+            upsert_plotter_key(content, "BUS_WIDTH", std::to_string(gpu_caps->gpus[0].bus_width_bits));
+        } else {
+            upsert_plotter_key(content, "MEM_FREQ", caps.memory_frequency);
+            upsert_plotter_key(content, "N_CHANNELS", std::to_string(caps.memory_channels));
+            upsert_plotter_key(content, "BUS_WIDTH", std::to_string(caps.bus_width));
+        }
     }
 
-    lseek(fd, 0, SEEK_SET);
-    if (ftruncate(fd, 0) == 0 && !content.empty()) {
-        write(fd, content.c_str(), content.length());
-    }
-
-    flock(fd, LOCK_UN);
-    close(fd);
+    lock.replace_all(content);
 }
 
+
 std::map<int, CpuTopology> get_cpu_topology() {
+#if defined(_WIN32)
+    std::map<int, CpuTopology> win_topo;
+    for (const platform::CpuPlacement& p : platform::cpu_placements()) {
+        win_topo[p.cpu] = CpuTopology{p.numa_node, p.package, p.core_id};
+    }
+    return win_topo;
+#else
     std::map<int, CpuTopology> cpu_topo = get_cpu_topology_from_sysfs();
     if (!cpu_topo.empty()) {
         return cpu_topo;
@@ -371,6 +375,7 @@ std::map<int, CpuTopology> get_cpu_topology() {
         }
     }
     return cpu_topo;
+#endif  // _WIN32
 }
 
 bool numa_node_has_memory(int node) {
@@ -452,34 +457,11 @@ std::vector<int> select_worker_cpus(int requested_count, int reserved_cpu) {
 
     const std::map<int, CpuTopology> cpu_topo = get_cpu_topology();
 
-    std::set<int> socket0_cores;
-    for (const auto& [cpu, topo] : cpu_topo) {
-        if (topo.socket == 0) socket0_cores.insert(topo.core_id);
-    }
-    if (requested_count >= static_cast<int>(socket0_cores.size())) {
-        reserved_cpu = -1;
-    }
-
     if (!is_a64fx_system()) {
-        std::set<long long> used_cores;
-        for (const auto& [cpu, topo] : cpu_topo) {
-            if (static_cast<int>(selected.size()) >= requested_count) {
-                break;
-            }
-            if (cpu == reserved_cpu || topo.socket != 0) {
-                continue;
-            }
 
-            const long long core_key =
-                (static_cast<long long>(topo.socket) << 32) | static_cast<unsigned int>(topo.core_id);
-            if (!used_cores.insert(core_key).second) {
-                continue;
-            }
-            selected.push_back(cpu);
-        }
-
-        if (!selected.empty()) {
-            return selected;
+        if (!cpu_topo.empty()) {
+            return cpu_topology::select_workers_on_socket(
+                cpu_topo, get_allowed_cpus(), requested_count, reserved_cpu);
         }
 
         for (int cpu = 0; static_cast<int>(selected.size()) < requested_count; ++cpu) {
@@ -593,16 +575,16 @@ bool is_a64fx_system() {
             return true;
         }
 
-        std::string lower = str_tolower(line);
+        std::string lower = string_utils::to_lower(line);
         if (lower.rfind("cpu implementer", 0) == 0) {
             const size_t colon = line.find(':');
             if (colon != std::string::npos) {
-                implementer = str_tolower(line.substr(colon + 1));
+                implementer = string_utils::to_lower(line.substr(colon + 1));
             }
         } else if (lower.rfind("cpu part", 0) == 0) {
             const size_t colon = line.find(':');
             if (colon != std::string::npos) {
-                part = str_tolower(line.substr(colon + 1));
+                part = string_utils::to_lower(line.substr(colon + 1));
             }
         }
     }
@@ -641,10 +623,17 @@ void ensure_a64fx_pmu_available() {
 }
 
 int get_default_traffic_gen_cores(const system_info& info) {
+#ifdef __APPLE__
+    if (info.total_physical_cores > 1) {
+        return info.total_physical_cores - 1;
+    }
+    return (info.total_physical_cores > 0) ? info.total_physical_cores : 1;
+#endif
     int cores = (info.socket_count > 0) ? (info.sockets[0].core_count - 1) : 0;
     if (cores <= 0) {
         return cores;
     }
+
 
     if (!is_a64fx_system()) {
         return cores;
@@ -665,33 +654,12 @@ std::map<int, std::set<int>> get_socket_to_nodes_map(const std::map<int, CpuTopo
     return socket_nodes;
 }
 
+#if !defined(_WIN32)
 namespace {
-
-bool read_long_long_file(const std::filesystem::path& path, long long& value) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return false;
-    }
-    file >> value;
-    return file.good() || file.eof();
-}
-
-bool read_string_file(const std::filesystem::path& path, std::string& out) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return false;
-    }
-    std::getline(file, out);
-    // Trim trailing whitespace.
-    while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
-        out.pop_back();
-    }
-    return true;
-}
 
 bool node_has_any_cpu(int node_id) {
     std::string cpulist;
-    if (!read_string_file("/sys/devices/system/node/node" + std::to_string(node_id) + "/cpulist", cpulist)) {
+    if (!file_utils::read_string_file("/sys/devices/system/node/node" + std::to_string(node_id) + "/cpulist", cpulist)) {
         return false;
     }
     for (char c : cpulist) {
@@ -739,7 +707,7 @@ std::set<int> read_dax_target_nodes() {
             break;
         }
         long long target_node = -1;
-        if (read_long_long_file(entry.path() / "target_node", target_node) && target_node >= 0) {
+        if (file_utils::read_long_long_file(entry.path() / "target_node", target_node) && target_node >= 0) {
             dax_nodes.insert(static_cast<int>(target_node));
         }
     }
@@ -749,8 +717,8 @@ std::set<int> read_dax_target_nodes() {
 void read_hmat_metrics(int node_id, long long& read_bw_mb_s, long long& read_lat_ns) {
     const std::filesystem::path access_root =
         "/sys/devices/system/node/node" + std::to_string(node_id) + "/access0/initiators";
-    read_long_long_file(access_root / "read_bandwidth", read_bw_mb_s);
-    read_long_long_file(access_root / "read_latency", read_lat_ns);
+    file_utils::read_long_long_file(access_root / "read_bandwidth", read_bw_mb_s);
+    file_utils::read_long_long_file(access_root / "read_latency", read_lat_ns);
 }
 
 std::string refine_generation(const std::string& tier, const std::string& cpu_model) {
@@ -779,7 +747,9 @@ std::string refine_generation(const std::string& tier, const std::string& cpu_mo
             return "DDR5";
         }
         if (upper.find("EPYC") != std::string::npos) return "DDR4";
-        if (upper.find("NEOVERSE") != std::string::npos || upper.find("GRACE") != std::string::npos) {
+        if (upper.find("NEOVERSE") != std::string::npos ||
+            upper.find("GRACE") != std::string::npos
+            ) {
             return "LPDDR5X";
         }
         return "DDR";  // generic when we can't be sure
@@ -788,11 +758,32 @@ std::string refine_generation(const std::string& tier, const std::string& cpu_mo
 }
 
 }
+#endif // !_WIN32
 
 std::map<int, NumaNodeMemoryInfo> detect_numa_memory_info(const std::string& cpu_model,
                                                           bool has_onpackage_hbm) {
     std::map<int, NumaNodeMemoryInfo> nodes;
 
+#if defined(_WIN32)
+    (void)cpu_model;
+    (void)has_onpackage_hbm;
+
+    si_numa_node win_nodes[SI_MAX_NUMA_NODES];
+    const int count = platform::detect_numa_nodes(win_nodes, SI_MAX_NUMA_NODES);
+    for (int i = 0; i < count; ++i) {
+        NumaNodeMemoryInfo info;
+        info.id = win_nodes[i].id;
+        info.mem_total_bytes = win_nodes[i].mem_total_bytes;
+        info.has_cpus = win_nodes[i].has_cpus != 0;
+        info.is_dax_backed = false;
+        info.read_bandwidth_mb_s = 0;
+        info.read_latency_ns = 0;
+        info.memory_type = win_nodes[i].memory_type;
+        if (info.memory_type.empty()) info.memory_type = "UNKNOWN";
+        nodes[info.id] = info;
+    }
+    return nodes;
+#else
     std::error_code ec;
     const std::filesystem::path node_root("/sys/devices/system/node");
     if (!std::filesystem::exists(node_root, ec)) {
@@ -847,7 +838,17 @@ std::map<int, NumaNodeMemoryInfo> detect_numa_memory_info(const std::string& cpu
         if (kv.second.read_bandwidth_mb_s > 0) {
             bw_samples.push_back(kv.second.read_bandwidth_mb_s);
             max_bw = std::max(max_bw, kv.second.read_bandwidth_mb_s);
-            if (min_bw_nonzero == 0 || kv.second.read_bandwidth_mb_s < min_bw_nonzero) {
+            if (!kv.second.is_dax_backed) {
+                if (min_bw_nonzero == 0 || kv.second.read_bandwidth_mb_s < min_bw_nonzero) {
+                    min_bw_nonzero = kv.second.read_bandwidth_mb_s;
+                }
+            }
+        }
+    }
+    if (min_bw_nonzero == 0) {
+        for (const auto& kv : nodes) {
+            if (kv.second.read_bandwidth_mb_s > 0 &&
+                (min_bw_nonzero == 0 || kv.second.read_bandwidth_mb_s < min_bw_nonzero)) {
                 min_bw_nonzero = kv.second.read_bandwidth_mb_s;
             }
         }
@@ -881,6 +882,8 @@ std::map<int, NumaNodeMemoryInfo> detect_numa_memory_info(const std::string& cpu
 
             if (high_latency) {
                 tier = (info.read_latency_ns > 250) ? "PMEM" : "CXL";
+            } else if (info.is_dax_backed && !dax_hbm_shape) {
+                tier = "CXL";
             } else if (ratio >= hbm_ratio_threshold || dax_hbm_shape || hbm_bandwidth_shape) {
                 tier = "HBM";
             } else {
@@ -916,6 +919,7 @@ std::map<int, NumaNodeMemoryInfo> detect_numa_memory_info(const std::string& cpu
     }
 
     return nodes;
+#endif // _WIN32
 }
 
 bool memory_type_matches(const std::string& memory_type, const std::string& family) {
@@ -987,7 +991,9 @@ bool numa_nodes_target_cxl_or_pmem(const std::map<int, NumaNodeMemoryInfo>& numa
 
 
 uint64_t calculate_traffic_gen_array_size(uint64_t l3_size_bytes) {
-    // TODO: This might need improving to ensure a minimum size, like we used to do with the previous formula
+    if (l3_size_bytes == 0) {
+        return (512ULL * 1024ULL * 1024ULL) / sizeof(double);
+    }
     return (l3_size_bytes * 4) / sizeof(double);
 }
 

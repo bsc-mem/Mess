@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,16 +36,28 @@
 
 #include "SystemDetection.h"
 #include "SystemInfo.h"
+#include "utils/SubprocessCapture.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 #include <string>
 #include <cctype>
+#include <regex>
+#include <iomanip>
+#include <unordered_map>
+#include <memory>
 #include <cstdlib>
 #include <limits>
-#include <sys/utsname.h>
+#if !defined(_WIN32)
+#include <sys/utsname.h>   // uname() fallback; guarded, see detect()
+#endif
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
@@ -72,6 +87,100 @@ namespace {
         std::stringstream buffer;
         buffer << file.rdbuf();
         return buffer.str();
+    }
+
+    int detect_apple_gpu_cores() {
+#ifdef __APPLE__
+        FILE* pipe = popen("/usr/sbin/ioreg -r -c IOGPU -d 1 2>/dev/null", "r");
+        if (!pipe) return 0;
+        char line[512];
+        while (std::fgets(line, sizeof(line), pipe)) {
+            const char* key = std::strstr(line, "\"gpu-core-count\"");
+            if (key) {
+                int cores = 0;
+                std::sscanf(key, "\"gpu-core-count\" = %d", &cores);
+                pclose(pipe);
+                return cores;
+            }
+        }
+        pclose(pipe);
+#endif
+        return 0;
+    }
+
+#ifdef __linux__
+    std::string normalize_device_tree_string(std::string value) {
+        std::replace(value.begin(), value.end(), '\0', ' ');
+
+        auto not_space = [](unsigned char c) { return !std::isspace(c); };
+        auto begin = std::find_if(value.begin(), value.end(), not_space);
+        auto end = std::find_if(value.rbegin(), value.rend(), not_space).base();
+        if (begin >= end) {
+            return "";
+        }
+
+        value = std::string(begin, end);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        return value;
+    }
+
+    bool file_exists(const std::string& path) {
+        return access(path.c_str(), F_OK) == 0;
+    }
+#endif
+
+    bool probe_nvidia_scf_pmu() {
+#ifdef __linux__
+        for (int i = 0; i < 64; ++i) {
+            const std::string pmu_path =
+                "/sys/bus/event_source/devices/nvidia_scf_pmu_" + std::to_string(i);
+            if (file_exists(pmu_path + "/type") || file_exists(pmu_path)) {
+                return true;
+            }
+        }
+#endif
+        return false;
+    }
+
+
+    NvidiaPlatformInfo detect_nvidia_platform_info() {
+        NvidiaPlatformInfo info;
+
+#ifdef __linux__
+        info.model = normalize_device_tree_string(read_file("/proc/device-tree/model"));
+        if (info.model.empty()) {
+            info.model = normalize_device_tree_string(read_file("/sys/firmware/devicetree/base/model"));
+        }
+
+        info.compatible = normalize_device_tree_string(read_file("/proc/device-tree/compatible"));
+        if (info.compatible.empty()) {
+            info.compatible = normalize_device_tree_string(read_file("/sys/firmware/devicetree/base/compatible"));
+        }
+
+#endif
+
+        info.has_nvidia_scf_pmu = probe_nvidia_scf_pmu();
+        return info;
+    }
+
+    bool looks_like_grace_core(const std::string& model) {
+        std::string upper = model;
+        std::transform(upper.begin(), upper.end(), upper.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        return upper.find("NEOVERSE-V2") != std::string::npos ||
+               upper.find("NEOVERSE V2") != std::string::npos ||
+               upper.find("GRACE") != std::string::npos;
+    }
+
+
+    void apply_nvidia_platform_identity(system_info& sys_info,
+                                        const NvidiaPlatformInfo& platform) {
+
+        if (platform.has_nvidia_scf_pmu && looks_like_grace_core(sys_info.cpu_model)) {
+            std::snprintf(sys_info.cpu_vendor, sizeof(sys_info.cpu_vendor), "NVIDIA");
+            std::snprintf(sys_info.cpu_model, sizeof(sys_info.cpu_model), "Grace (Neoverse-V2)");
+        }
     }
 
     bool parse_first_uint64(const std::string& text, uint64_t& out) {
@@ -123,13 +232,43 @@ namespace {
         }
     }
 
+    int count_cpu_list_entries(const std::string& list) {
+        int count = 0;
+        std::stringstream stream(list);
+        std::string range;
+
+        while (std::getline(stream, range, ',')) {
+            size_t dash = range.find('-');
+            try {
+                if (dash == std::string::npos) {
+                    if (range.find_first_of("0123456789") != std::string::npos) ++count;
+                } else {
+                    int first = std::stoi(range.substr(0, dash));
+                    int last = std::stoi(range.substr(dash + 1));
+                    if (last >= first) count += last - first + 1;
+                }
+            } catch (...) {
+                continue;
+            }
+        }
+
+        return count;
+    }
+
     /**
      * @brief Parses the sysfs interface to determine the CPU cache size for a given level.
-     * 
+     *
      * Iterates through `/sys/devices/system/cpu/cpu0/cache/index*` to find the cache
      * matching the requested level (e.g., 1 for L1, 2 for L2). When found, it reads
      * the `size` file, converting strings (e.g., "32K", "1M") into exact byte values.
-     * 
+     *
+     * For the LLC the reported value is scaled up to the whole socket. Chiplet CPUs
+     * (AMD Zen CCDs) expose one L3 instance per chiplet, and sysfs reports the size of
+     * that single slice, so a 12-CCD EPYC otherwise looks like it has 32 MB of L3
+     * instead of 384 MB. The slice count comes from the CPUs in the socket divided by
+     * the CPUs sharing this cache. Lower levels are per-core/per-cluster by definition
+     * and are returned untouched.
+     *
      * @param level The cache level to detect (1, 2, or 3).
      * @return size_t The size of the cache in bytes, or 0 if not found.
      */
@@ -151,7 +290,21 @@ namespace {
                 std::string size_content = read_file(base + "/size");
                 if (!size_content.empty()) {
                     size_t size = parse_size_with_unit(size_content);
-                    if (size > 0) return size;
+                    if (size > 0) {
+                        if (level < 3) return size;
+
+                        std::string package_cpus = read_file("/sys/devices/system/cpu/cpu0/topology/package_cpus_list");
+                        if (package_cpus.empty()) {
+                            package_cpus = read_file("/sys/devices/system/cpu/cpu0/topology/core_siblings_list");
+                        }
+
+                        const int cpus_per_slice = count_cpu_list_entries(read_file(base + "/shared_cpu_list"));
+                        const int cpus_per_socket = count_cpu_list_entries(package_cpus);
+                        if (cpus_per_slice > 0 && cpus_per_socket > cpus_per_slice) {
+                            size *= static_cast<size_t>(cpus_per_socket / cpus_per_slice);
+                        }
+                        return size;
+                    }
                 }
             }
         }
@@ -179,17 +332,65 @@ namespace {
 #ifdef __APPLE__
 #include <sys/sysctl.h>
     size_t detect_cache_size_macos(int level) {
-        std::string name;
-        if (level == 1) name = "hw.l1dcachesize";
-        else if (level == 2) name = "hw.l2cachesize";
-        else if (level == 3) name = "hw.l3cachesize";
-        else return 0;
-
-        uint64_t size = 0;
-        size_t len = sizeof(size);
-        if (sysctlbyname(name.c_str(), &size, &len, nullptr, 0) == 0) {
-            return static_cast<size_t>(size);
+        if (level == 1) {
+            uint64_t size = 0;
+            size_t len = sizeof(size);
+            if (sysctlbyname("hw.l1dcachesize", &size, &len, nullptr, 0) == 0) {
+                return static_cast<size_t>(size);
+            }
+            return 0;
         }
+
+        if (level == 2) {
+            uint64_t size = 0;
+            size_t len = sizeof(size);
+            if (sysctlbyname("hw.perflevel0.l2cachesize", &size, &len, nullptr, 0) == 0 && size > 0) {
+                return static_cast<size_t>(size);
+            }
+            if (sysctlbyname("hw.l2cachesize", &size, &len, nullptr, 0) == 0) {
+                return static_cast<size_t>(size);
+            }
+            return 0;
+        }
+
+        if (level == 3) {
+            uint64_t size = 0;
+            size_t len = sizeof(size);
+            if (sysctlbyname("hw.l3cachesize", &size, &len, nullptr, 0) == 0 && size > 0) {
+                return static_cast<size_t>(size);
+            }
+
+            char brand[256] = {};
+            size_t blen = sizeof(brand);
+            if (sysctlbyname("machdep.cpu.brand_string", brand, &blen, nullptr, 0) == 0) {
+                std::string s(brand);
+                bool is_ultra  = s.find("Ultra")  != std::string::npos;
+                bool is_max    = s.find("Max")    != std::string::npos;
+                bool is_pro    = s.find("Pro")    != std::string::npos;
+                bool is_m1     = s.find("M1")     != std::string::npos;
+                bool is_m2     = s.find("M2")     != std::string::npos;
+                bool is_m3     = s.find("M3")     != std::string::npos;
+                bool is_m4     = s.find("M4")     != std::string::npos;
+                bool is_m5     = s.find("M5")     != std::string::npos;
+                bool is_m6     = s.find("M6")     != std::string::npos;
+
+                if (is_ultra) {
+                    return 96ULL * 1000 * 1000;
+                }
+                if (is_max) {
+                    return 48ULL * 1000 * 1000;
+                }
+                if (is_pro) {
+                    if (is_m3) return 24ULL * 1000 * 1000;
+                    return 32ULL * 1000 * 1000;
+                }
+                if (is_m1 || is_m2 || is_m3 || is_m4 || is_m5 || is_m6) {
+                    return 16ULL * 1000 * 1000;
+                }
+            }
+            return 0;
+        }
+
         return 0;
     }
 #endif
@@ -204,6 +405,16 @@ namespace {
     }
 #endif
 }
+
+const NvidiaPlatformInfo& get_nvidia_platform_info() {
+    static const NvidiaPlatformInfo info = detect_nvidia_platform_info();
+    return info;
+}
+
+bool has_nvidia_scf_pmu() {
+    return get_nvidia_platform_info().has_nvidia_scf_pmu;
+}
+
 
 size_t detect_cache_size(int level) {
     size_t size = detect_cache_size_sysfs(level);
@@ -238,6 +449,7 @@ int detect_cache_line_size_fallback() {
 SystemDetector::SystemDetector() {
     memset(&sys_info_, 0, sizeof(sys_info_));
     capabilities_ = {};
+    nvidia_platform_ = {};
 }
 
 /**
@@ -257,6 +469,8 @@ bool SystemDetector::detect() {
     if (system_info_detect(&sys_info_) != 0) {
         return false;
     }
+    nvidia_platform_ = ::get_nvidia_platform_info();
+    apply_nvidia_platform_identity(sys_info_, nvidia_platform_);
 
     std::string vendor = sys_info_.cpu_vendor;
     std::transform(vendor.begin(), vendor.end(), vendor.begin(), ::tolower);
@@ -264,6 +478,8 @@ bool SystemDetector::detect() {
         capabilities_.vendor = CPUVendor::INTEL;
     } else if (vendor.find("amd") != std::string::npos) {
         capabilities_.vendor = CPUVendor::AMD;
+    } else if (vendor.find("apple") != std::string::npos) {
+        capabilities_.vendor = CPUVendor::APPLE;
     } else if (vendor.find("arm") != std::string::npos
             || vendor.find("fujitsu") != std::string::npos
             || vendor.find("ampere") != std::string::npos
@@ -329,6 +545,7 @@ bool SystemDetector::detect() {
     capabilities_.arch = CPUArchitecture::RISCV64;
 #endif
 
+#if !defined(_WIN32)
     if (capabilities_.arch == CPUArchitecture::UNKNOWN) {
         struct utsname uname_info;
         if (uname(&uname_info) == 0) {
@@ -344,6 +561,7 @@ bool SystemDetector::detect() {
             }
         }
     }
+#endif
 
     capabilities_.model_name = sys_info_.cpu_model;
     capabilities_.physical_cores = sys_info_.total_physical_cores;
@@ -352,6 +570,7 @@ bool SystemDetector::detect() {
     capabilities_.total_memory = static_cast<size_t>(sys_info_.total_mem_bytes);
     capabilities_.memory_type = sys_info_.mem_technology;
     capabilities_.memory_frequency = sys_info_.mem_frequency;
+    capabilities_.cpu_inferred = sys_info_.cpu_inferred;
 
     bool has_cache_info = false;
     int detected_cache_line_size = 0;
@@ -396,7 +615,7 @@ bool SystemDetector::detect() {
         }
         
         if (vendor.find("Apple") != std::string::npos) {
-            return 16;
+            return 2;
         }
         
         return 8;
@@ -432,6 +651,53 @@ bool SystemDetector::detect() {
         }
         if (capabilities_.memory_channels <= 0 || capabilities_.memory_channels == 2) {
             capabilities_.memory_channels = 16;
+        }
+    } else if (capabilities_.vendor == CPUVendor::APPLE) {
+        const int gpu_cores = detect_apple_gpu_cores();
+        capabilities_.bus_width = 16;
+        if (model_upper.find("ULTRA") != std::string::npos) {
+            capabilities_.memory_channels = 64;
+        } else if (model_upper.find("MAX") != std::string::npos) {
+            capabilities_.memory_channels =
+                ((gpu_cores == 30 && model_upper.find("M3") != std::string::npos) ||
+                 (gpu_cores == 32 &&
+                  (model_upper.find("M4") != std::string::npos ||
+                   model_upper.find("M5") != std::string::npos)) ||
+                 (gpu_cores == 0 && capabilities_.physical_cores == 14 &&
+                  (model_upper.find("M3") != std::string::npos ||
+                   model_upper.find("M4") != std::string::npos)) ||
+                 (gpu_cores == 0 && model_upper.find("M5") != std::string::npos &&
+                  capabilities_.total_memory > 0 &&
+                  capabilities_.total_memory <= 36ULL * 1024 * 1024 * 1024)) ? 24 : 32;
+        } else if (model_upper.find("PRO") != std::string::npos) {
+            capabilities_.memory_channels = model_upper.find("M3") != std::string::npos ? 12 : 16;
+        } else {
+            capabilities_.memory_channels = 8;
+        }
+
+        const bool apple_pro_class =
+            model_upper.find("PRO") != std::string::npos ||
+            model_upper.find("MAX") != std::string::npos ||
+            model_upper.find("ULTRA") != std::string::npos;
+        if (model_upper.find("M1") != std::string::npos && !apple_pro_class) {
+            capabilities_.memory_type = "LPDDR4X";
+            capabilities_.memory_frequency = "4266";
+        } else if (model_upper.find("M6") != std::string::npos) {
+            capabilities_.memory_type = "LPDDR5X";
+            capabilities_.memory_frequency =
+                capabilities_.total_memory > 0 &&
+                capabilities_.total_memory <= 16ULL * 1024 * 1024 * 1024 ? "9600" : "10667";
+        } else if (model_upper.find("M5") != std::string::npos) {
+            capabilities_.memory_type = "LPDDR5X";
+            capabilities_.memory_frequency = "9600";
+        } else if (model_upper.find("M4") != std::string::npos) {
+            capabilities_.memory_type = "LPDDR5X";
+            capabilities_.memory_frequency = apple_pro_class ? "8533" : "7500";
+        } else if (model_upper.find("M1") != std::string::npos ||
+                   model_upper.find("M2") != std::string::npos ||
+                   model_upper.find("M3") != std::string::npos) {
+            capabilities_.memory_type = "LPDDR5";
+            capabilities_.memory_frequency = "6400";
         }
     }
 
@@ -527,18 +793,17 @@ bool SystemDetector::detect() {
         }
     }
 
+
+    bool cpu_detected = true;
     switch (capabilities_.arch) {
-        case CPUArchitecture::X86_64:
-            return detect_x86_capabilities();
-        case CPUArchitecture::ARM64:
-            return detect_arm_capabilities();
-        case CPUArchitecture::POWERPC:
-            return detect_powerpc_capabilities();
-        case CPUArchitecture::RISCV64:
-            return detect_riscv_capabilities();
-        default:
-            return true;
+        case CPUArchitecture::X86_64: cpu_detected = detect_x86_capabilities(); break;
+        case CPUArchitecture::ARM64: cpu_detected = detect_arm_capabilities(); break;
+        case CPUArchitecture::POWERPC: cpu_detected = detect_powerpc_capabilities(); break;
+        case CPUArchitecture::RISCV64: cpu_detected = detect_riscv_capabilities(); break;
+        default: break;
     }
+    detect_gpu_capabilities();
+    return cpu_detected;
 }
 
 bool SystemDetector::detect_x86_capabilities() {
@@ -669,6 +934,15 @@ bool SystemDetector::detect_arm_capabilities() {
             capabilities_.nvlink_bw_gb_s = 450.0;
         }
     }
+#elif defined(__APPLE__)
+    int has_advsimd = 1;
+    size_t advsimd_len = sizeof(has_advsimd);
+    if (sysctlbyname("hw.optional.AdvSIMD", &has_advsimd, &advsimd_len, nullptr, 0) != 0) {
+        has_advsimd = 1;  // guaranteed on Apple Silicon
+    }
+    if (has_advsimd) {
+        capabilities_.extensions.push_back(ISAExtension::NEON);
+    }
 #endif
 
     return true;
@@ -716,6 +990,48 @@ bool SystemDetector::detect_riscv_capabilities() {
     return true;
 }
 
+bool SystemDetector::detect_gpu_capabilities() {
+    gpu_capabilities_ = GPUCapabilities{};
+    subprocess::Options options;
+    options.timeout = std::chrono::seconds(5);
+    const auto query = subprocess::capture("nvidia-smi",
+        {"--query-gpu=name,memory.total", "--format=csv,noheader"}, options);
+    if (!query.ok() || query.output.size() >= options.max_output_bytes) return false;
+
+    std::vector<std::string> compute_capabilities;
+    const auto capability_query = subprocess::capture("nvidia-smi",
+        {"--query-gpu=compute_cap", "--format=csv,noheader"}, options);
+    if (capability_query.ok()) {
+        std::istringstream lines(capability_query.output);
+        for (std::string line; std::getline(lines, line);) {
+            line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
+            compute_capabilities.push_back(line);
+        }
+    }
+
+    std::istringstream rows(query.output);
+    std::string row;
+    int device_index = 0;
+    while (std::getline(rows, row)) {
+        const int index = device_index++;
+        const auto comma = row.rfind(',');
+        if (comma == std::string::npos) continue;
+        GPUInfo info;
+        info.name = row.substr(0, comma);
+        if (index < static_cast<int>(compute_capabilities.size())) info.compute_capability = compute_capabilities[index];
+        try {
+            info.memory_bytes = std::stoull(row.substr(comma + 1)) * 1024ULL * 1024ULL;
+        } catch (const std::exception&) {
+            continue;
+        }
+        gpu_capabilities_.gpus.push_back(info);
+    }
+    gpu_capabilities_.num_gpus = static_cast<int>(gpu_capabilities_.gpus.size());
+    gpu_capabilities_.has_gpu = !gpu_capabilities_.gpus.empty();
+    if (gpu_capabilities_.has_gpu) gpu_capabilities_.gpu_arch = GPUArchitecture::NVIDIA;
+    return gpu_capabilities_.has_gpu;
+}
+
 void SystemDetector::print(std::ostream& os, int verbosity) const {
     os << "System Information:" << std::endl;
     os << "  OS: " << sys_info_.os_name << " " << sys_info_.os_release << std::endl;
@@ -736,14 +1052,38 @@ void SystemDetector::print(std::ostream& os, int verbosity) const {
 
     if (verbosity >= 2) {
         os << "  Memory: " << (capabilities_.total_memory / (1000*1000*1000)) << " GB" << std::endl;
-        if (!capabilities_.memory_type.empty()) {
-            os << "  Memory Type: " << capabilities_.memory_type;
-            if (!capabilities_.memory_frequency.empty()) {
-                os << " @ " << capabilities_.memory_frequency;
+
+        auto is_unknown = [](const std::string& v) { return v.empty() || v == "Unknown"; };
+        const bool mem_undetected =
+            is_unknown(capabilities_.memory_type) || is_unknown(capabilities_.memory_frequency);
+
+        // Windows reads the same data from SMBIOS without privilege, so the
+        // consumer-CPU caveat and the dmidecode remedy do not apply there.
+#if defined(_WIN32)
+        const bool report_undetected = mem_undetected;
+        const char* const undetected_reason = "firmware reported no SMBIOS memory devices";
+#else
+        const bool report_undetected = cpu_is_consumer(sys_info_.cpu_model) && mem_undetected;
+        const char* const undetected_reason = "dmidecode requires root/sudo";
+#endif
+
+        if (report_undetected) {
+            os << "  Memory system not detected (" << undetected_reason << "). "
+                  "Theoretical peaks not available." << std::endl;
+        } else {
+            if (!capabilities_.memory_type.empty()) {
+                os << "  Memory Type: " << capabilities_.memory_type;
+                if (!capabilities_.memory_frequency.empty()) {
+                    os << " @ " << capabilities_.memory_frequency;
+                }
+                os << std::endl;
+            }
+            os << "  Memory Channels: " << capabilities_.memory_channels;
+            if (capabilities_.bus_width > 0) {
+                os << " x " << capabilities_.bus_width << "-bit";
             }
             os << std::endl;
         }
-        os << "  Memory Channels: " << capabilities_.memory_channels << std::endl;
 
         if (capabilities_.l1d_size > 0) os << "  L1D Cache: " << (capabilities_.l1d_size / 1000) << " KB" << std::endl;
         if (capabilities_.l1i_size > 0) os << "  L1I Cache: " << (capabilities_.l1i_size / 1000) << " KB" << std::endl;

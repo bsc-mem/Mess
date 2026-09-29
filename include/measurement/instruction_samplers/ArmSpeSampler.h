@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -56,7 +58,7 @@ public:
 
     static std::string availability_diagnostic();
     bool is_available() const override;
-    bool start_async(const std::vector<int>& cores, const std::vector<pid_t>& pids) override;
+    bool start_async(const std::vector<int>& cores, const std::vector<platform::ProcessId>& pids) override;
     InstructionSamplerStats stop_and_process(double cpu_freq_ghz) override;
     void cleanup() override;
 

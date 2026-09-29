@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,6 +35,8 @@
 
 #ifndef PROCESS_BINDING_H
 #define PROCESS_BINDING_H
+
+#include "platform/Process.h"
 
 #include <vector>
 #include <set>
@@ -71,11 +75,11 @@ public:
     ProcessBindingDetector();
     
     ProcessBinding detect();
-    ProcessBinding detect_for_pid(pid_t pid);
+    ProcessBinding detect_for_pid(platform::ProcessId pid);
     
-    static std::set<int> get_cpu_affinity_mask_for_pid(pid_t pid);
+    static std::set<int> get_cpu_affinity_mask_for_pid(platform::ProcessId pid);
     
-    static std::set<int> get_membind_nodes_for_pid(pid_t pid);
+    static std::set<int> get_membind_nodes_for_pid(platform::ProcessId pid);
     
     static std::set<int> cpus_to_numa_nodes(const std::set<int>& cpus);
     static std::set<int> get_all_system_nodes();

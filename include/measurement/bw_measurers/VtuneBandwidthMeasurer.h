@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -35,6 +37,7 @@
 #define VTUNE_BANDWIDTH_MEASURER_H
 
 #include "Measurement.h"
+#include "measurement/VtuneCollection.h"
 
 /**
  * @file VtuneBandwidthMeasurer.h
@@ -57,6 +60,34 @@ public:
                          bool summary_mode) override;
 
     std::string find_vtune_binary() const;
+
+    /**
+     * @brief Absolute path of the vtune binary, or empty when it is not installed.
+     *
+     * Static so AUTO resolution can ask before a measurer exists. No spawn.
+     */
+    static std::string locate_binary();
+
+    static bool process_elevated();
+
+    /**
+     * @brief Whether VTune can actually read this machine's memory controllers.
+     *
+     * Installed is not working: a hypervisor or missing driver leaves a
+     * collection that exits cleanly and reports nothing. Runs one real
+     * collection per counter set tried, cached with the measurer's own probe.
+     */
+    static bool probe_available(int verbosity);
+
+    /**
+     * @brief Why VTune cannot collect here, phrased as something to do about it.
+     *
+     * Empty when VTune is absent or working. An unregistered driver and an
+     * unsupported processor otherwise fail identically.
+     */
+    static std::string setup_guidance();
+private:
+    std::unique_ptr<measurement::vtune::CollectionSession> collection_ = measurement::vtune::make_collection_session();
 };
 
 #endif

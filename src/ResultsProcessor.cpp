@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -115,7 +118,7 @@ void print_lat_range_line(const char* prefix, const NumericRange& r, const char*
     std::cout << " ns" << std::endl;
 }
 
-} // namespace
+}
 
 ResultsProcessor::ResultsProcessor(const BenchmarkConfig& config, const BenchmarkExecutor* executor)
     : config_(config), total_runtime_(0.0), executor_(executor) {
@@ -228,7 +231,7 @@ void ResultsProcessor::print_timing_statistics() const {
         std::cout << std::endl;
     };
     
-    print_mode_summary("MultiSequential Execution Summary", seq_results);
+    print_mode_summary(config_.run_gpu ? "GPU Execution Summary" : "MultiSequential Execution Summary", seq_results);
     
     if (has_valid_measurements) {
         std::cout << "\033[1;32mBenchmark completed successfully\033[0m" << std::endl;

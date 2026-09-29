@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -204,10 +206,30 @@ std::string X86Assembler::generateAsmStart() const {
 }
 
 std::string X86Assembler::generateAsmEnd() const {
-    return "      :\n"
-           "      : \"r\" (a), \"r\" (b), \"r\" (i), \"r\" (n), \"r\" (p)\n"
-           "      : \"rdi\", \"memory\", \"cc\"\n"
-           "    );\n";
+    std::ostringstream oss;
+    // The loop changes i, and post-increment addressing changes a and b.
+    // Explicit outputs prevent the compiler from reusing their initial values.
+    oss << "      : \"+r\" (a), \"+r\" (b), \"+r\" (i)\n"
+        << "      : \"r\" (n), \"r\" (p)\n"
+        << "      : \"rdi\", \"memory\", \"cc\"";
+    if (config_.isa_mode == ISAMode::SCALAR) {
+        const int count = config_.single_registers ? 1 :
+            std::max(1, std::min(config_.num_simd_registers, 9));
+        for (int reg = 0; reg < count; ++reg) {
+            const std::string name = getScalarRegName(reg);
+            if (name != "rdi") oss << ", \"" << name << "\"";
+        }
+    } else {
+        const int limit = config_.isa_mode == ISAMode::AVX512 ? 32 : 16;
+        // Register 1 is initialized even when the memory operations use only 0.
+        const int count = std::max(2, config_.single_registers ? 1 :
+            std::max(1, std::min(config_.num_simd_registers, limit)));
+        for (int reg = 0; reg < count; ++reg) {
+            oss << ", \"" << x86VectorRegPrefix(config_.isa_mode) << reg << "\"";
+        }
+    }
+    oss << "\n    );\n";
+    return oss.str();
 }
 
 std::string X86Assembler::getPointerChaseLoopAsm() const {

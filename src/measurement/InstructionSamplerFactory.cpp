@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,8 +34,10 @@
  */
 
  #include "measurement/InstructionSamplerFactory.h"
+#if !defined(_WIN32)
 #include "measurement/instruction_samplers/IntelPebsSampler.h"
 #include "measurement/instruction_samplers/ArmSpeSampler.h"
+#endif
 #include <iostream>
 #include <sstream>
 
@@ -48,6 +52,7 @@ std::string InstructionSamplerFactory::backend_name(SamplerBackend b) {
 }
 
 SamplerBackend InstructionSamplerFactory::detect_best_backend() {
+#if !defined(_WIN32)
     {
         IntelPebsSampler probe(50, 997, 0);
         if (probe.is_available()) return SamplerBackend::INTEL_PEBS;
@@ -56,6 +61,7 @@ SamplerBackend InstructionSamplerFactory::detect_best_backend() {
         ArmSpeSampler probe(50, 4096, 0);
         if (probe.is_available()) return SamplerBackend::ARM_SPE;
     }
+#endif
     return SamplerBackend::NONE;
 }
 
@@ -65,6 +71,11 @@ std::string InstructionSamplerFactory::availability_diagnostic(CPUArchitecture a
     }
 
     std::ostringstream oss;
+#if defined(_WIN32)
+    (void)arch;
+    oss << "Instruction sampling is not available on Windows; drop --inst-lat to use ptr_chase.";
+    return oss.str();
+#else
     oss << "Instruction sampling not supported on this CPU/Kernel (no PEBS or SPE found)";
 
     if (arch == CPUArchitecture::ARM64) {
@@ -72,6 +83,7 @@ std::string InstructionSamplerFactory::availability_diagnostic(CPUArchitecture a
     }
 
     return oss.str();
+#endif
 }
 
 std::unique_ptr<InstructionSampler> InstructionSamplerFactory::create(
@@ -89,6 +101,14 @@ std::unique_ptr<InstructionSampler> InstructionSamplerFactory::create(
         }
     }
 
+#if defined(_WIN32)
+    (void)latency_threshold;
+    (void)sample_rate;
+    if (resolved != SamplerBackend::NONE && verbosity >= 1) {
+        std::cerr << "    Warning: instruction sampling is not available on Windows\n";
+    }
+    return nullptr;
+#else
     switch (resolved) {
         case SamplerBackend::INTEL_PEBS: {
             int freq = (sample_rate > 0) ? sample_rate : 997;
@@ -113,5 +133,6 @@ std::unique_ptr<InstructionSampler> InstructionSamplerFactory::create(
             return nullptr;
     }
     return nullptr;
+#endif
 }
 

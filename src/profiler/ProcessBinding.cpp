@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -121,7 +123,7 @@ ProcessBinding ProcessBindingDetector::detect() {
     return detect_for_pid(getpid());
 }
 
-ProcessBinding ProcessBindingDetector::detect_for_pid(pid_t pid) {
+ProcessBinding ProcessBindingDetector::detect_for_pid(platform::ProcessId pid) {
     ProcessBinding binding;
     
     binding.allowed_cpus = get_cpu_affinity_mask_for_pid(pid);
@@ -161,14 +163,14 @@ ProcessBinding ProcessBindingDetector::detect_for_pid(pid_t pid) {
     return binding;
 }
 
-std::set<int> ProcessBindingDetector::get_cpu_affinity_mask_for_pid(pid_t pid) {
+std::set<int> ProcessBindingDetector::get_cpu_affinity_mask_for_pid(platform::ProcessId pid) {
     std::set<int> cpus;
     
 #ifdef __linux__
     cpu_set_t mask;
     CPU_ZERO(&mask);
     
-    if (sched_getaffinity(pid, sizeof(mask), &mask) == 0) {
+    if (sched_getaffinity(static_cast<pid_t>(pid), sizeof(mask), &mask) == 0) {
         for (int i = 0; i < CPU_SETSIZE; ++i) {
             if (CPU_ISSET(i, &mask)) {
                 cpus.insert(i);
@@ -183,7 +185,7 @@ std::set<int> ProcessBindingDetector::get_cpu_affinity_mask_for_pid(pid_t pid) {
     return cpus;
 }
 
-std::set<int> ProcessBindingDetector::get_membind_nodes_for_pid(pid_t pid) {
+std::set<int> ProcessBindingDetector::get_membind_nodes_for_pid(platform::ProcessId pid) {
     std::set<int> nodes;
     
 #ifdef __linux__

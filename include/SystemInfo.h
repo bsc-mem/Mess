@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -111,10 +113,10 @@ struct system_info {
     long long total_mem_bytes;
     char mem_technology[64];
     char mem_frequency[32];
+    bool cpu_inferred;
 
-    int cpu_base_mhz;
-    int cpu_max_mhz;
-    int cpu_cur_mhz;
+    int performance_cores;
+    int efficiency_cores;
 
     int socket_count;
     si_socket sockets[SI_MAX_SOCKETS];
@@ -131,5 +133,13 @@ struct system_info {
 int  system_info_detect(system_info *out);
 
 bool cpu_has_onpackage_hbm(const std::string& cpu_model);
+
+/**
+ * @brief True for consumer desktop/laptop CPUs (Core i*, Ryzen, Celeron, ...).
+ *
+ * Their memory type/speed/channels are not encoded in the model number and can
+ * only be read from DMI (dmidecode), which needs root. Server SKUs return false.
+ */
+bool cpu_is_consumer(const std::string& cpu_model);
 
 #endif

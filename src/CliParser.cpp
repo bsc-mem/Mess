@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,6 +36,7 @@
 
 #include "CliParser.h"
 #include "architecture/BandwidthCounterStrategy.h"
+#include "platform/Sys.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -59,6 +63,12 @@ void CLIParser::display_configuration(const BenchmarkConfig& config, bool perf_a
         } else {
             std::cout << "! TLB measurement failed, using default values" << std::endl;
         }
+
+#if defined(_WIN32)
+        if (platform::large_pages_available()) {
+            std::cout << "Huge pages: enabled" << std::endl;
+        }
+#endif
     }else{
         std::cout << "\n";
     }
@@ -102,24 +112,39 @@ void CLIParser::display_configuration(const BenchmarkConfig& config, bool perf_a
 
 CLIParser::CLIParser() {
     specs_ = {
-        {"r", "ratio", true, "X[,X...]", "read/write ratios in percent; comma-separated list"},
+        {"r", "ratio", true, "X[,X...]", "read/write ratios in percent; comma-separated list (GPU: whole percentages)"},
+        {"", "gpu", false, "", "run the NVIDIA GPU bandwidth/latency benchmark"},
         {"", "dry-run", false, "", "detect system and print configuration without running benchmark"},
         {"", "profile", false, "", "save bw/lat files to measuring/ directory"},
         {"", "folder", true, "DIR", "root output folder (default: measuring)"},
-        {"v", "verbose", true, "N", "verbosity level (0-4, default: 1)"},
+        {"v", "verbose", true, "N", "verbosity level (0-4, default: 1); also -v N or -vN"},
         {"", "version", false, "", "print version and exit"},
         {"h", "help", false, "", "print this help and exit"},
         {"", "pause", true, "X[,X...]", "pause values; comma-separated list"},
         {"", "tier", true, "TIER", "adaptive pause discovery preset: lite (15 points), standard (50, default), detailed (200)"},
         {"", "point-count", true, "N", "custom adaptive point budget override; incompatible with --tier and --pause"},
-        {"", "measurer", true, "TYPE", "bandwidth measurement tool: auto, perf, likwid, vtune, pcm (default: auto)"},
+#if defined(_WIN32)
+        {"", "measurer", true, "TYPE", "bandwidth measurement tool: cupti (GPU); auto, imc (Intel), uprof (AMD), vtune (default: auto)"},
+#else
+        {"", "measurer", true, "TYPE", "bandwidth measurement tool: cupti (GPU); auto, perf, likwid, vtune, pcm, ioreport (default: auto; Apple Silicon auto-selects ioreport)"},
+#endif
         {"", "repetitions", true, "N", "number of point repetitions (default: 3)"},
-        {"", "total-cores", true, "N", "number of cores to run TrafficGen workers on (default: TOTAL_CORES-1)"},
-        {"", "cores", true, "LIST", "comma-separated list of specific cores to use (e.g. 0,1,2). Incompatible with --total-cores"},
-        {"", "bind", true, "LIST", "comma-separated list of NUMA nodes to bind memory to (e.g. 0,1)"},
-        {"", "persistent-trafficgen", false, "", "keep TrafficGen alive across repetitions for the same point"},
+        {"", "total-cores", true, "N", "CPU only: number of cores to run TrafficGen workers on (default: TOTAL_CORES-1)"},
+        {"", "cores", true, "LIST", "CPU only: comma-separated list of specific cores to use (e.g. 0,1,2). Incompatible with --total-cores"},
+#if !defined(__APPLE__) && !defined(_WIN32)
+        {"", "bind", true, "LIST", "CPU only: comma-separated list of NUMA nodes to bind memory to (e.g. 0,1)"},
+#endif
+        {"", "persistent-trafficgen", false, "", "keep TrafficGen alive across repetitions for the same point (alias: --persistent-traffic-gen; always enabled on GPU)"},
+#if defined(_WIN32)
+        {"", "inst-lat", false, "", "hardware instruction sampling (not available on Windows)"},
+#elif !defined(__APPLE__)
         {"", "inst-lat", false, "", "use hardware instruction sampling (PEBS/SPE) for latency instead of pointer chasing"},
-        {"", "add-counters", true, "COUNTERS", "comma-separated list of extra counters to measure alongside BW"}
+#endif
+#if defined(_WIN32)
+        {"", "add-counters", true, "COUNTERS", "extra counters (not available on Windows)"}
+#elif !defined(__APPLE__)
+        {"", "add-counters", true, "COUNTERS", "comma-separated extra counters alongside BW (GPU: exact CUPTI/Nsight Compute metric names)"}
+#endif
     };
 }
 
@@ -156,6 +181,7 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
     bool repetitions_flag_seen = false;
     bool tier_flag_seen = false;
     bool point_count_flag_seen = false;
+    bool gpu_flag_seen = false;
     
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -164,26 +190,15 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
             config.show_version = true;
         } else if (arg == "--help" || arg == "-h") {
             config.show_help = true;
-        } else if (arg == "--ratio" || arg == "-r") {
-            if (i + 1 >= argc) { std::cerr << "error: --ratio requires an argument" << std::endl; return false; }
+        } else if (arg == "-r") {
+            if (i + 1 >= argc) { std::cerr << "error: -r requires an argument" << std::endl; return false; }
             if (!parse_ratios(argv[++i], config.ratios_pct)) { std::cerr << "error: invalid ratio list '" << argv[i] << "'" << std::endl; return false; }
         } else if (arg.find("--ratio=") == 0) {
             std::string value = arg.substr(8);
             if (!parse_ratios(value.c_str(), config.ratios_pct)) { std::cerr << "error: invalid ratio '" << value << "'" << std::endl; return false; }
-        } else if (arg == "--pause") {
-            if (i + 1 >= argc) { std::cerr << "error: --pause requires an argument" << std::endl; return false; }
-            if (!parse_pauses(argv[++i], config.pauses)) { std::cerr << "error: invalid pause list '" << argv[i] << "'" << std::endl; return false; }
         } else if (arg.find("--pause=") == 0) {
             std::string value = arg.substr(8);
             if (!parse_pauses(value.c_str(), config.pauses)) { std::cerr << "error: invalid pause '" << value << "'" << std::endl; return false; }
-        } else if (arg == "--tier") {
-            if (i + 1 >= argc) { std::cerr << "error: --tier requires an argument" << std::endl; return false; }
-            config.adaptive_tier = argv[++i];
-            if (config.adaptive_tier != "lite" && config.adaptive_tier != "standard" && config.adaptive_tier != "detailed") {
-                std::cerr << "error: invalid tier '" << config.adaptive_tier << "' (valid: lite, standard, detailed)" << std::endl;
-                return false;
-            }
-            tier_flag_seen = true;
         } else if (arg.find("--tier=") == 0) {
             config.adaptive_tier = arg.substr(7);
             if (config.adaptive_tier != "lite" && config.adaptive_tier != "standard" && config.adaptive_tier != "detailed") {
@@ -191,14 +206,6 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
                 return false;
             }
             tier_flag_seen = true;
-        } else if (arg == "--point-count") {
-            if (i + 1 >= argc) { std::cerr << "error: --point-count requires an argument" << std::endl; return false; }
-            config.adaptive_point_count = std::stoi(argv[++i]);
-            if (config.adaptive_point_count < 1) {
-                std::cerr << "error: point-count must be >= 1" << std::endl;
-                return false;
-            }
-            point_count_flag_seen = true;
         } else if (arg.find("--point-count=") == 0) {
             std::string value = arg.substr(14);
             config.adaptive_point_count = std::stoi(value);
@@ -215,30 +222,31 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         } else if (arg == "--likwid") {
             std::cerr << "error: --likwid is deprecated. Use --measurer=likwid instead." << std::endl;
             return false;
-        } else if (arg == "--measurer") {
-            if (i + 1 >= argc) { std::cerr << "error: --measurer requires an argument" << std::endl; return false; }
-            config.measurer = argv[++i];
         } else if (arg.find("--measurer=") == 0) {
             config.measurer = arg.substr(11);
+        } else if (arg == "--gpu") {
+            gpu_flag_seen = true;
+#ifdef __APPLE__
+        } else if (arg == "--inst-lat" ||
+                   arg.find("--bind=") == 0 ||
+                   arg.find("--add-counters=") == 0
+                   ) {
+            std::string flag = arg.substr(0, arg.find('='));
+            std::cerr << "error: " << flag << " is not available for macOS (yet)." << std::endl;
+            return false;
+#endif
         } else if (arg == "--inst-lat") {
             config.instruction_sampling = true;
         } else if (arg == "--persistent-trafficgen" || arg == "--persistent-traffic-gen") {
             config.persistent_traffic_gen = true;
-        } else if (arg == "--bind") {
-            if (i + 1 >= argc) { std::cerr << "error: --bind requires an argument" << std::endl; return false; }
-            std::string value = argv[++i];
-            if (!parse_bind(value, config.memory_bind_nodes)) {
-                std::cerr << "ERROR: Invalid bind value: " << value << std::endl;
-                return false;
-            }
         } else if (arg.find("--bind=") == 0) {
             std::string value = arg.substr(7);
             if (!parse_bind(value, config.memory_bind_nodes)) {
                 std::cerr << "error: invalid bind mode '" << value << "' (expected NUMA node id or list)" << std::endl;
                 return false;
             }
-        } else if (arg == "--verbose" || arg == "-v") {
-            if (i + 1 >= argc) { std::cerr << "error: --verbose requires an argument" << std::endl; return false; }
+        } else if (arg == "-v") {
+            if (i + 1 >= argc) { std::cerr << "error: -v requires an argument" << std::endl; return false; }
             config.verbosity = std::stoi(argv[++i]);
             if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
         } else if (arg.find("--verbose=") == 0) {
@@ -249,37 +257,17 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
             std::string value = arg.substr(2);
             config.verbosity = std::stoi(value);
             if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
-        } else if (arg == "--repetitions") {
-            if (i + 1 >= argc) { std::cerr << "error: --repetitions requires an argument" << std::endl; return false; }
-            config.point_reps = std::stoi(argv[++i]);
-            if (config.point_reps < 1) { std::cerr << "error: repetitions must be >= 1" << std::endl; return false; }
-            repetitions_flag_seen = true;
         } else if (arg.find("--repetitions=") == 0) {
             std::string value = arg.substr(14);
             config.point_reps = std::stoi(value);
             if (config.point_reps < 1) { std::cerr << "error: repetitions must be >= 1" << std::endl; return false; }
             repetitions_flag_seen = true;
-        } else if (arg == "--total-cores") {
-            if (i + 1 >= argc) { std::cerr << "error: --total-cores requires an argument" << std::endl; return false; }
-            int c = std::stoi(argv[++i]);
-            if (c < 1 || c > 4096) { std::cerr << "error: total-cores must be between 1 and 4096" << std::endl; return false; }
-            config.traffic_gen_cores = c;
-            total_cores_flag_seen = true;
         } else if (arg.find("--total-cores=") == 0) {
             std::string value = arg.substr(14);
             int c = std::stoi(value);
             if (c < 1 || c > 4096) { std::cerr << "error: total-cores must be between 1 and 4096" << std::endl; return false; }
             config.traffic_gen_cores = c;
             total_cores_flag_seen = true;
-        } else if (arg == "--cores") {
-            if (i + 1 >= argc) { std::cerr << "error: --cores requires an argument" << std::endl; return false; }
-            std::string value = argv[++i];
-            if (!expand_core_list(value, config.traffic_gen_explicit_cores)) {
-                std::cerr << "error: invalid --cores value '" << value << "' (expected comma-separated cores and/or N-M ranges)" << std::endl;
-                return false;
-            }
-            config.traffic_gen_cores = config.traffic_gen_explicit_cores.size();
-            explicit_cores_flag_seen = true;
         } else if (arg.find("--cores=") == 0) {
             std::string value = arg.substr(8);
             if (!expand_core_list(value, config.traffic_gen_explicit_cores)) {
@@ -288,10 +276,6 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
             }
             config.traffic_gen_cores = config.traffic_gen_explicit_cores.size();
             explicit_cores_flag_seen = true;
-        } else if (arg == "--folder") {
-            if (i + 1 >= argc) { std::cerr << "error: --folder requires an argument" << std::endl; return false; }
-            config.output_root = argv[++i];
-            if (config.output_root.empty()) { std::cerr << "error: folder must be non-empty" << std::endl; return false; }
         } else if (arg.find("--folder=") == 0) {
             std::string value = arg.substr(9);
             if (value.empty()) { std::cerr << "error: folder must be non-empty" << std::endl; return false; }
@@ -299,16 +283,6 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         } else if (arg == "--extra-perf" || arg.find("--extra-perf=") == 0) {
             std::cerr << "error: --extra-perf is deprecated. Use --add-counters instead." << std::endl;
             return false;
-        } else if (arg == "--add-counters") {
-            if (i + 1 >= argc) { std::cerr << "error: --add-counters requires an argument" << std::endl; return false; }
-            std::string value = argv[++i];
-            std::stringstream ss(value);
-            std::string segment;
-            while(std::getline(ss, segment, ',')) {
-                if (!segment.empty()) {
-                    config.add_counters.push_back(segment);
-                }
-            }
         } else if (arg.find("--add-counters=") == 0) {
             std::string value = arg.substr(15);
             std::stringstream ss(value);
@@ -324,7 +298,37 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         }
     }
     
+#if defined(_WIN32)
+    if (!config.memory_bind_nodes.empty()) {
+        std::cerr << "ERROR: --bind is not supported on Windows. Workers are CPU-pinned, "
+                     "but explicit NUMA memory placement is not implemented." << std::endl;
+        return false;
+    }
+#endif
     config.generate_multiseq = true;
+
+    config.run_gpu = gpu_flag_seen;
+    if (config.run_gpu) {
+        if (total_cores_flag_seen || explicit_cores_flag_seen || !config.memory_bind_nodes.empty()) {
+            std::cerr << "error: --cores, --total-cores and --bind control CPU workers, not GPU execution.\n";
+            return false;
+        }
+        if (config.measurer != "auto" && config.measurer != "cupti") {
+            std::cerr << "error: GPU measurement supports --measurer=auto or --measurer=cupti.\n";
+            return false;
+        }
+        for (double ratio : config.ratios_pct) {
+            if (ratio != std::floor(ratio)) {
+                std::cerr << "error: GPU ratios must be whole percentages; fractional ratios cannot be stored separately.\n";
+                return false;
+            }
+        }
+        config.measurer = "cupti";
+    } else if (config.measurer == "cupti") {
+        std::cerr << "error: --measurer=cupti requires --gpu.\n";
+        return false;
+    }
+
 
     if (total_cores_flag_seen && explicit_cores_flag_seen) {
         std::cerr << "ERROR: --total-cores and --cores are mutually exclusive." << std::endl;
@@ -352,11 +356,6 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         config.point_reps = 1;
     }
 
-    if (string_to_measurer_type(config.measurer) == MeasurerType::VTUNE && !config.add_counters.empty()) {
-        std::cerr << "error: --add-counters is not supported with --measurer=vtune." << std::endl;
-        return false;
-    }
-    
     return true;
 }
 
@@ -364,7 +363,7 @@ void CLIParser::print_help(const char* argv0) {
     print_usage(argv0);
 
     std::cout << "\nBasic Options:\n";
-    std::vector<std::string> basic_opts = {"ratio", "dry-run", "profile", "folder", "verbose", "tier", "version", "help"};
+    std::vector<std::string> basic_opts = {"ratio", "gpu", "dry-run", "profile", "folder", "verbose", "tier", "version", "help"};
 
     for (const auto& spec : specs_) {
         if (std::find(basic_opts.begin(), basic_opts.end(), spec.long_opt) != basic_opts.end()) {
@@ -408,6 +407,7 @@ void CLIParser::print_help(const char* argv0) {
     std::cout << "  " << argv0 << " --profile\n";
     std::cout << "  " << argv0 << " --dry-run\n";
     std::cout << "  " << argv0 << " --profile --ratio=100 --tier=lite\n";
+    std::cout << "  " << argv0 << " --gpu --profile --ratio=0,50,100 --tier=lite\n";
 }
 
 void CLIParser::print_usage(const char* argv0) {

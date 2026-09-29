@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,6 +34,7 @@
  */
 
 #include "CurveTracer.h"
+#include "platform/Console.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,6 +44,7 @@
 namespace {
 constexpr double SUSPICION_ALPHA = 0.25;
 constexpr double SUSPICION_MIN_THRESHOLD = 0.03;
+constexpr double REUSE_LATENCY_SPAN = 0.2;
 }
 
 const double CurveTracer::DEFAULT_TOLERANCE = 0.00005;
@@ -181,7 +185,9 @@ int CurveTracer::next_refinement_pause() {
         int left_pause = sorted_ps_[segment.left_idx];
         int right_pause = sorted_ps_[segment.left_idx + 1];
         int pause = split_pause(left_pause, right_pause);
-        if (pause < 0 || points_.find(pause) != points_.end()) {
+        const bool reusable = !budgeted_pauses_.count(pause) &&
+            std::abs(normalize_lat(points_.at(right_pause).lat) - normalize_lat(points_.at(left_pause).lat)) >= REUSE_LATENCY_SPAN;
+        if (pause < 0 || (points_.count(pause) && !reusable)) {
             if (segment.error >= tier_.tolerance && segments_above_ > 0) {
                 --segments_above_;
             }
@@ -189,7 +195,7 @@ int CurveTracer::next_refinement_pause() {
         }
 
         if (verbosity_ >= 3) {
-            std::cout << "\r" << std::string(140, ' ') << "\r";
+            std::cout << platform::clear_line();
             std::cout << " CurveTracer Split [" << left_pause
                       << ", " << right_pause << "] -> p=" << pause
                       << " (E=" << std::scientific << std::setprecision(3)

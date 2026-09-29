@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -34,9 +36,12 @@
 #ifndef INSTRUCTION_SAMPLER_H
 #define INSTRUCTION_SAMPLER_H
 
+#include <algorithm>
+#include <numeric>
 #include <vector>
 #include <cstdint>
 #include <sys/types.h>
+#include "platform/Process.h"
 
 /**
  * @file InstructionSampler.h
@@ -72,6 +77,56 @@ struct InstructionSamplerStats {
     std::vector<uint64_t> raw_latencies;
 };
 
+inline InstructionSamplerStats build_instruction_sampler_stats(std::vector<uint64_t> latencies,
+                                                               double cpu_freq_ghz) {
+    InstructionSamplerStats stats{};
+    if (latencies.empty()) {
+        return stats;
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+    stats.samples = static_cast<long long>(latencies.size());
+    stats.raw_latencies = std::move(latencies);
+
+    double sum = std::accumulate(stats.raw_latencies.begin(), stats.raw_latencies.end(), 0.0);
+    stats.mean_cycles = sum / stats.samples;
+    stats.min_cycles = stats.raw_latencies.front();
+    stats.max_cycles = stats.raw_latencies.back();
+
+    auto pct = [&](double p) -> double {
+        size_t idx = static_cast<size_t>(p * (stats.raw_latencies.size() - 1));
+        return stats.raw_latencies[idx];
+    };
+
+    stats.median_cycles = pct(0.50);
+    stats.p90_cycles = pct(0.90);
+    stats.p95_cycles = pct(0.95);
+    stats.p99_cycles = pct(0.99);
+    stats.p99_9_cycles = pct(0.999);
+
+    size_t q1_idx = static_cast<size_t>(0.25 * (stats.raw_latencies.size() - 1));
+    size_t q3_idx = static_cast<size_t>(0.75 * (stats.raw_latencies.size() - 1));
+    double iqr_sum = std::accumulate(
+        stats.raw_latencies.begin() + q1_idx,
+        stats.raw_latencies.begin() + q3_idx + 1,
+        0.0);
+    stats.iqr_mean_cycles = iqr_sum / (q3_idx - q1_idx + 1);
+
+    if (cpu_freq_ghz > 0.0) {
+        stats.mean_ns = stats.mean_cycles / cpu_freq_ghz;
+        stats.iqr_mean_ns = stats.iqr_mean_cycles / cpu_freq_ghz;
+        stats.min_ns = stats.min_cycles / cpu_freq_ghz;
+        stats.median_ns = stats.median_cycles / cpu_freq_ghz;
+        stats.p90_ns = stats.p90_cycles / cpu_freq_ghz;
+        stats.p95_ns = stats.p95_cycles / cpu_freq_ghz;
+        stats.p99_ns = stats.p99_cycles / cpu_freq_ghz;
+        stats.p99_9_ns = stats.p99_9_cycles / cpu_freq_ghz;
+        stats.max_ns = stats.max_cycles / cpu_freq_ghz;
+    }
+
+    return stats;
+}
+
 /**
  * @brief Base class for hardware-backed instruction latency samplers.
  * 
@@ -86,7 +141,7 @@ public:
 
     virtual bool is_available() const = 0;
 
-    virtual bool start_async(const std::vector<int>& cores, const std::vector<pid_t>& pids) = 0;
+    virtual bool start_async(const std::vector<int>& cores, const std::vector<platform::ProcessId>& pids) = 0;
 
     virtual InstructionSamplerStats stop_and_process(double cpu_freq_ghz) = 0;
 
@@ -94,4 +149,3 @@ public:
 };
 
 #endif
-

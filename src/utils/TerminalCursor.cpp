@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,39 +35,20 @@
 
 #include "utils/TerminalCursor.h"
 
-#include <iostream>
-#include <unistd.h>
+#include "platform/Console.h"
 
 namespace terminal {
 
-namespace {
-
-constexpr char kHide[] = "\033[?25l";
-constexpr char kShow[] = "\033[?25h";
-
-bool stdout_is_tty() {
-    return isatty(STDOUT_FILENO) != 0;
-}
-
-}
-
 void hide_cursor() {
-    if (stdout_is_tty()) {
-        std::cout << kHide << std::flush;
-    }
+    platform::hide_cursor();
 }
 
 void show_cursor() {
-    if (stdout_is_tty()) {
-        std::cout << kShow << std::flush;
-    }
+    platform::show_cursor();
 }
 
 void show_cursor_signal_safe() {
-    if (isatty(STDOUT_FILENO) != 0) {
-        ssize_t written = write(STDOUT_FILENO, kShow, sizeof(kShow) - 1);
-        (void)written;
-    }
+    platform::show_cursor_signal_safe();
 }
 
 CursorGuard::CursorGuard() {

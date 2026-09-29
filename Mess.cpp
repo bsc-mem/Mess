@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -48,7 +51,11 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include "platform/Console.h"
+#include "platform/Fs.h"
 #include <sstream>
+#include "platform/Process.h"
+#include "platform/Sys.h"
 
 #include "SystemDetection.h"
 #include "architecture/ArchitectureRegistry.h"
@@ -59,13 +66,20 @@
 #include "BenchmarkExecutor.h"
 #include "ResultsProcessor.h"
 #include "CliParser.h"
+#include "gpu/GpuBenchmarkExecutor.h"
 
 #include "Utils.h"
 #include "PtrchasePerfHelper.h"
 #include "measurement/InstructionSamplerFactory.h"
+#if defined(_WIN32)
+#include "measurement/bw_measurers/WindowsImcBandwidthMeasurer.h"
+#include "measurement/bw_measurers/AMDuProfBandwidthMeasurer.h"
+#include "measurement/bw_measurers/VtuneBandwidthMeasurer.h"
+#endif
 #include "utils/TerminalCursor.h"
+#include "utils/StringUtils.h"
 
-#define MESS_VERSION "2.0.0"
+#define MESS_VERSION "2.1.0"
 
 namespace {
 
@@ -105,10 +119,39 @@ void cleanup_empty_output_dirs(const BenchmarkConfig& config) {
 struct PerfAccessProbeResult {
     int paranoid_level = 3;
     bool perf_accessible = false;
+    std::string diagnosis;
 };
 
-PerfAccessProbeResult probe_perf_access() {
+PerfAccessProbeResult probe_perf_access(MeasurerType requested, int verbosity) {
     PerfAccessProbeResult result;
+#if defined(_WIN32)
+    result.paranoid_level = 0;
+    switch (requested) {
+        case MeasurerType::VTUNE:
+            result.perf_accessible = VtuneBandwidthMeasurer::probe_available(verbosity);
+            if (!result.perf_accessible) {
+                result.diagnosis = VtuneBandwidthMeasurer::setup_guidance();
+                if (result.diagnosis.empty()) {
+                    result.diagnosis = "VTune is not installed, or vtune.exe is not on PATH.";
+                }
+            }
+            break;
+        case MeasurerType::UPROF:
+            result.perf_accessible = AMDuProfBandwidthMeasurer::counters_available(result.diagnosis);
+            break;
+        case MeasurerType::IMC:
+            result.perf_accessible = WindowsImcBandwidthMeasurer::counters_available(result.diagnosis);
+            break;
+        default: {
+            const auto& choice = windows_auto_measurer(verbosity);
+            result.perf_accessible = choice.available;
+            result.diagnosis = choice.diagnosis;
+            break;
+        }
+    }
+#else
+    (void)requested;
+    (void)verbosity;
     std::ifstream paranoid_file("/proc/sys/kernel/perf_event_paranoid");
     if (paranoid_file.is_open()) {
         paranoid_file >> result.paranoid_level;
@@ -117,6 +160,7 @@ PerfAccessProbeResult probe_perf_access() {
     if (result.paranoid_level <= 1) {
         result.perf_accessible = run_command_success("perf stat -e cycles:k true 2>/dev/null >/dev/null");
     }
+#endif
     return result;
 }
 
@@ -127,17 +171,16 @@ struct KernelBinaryCheckResult {
 
 KernelBinaryCheckResult validate_runtime_binaries() {
     KernelBinaryCheckResult result;
-    std::error_code ec;
-    const std::filesystem::path exe_path = std::filesystem::canonical("/proc/self/exe", ec);
-    if (ec) {
+    const std::filesystem::path exe_path = get_executable_path();
+    if (exe_path.empty()) {
         result.ok = false;
-        result.error_message = "ERROR: Could not determine executable path at /proc/self/exe.";
+        result.error_message = "ERROR: Could not determine executable path.";
         return result;
     }
 
     const std::filesystem::path bin_dir = exe_path.parent_path();
-    const std::filesystem::path ptr_chase_path = bin_dir / "ptr_chase";
-    const std::filesystem::path traffic_gen_path = bin_dir / "traffic_gen_multiseq.x";
+    const std::filesystem::path ptr_chase_path = bin_dir / platform::exe_name("ptr_chase");
+    const std::filesystem::path traffic_gen_path = bin_dir / platform::exe_name("traffic_gen_multiseq.x");
 
     if (!std::filesystem::exists(ptr_chase_path)) {
         std::ostringstream oss;
@@ -159,6 +202,196 @@ KernelBinaryCheckResult validate_runtime_binaries() {
     }
 
     return result;
+}
+
+[[maybe_unused]] std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+[[maybe_unused]] std::string run_command_capture(const std::string& command, int& exit_code) {
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        exit_code = -1;
+        return output;
+    }
+
+    char buffer[512];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+    const int status = pclose(pipe);
+    exit_code = platform::exit_code_of(status);
+    return output;
+}
+
+uint64_t read_generated_trafficgen_array_elements(const std::string& binary_name) {
+    const std::filesystem::path exe_path = get_executable_path();
+    if (exe_path.empty()) {
+        return 0;
+    }
+
+    const std::filesystem::path trafficgen_path = exe_path.parent_path() / binary_name;
+    int exit_code = -1;
+    std::string output;
+#if defined(_WIN32)
+    const platform::RunResult probe = platform::run(trafficgen_path.string(), {"--size"});
+    output    = probe.output;
+    exit_code = probe.exit_status;
+#else
+    output = run_command_capture(shell_quote(trafficgen_path.string()) + " --size 2>/dev/null", exit_code);
+#endif
+    if (exit_code != 0) {
+        return 0;
+    }
+
+    std::istringstream stream(output);
+    for (std::string line; std::getline(stream, line); ) {
+        const std::string key = "traffic_gen_array_elements=";
+        if (line.rfind(key, 0) != 0) {
+            continue;
+        }
+        try {
+            return std::stoull(line.substr(key.size()));
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+uint64_t read_generated_trafficgen_array_elements() {
+    return read_generated_trafficgen_array_elements(platform::exe_name("traffic_gen_multiseq.x"));
+}
+
+#ifdef __linux__
+bool is_numeric_pid_dirname(const std::string& name) {
+    if (name.empty()) return false;
+    for (unsigned char c : name) {
+        if (!std::isdigit(c)) return false;
+    }
+    return true;
+}
+
+bool pid_owned_by_current_user(const std::filesystem::path& proc_dir) {
+    std::ifstream status_file(proc_dir / "status");
+    if (!status_file.is_open()) return false;
+
+    const uid_t uid = getuid();
+    std::string line;
+    while (std::getline(status_file, line)) {
+        if (line.rfind("Uid:", 0) != 0) continue;
+        std::istringstream iss(line.substr(4));
+        uid_t real_uid = static_cast<uid_t>(-1);
+        iss >> real_uid;
+        return real_uid == uid;
+    }
+    return false;
+}
+
+bool process_comm_matches(const std::filesystem::path& proc_dir,
+                          const std::vector<std::string>& names) {
+    std::ifstream comm_file(proc_dir / "comm");
+    if (!comm_file.is_open()) return false;
+
+    std::string comm;
+    if (!std::getline(comm_file, comm)) return false;
+    for (const auto& name : names) {
+        if (comm == name) return true;
+    }
+    return false;
+}
+#endif
+
+void signal_processes_by_name(const std::vector<std::string>& names, platform::Stop stop) {
+#ifdef __linux__
+    const int sig = (stop == platform::Stop::Force) ? SIGKILL : SIGTERM;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+        if (ec) break;
+        if (!entry.is_directory(ec)) continue;
+
+        const std::string pid_name = entry.path().filename().string();
+        if (!is_numeric_pid_dirname(pid_name)) continue;
+        if (!pid_owned_by_current_user(entry.path())) continue;
+        if (!process_comm_matches(entry.path(), names)) continue;
+
+        int pid_value = -1;
+        if (string_utils::parse_int_strict(pid_name, pid_value) && pid_value > 0) {
+            ::kill(static_cast<pid_t>(pid_value), sig);
+        }
+    }
+#else
+    (void)names;
+    (void)stop;
+#endif
+}
+
+void unlink_globbed_files(const char* pattern) {
+    for (const std::string& path : platform::list_matching(pattern)) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
+
+void cleanup_benchmark_processes_and_temp_files() {
+    const std::vector<std::string> traffic_names = {
+        "traffic_gen_multiseq.x",
+        "traffic_gen_rand.x"
+    };
+    signal_processes_by_name(traffic_names, platform::Stop::Graceful);
+    signal_processes_by_name({"ptr_chase", "perf"}, platform::Stop::Graceful);
+    signal_processes_by_name(traffic_names, platform::Stop::Force);
+    signal_processes_by_name({"ptr_chase"}, platform::Stop::Force);
+
+    const char* patterns[] = {
+        "/tmp/traffic_gen_pid_*",
+        "/tmp/ptr_chase_perf_*",
+        "/tmp/ptr_chase_ready_*.flag",
+        "/tmp/ptr_chase_start_*.flag",
+        "/tmp/mess_ptrchase_pipe_*",
+        "/tmp/mess_tgen_ready_*",
+        "/tmp/ptr_chase_*.log",
+        "/dev/shm/mem_sampler_perf_*.data",
+        "/dev/shm/mem_sampler_perf_*.log"
+    };
+    for (const char* pattern : patterns) {
+        unlink_globbed_files(pattern);
+    }
+}
+
+bool parse_first_traffic_gen_core(const BenchmarkConfig& config, int& core) {
+    if (config.traffic_gen_explicit_cores.empty()) {
+        return false;
+    }
+
+    const std::string& token = config.traffic_gen_explicit_cores.front();
+    if (string_utils::parse_int_strict(token, core)) {
+        return true;
+    }
+
+    std::cerr << "Warning: could not parse traffic-gen core '" << token
+              << "'; using default core selection." << std::endl;
+    return false;
+}
+
+int resolve_traffic_gen_cores(const BenchmarkConfig& config, const system_info& info) {
+    int cores = config.traffic_gen_cores;
+    if (cores <= 0) {
+        cores = get_default_traffic_gen_cores(info);
+    }
+    return std::max(cores, 1);
 }
 
 }
@@ -184,13 +417,7 @@ void signal_handler(int signal) {
             g_executor->force_cleanup();
         }
 
-        system("pkill -u $(id -u) -TERM -x traffic_gen_multiseq.x 2>/dev/null || true");
-        system("pkill -u $(id -u) -TERM -x ptr_chase 2>/dev/null || true");
-        system("pkill -u $(id -u) -KILL -x traffic_gen_multiseq.x 2>/dev/null || true");
-        system("pkill -u $(id -u) -KILL -x ptr_chase 2>/dev/null || true");
-        system("pkill -u $(id -u) -TERM perf 2>/dev/null || true");
-        system("rm -f /tmp/traffic_gen_pid_* /tmp/ptr_chase_perf_* /tmp/ptr_chase_ready_*.flag /tmp/ptr_chase_start_*.flag /tmp/mess_ptrchase_pipe_* /tmp/mess_tgen_ready_* /tmp/ptr_chase_*.log 2>/dev/null");
-        system("rm -f /dev/shm/mem_sampler_perf_*.data /dev/shm/mem_sampler_perf_*.log 2>/dev/null");
+        cleanup_benchmark_processes_and_temp_files();
         
         std::signal(signal, SIG_DFL);
         raise(signal);
@@ -230,8 +457,9 @@ void print_enhanced_header(const SystemDetector& detector) {
 }
 
 int main(int argc, char **argv) {
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    platform::init_console();
+
+    platform::install_interrupt_handler(signal_handler);
 
     try {
         TLBMeasurement tlb_measurement;
@@ -259,14 +487,38 @@ int main(int argc, char **argv) {
         }
 
         SystemDetector detector;
+        if (config->run_gpu) {
+            if (config->instruction_sampling) {
+                std::cerr << "--inst-lat uses CPU PEBS/SPE sampling and is not supported with --gpu\n";
+                return EXIT_FAILURE;
+            }
+            if (!detector.detect()) {
+                std::cerr << "Failed to detect system information\n";
+                return EXIT_FAILURE;
+            }
+            print_enhanced_header(detector);
+            if (!detector.get_gpu_capabilities().has_gpu) {
+                std::cerr << "No NVIDIA GPU detected\n";
+                return EXIT_FAILURE;
+            }
+            if (config->dry_run) return GpuBenchmarkExecutor::check_environment() ? EXIT_SUCCESS : EXIT_FAILURE;
+            GpuBenchmarkExecutor executor(*config, detector.get_system_info(),
+                detector.get_capabilities(), detector.get_gpu_capabilities());
+            if (!executor.run()) return EXIT_FAILURE;
+            ResultsProcessor processor(*config, nullptr);
+            return processor.process(executor.get_results(), executor.get_total_runtime(),
+                                     executor.get_iteration_times()) ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
         auto detect_future = std::async(std::launch::async, [&detector]() {
             return detector.detect();
         });
         auto cache_future = std::async(std::launch::async, []() {
             SystemToolsCache::instance().init();
         });
-        auto perf_probe_future = std::async(std::launch::async, []() {
-            return probe_perf_access();
+        const MeasurerType requested_measurer = string_to_measurer_type(config->measurer);
+        const int probe_verbosity = config->verbosity;
+        auto perf_probe_future = std::async(std::launch::async, [requested_measurer, probe_verbosity]() {
+            return probe_perf_access(requested_measurer, probe_verbosity);
         });
 
         std::future<KernelBinaryCheckResult> kernel_check_future;
@@ -304,6 +556,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        config->traffic_gen_array_elements = read_generated_trafficgen_array_elements();
+
         const auto perf_probe = perf_probe_future.get();
         const int paranoid_level = perf_probe.paranoid_level;
         const bool perf_accessible = perf_probe.perf_accessible;
@@ -324,11 +578,7 @@ int main(int argc, char **argv) {
         }
 
         int src_cpu = 0;
-        if (!config->traffic_gen_explicit_cores.empty()) {
-            try {
-                src_cpu = std::stoi(config->traffic_gen_explicit_cores[0]);
-            } catch (...) {}
-        }
+        const bool has_explicit_src_cpu = parse_first_traffic_gen_core(*config, src_cpu);
 
         std::vector<int> target_nodes = config->memory_bind_nodes;
         if (target_nodes.empty()) {
@@ -337,6 +587,9 @@ int main(int argc, char **argv) {
 
         auto& bw_strategy = BandwidthCounterStrategy::instance();
         bw_strategy.set_measurer_type(string_to_measurer_type(config->measurer));
+#if defined(_WIN32)
+        bw_strategy.set_windows_auto_measurer(windows_auto_measurer().type);
+#endif
         bw_strategy.set_extra_counters(config->add_counters);
         bw_strategy.set_memory_type(caps.memory_type);
         std::cout << status_prefix << "\033[33mDiscovering counters...\033[0m" << std::string(5, ' ') << "\r" << std::flush;
@@ -354,18 +607,15 @@ int main(int argc, char **argv) {
         counter_discovery_future.get();
         cache_future.get();
 
-        if (!config->traffic_gen_explicit_cores.empty()) {
-            try {
-                int first_cpu = std::stoi(config->traffic_gen_explicit_cores[0]);
-                auto& cache = SystemToolsCache::instance();
-                cache.ptr_chase_cpu = first_cpu;
-                auto it = cache.cpu_topology.find(first_cpu);
-                if (it != cache.cpu_topology.end()) {
-                    cache.ptr_chase_node = it->second.node;
-                } else {
-                    cache.ptr_chase_node = get_numa_node_of_cpu(first_cpu);
-                }
-            } catch (...) {}
+        if (has_explicit_src_cpu) {
+            auto& cache = SystemToolsCache::instance();
+            cache.ptr_chase_cpu = src_cpu;
+            auto it = cache.cpu_topology.find(src_cpu);
+            if (it != cache.cpu_topology.end()) {
+                cache.ptr_chase_node = it->second.node;
+            } else {
+                cache.ptr_chase_node = get_numa_node_of_cpu(src_cpu);
+            }
         }
 
         const std::string sampler_diagnostic = config->instruction_sampling
@@ -373,7 +623,8 @@ int main(int argc, char **argv) {
             : std::string();
         const bool sampler_ok = sampler_diagnostic.empty();
 
-        bool overall_ok = perf_accessible && tlb_ok && sampler_ok;
+        const bool apple_silicon = caps.isAppleSilicon();
+        bool overall_ok = config->run_gpu || ((perf_accessible || apple_silicon) && (tlb_ok || apple_silicon) && sampler_ok);
 
         // Initialize default ratios if none specified
         if (config->ratios_pct.empty()) {
@@ -393,8 +644,16 @@ int main(int argc, char **argv) {
             std::cout << "\033[31mKO\033[0m" << std::endl;
 
             if (!perf_accessible) {
+#if defined(_WIN32)
+                std::cout << "  → Bandwidth counters are not available." << std::endl;
+                if (!perf_probe.diagnosis.empty()) {
+                    std::cout << "    " << perf_probe.diagnosis << std::endl;
+                }
+                std::cout << "    See the Windows section of README.md." << std::endl;
+#else
                 std::cout << "  → Performance counter access denied (paranoid level: " << paranoid_level << ")" << std::endl;
                 std::cout << "    Required for benchmark execution. Try: echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid" << std::endl;
+#endif
             }
             if (perf_accessible && !tlb_ok) {
                 std::cout << "  → TLB measurement not available (using default values)" << std::endl;
@@ -413,7 +672,16 @@ int main(int argc, char **argv) {
         uint64_t tlb1_raw = 0, tlb2_raw = 0;
         bool use_tlb1 = false, use_tlb2 = false;
         bw_strategy.get_tlb_counters(tlb1_raw, tlb2_raw, use_tlb1, use_tlb2);
-        
+
+#if defined(_WIN32)
+        const bool huge_pages_ok = platform::large_pages_available();
+        if (!huge_pages_ok) {
+            std::cerr << "\nWarning: huge pages are unavailable; pointer chase will use 4 KB pages.\n"
+                      << "Grant \"Lock pages in memory\" to this user, then sign in again.\n"
+                      << std::endl;
+        }
+#endif
+
         if (config->dry_run) {
             std::cout << "\n=== Dry Run Mode ===" << std::endl;
             config->print_summary(std::cout, true);
@@ -423,37 +691,25 @@ int main(int argc, char **argv) {
             std::cout << "\n=== Memory Architecture & Counter Discovery ===" << std::endl;
             std::cout << "Detected Architecture: " << (architecture ? architecture->getName() : "Unknown") << std::endl;
             std::cout << "Memory Configuration:\n";
-            std::cout << "  Type: " << caps.memory_type;
+            std::cout << "  Type: " << (!caps.memory_type.empty() ? caps.memory_type : "Unknown");
             if (!caps.memory_frequency.empty()) {
                 std::cout << " @ " << caps.memory_frequency;
             }
+            if(caps.cpu_inferred) std::cout << " (inferred from CPU model; run with sudo for exact detection)";
             std::cout << "\n";
-            std::cout << "  Channels: " << caps.memory_channels << "\n";
-            std::cout << "  Total Size: " << (caps.total_memory / (1000*1000*1000)) << " GB\n";
-            std::cout << "  HBM detected: " << (bw_strategy.is_hbm() ? "yes" : "no") << "\n\n";
-
-            {
-                const auto numa_memory = detect_numa_memory_info(caps.model_name, caps.hasOnPackageHBM());
-                std::cout << "NUMA Memory Topology (per-node classification):\n";
-                std::cout << "  node  cpus  dax   size(GB)  HMAT_bw(MB/s)  HMAT_lat(ns)  type\n";
-                for (const auto& kv : numa_memory) {
-                    const auto& n = kv.second;
-                    std::cout << "  " << std::left << std::setw(6) << n.id
-                              << std::setw(6) << (n.has_cpus ? "yes" : "no")
-                              << std::setw(6) << (n.is_dax_backed ? "yes" : "no")
-                              << std::setw(10) << (n.mem_total_bytes / (1000LL*1000*1000))
-                              << std::setw(15) << n.read_bandwidth_mb_s
-                              << std::setw(14) << n.read_latency_ns
-                              << n.memory_type << "\n";
-                }
-                std::cout << "\n";
+            std::cout << "  Channels: " << caps.memory_channels;
+            if (caps.bus_width > 0) {
+                std::cout << " x " << caps.bus_width << "-bit";
             }
+            std::cout << "\n";
+            std::cout << "  Total Size: " << (caps.total_memory / (1024*1024*1024)) << " GB\n";
+            std::cout << "  HBM detected: " << (bw_strategy.is_hbm() ? "yes" : "no") << "\n";
+#if defined(_WIN32)
+            std::cout << "  Huge pages: " << (huge_pages_ok ? "enabled" : "disabled (pointer chase uses 4 KB pages)") << "\n";
+#endif
+            std::cout << "\n";
 
-            int num_cores = config->traffic_gen_cores;
-            if (num_cores <= 0) {
-                num_cores = get_default_traffic_gen_cores(detector.get_system_info());
-            }
-            if (num_cores < 1) num_cores = 1;
+            const int num_cores = resolve_traffic_gen_cores(*config, detector.get_system_info());
 
             std::cout << "TrafficGen Configuration:\n";
             std::cout << "  Cores: " << num_cores << "\n";
@@ -492,16 +748,17 @@ int main(int argc, char **argv) {
             if (!detector.get_capabilities().memory_frequency.empty()) {
                 std::cout << " @ " << detector.get_capabilities().memory_frequency;
             }
+            if(detector.get_capabilities().cpu_inferred) std::cout << " (inferred from CPU model; run with sudo for exact detection)";
             std::cout << "\n";
             
-            int traffic_cores = config->traffic_gen_cores;
-            if (traffic_cores <= 0) {
-                traffic_cores = get_default_traffic_gen_cores(detector.get_system_info());
-            }
-            if (traffic_cores < 1) traffic_cores = 1;
+            const int traffic_cores = resolve_traffic_gen_cores(*config, detector.get_system_info());
 
             std::cout << "TrafficGen Configuration:\n";
             std::cout << "  Cores: " << traffic_cores << "\n";
+            if (config->traffic_gen_array_elements > 0) {
+                std::cout << "  MultiSeq array size: " << ((config->traffic_gen_array_elements * sizeof(double)) / (1000 * 1000))
+                          << " MB total\n";
+            }
             std::cout << std::endl;
 
             std::cout << "Bindings:" << std::endl;
@@ -515,47 +772,37 @@ int main(int argc, char **argv) {
         
         std::filesystem::path root = get_project_root();
         std::string output_dir = (root / "src/traffic_gen/src").string();
-        
-        const auto& capabilities = detector.get_capabilities();
-        uint64_t arg1 = 5ULL * 1000 * 1000 * 1000;
-        uint64_t arg2 = static_cast<uint64_t>(capabilities.l3_size) * 8;
-        uint64_t min_traffic_gen_size = std::max(arg1, arg2) / sizeof(double);
-
-        bool using_avx512 = (config->kernel.isa_mode == ISAMode::AVX512 || 
-                            (config->kernel.isa_mode == ISAMode::AUTO && 
-                             std::find(capabilities.extensions.begin(), 
-                                      capabilities.extensions.end(), 
-                                      ISAExtension::AVX512) != capabilities.extensions.end()));
-        
-        if (using_avx512) {
-            min_traffic_gen_size *= 2;
-        } else {
-            min_traffic_gen_size = static_cast<uint64_t>(min_traffic_gen_size * 1.1);
-        }
-        
-        int num_cores = config->traffic_gen_cores;
-        if (num_cores <= 0) {
-            num_cores = detector.get_system_info().sockets[0].core_count - 1;
-        }
-        if (num_cores < 1) num_cores = 1;
 
         kernel_gen.generate_kernel(output_dir);
 
-        BenchmarkExecutor executor(*config, detector.get_system_info(), capabilities,
-                                 tlb_measurement.latency_ns, tlb_measurement.cache_line_size);
-        g_executor = &executor;
 
-        terminal::CursorGuard cursor_guard;
+        const auto& capabilities = detector.get_capabilities();
+        
+        std::vector<BenchmarkResult> final_results;
+        double total_runtime = 0.0;
+        std::vector<double> iteration_times;
 
-        if (!executor.run()) {
+        {
+            BenchmarkExecutor executor(*config, detector.get_system_info(), capabilities,
+                                     tlb_measurement.latency_ns, tlb_measurement.cache_line_size);
+            g_executor = &executor;
+
+            terminal::CursorGuard cursor_guard;
+
+            if (!executor.run()) {
+                g_executor = nullptr;
+                std::cerr << "\n\nBenchmark execution failed" << std::endl;
+                return EXIT_FAILURE;
+            }
             g_executor = nullptr;
-            std::cerr << "\n\nBenchmark execution failed" << std::endl;
-            return EXIT_FAILURE;
-        }
-        g_executor = nullptr;
 
-        ResultsProcessor results_processor(*config, &executor);
-        if (!results_processor.process(executor.get_results(), executor.get_total_runtime(), executor.get_iteration_times())) {
+            final_results = executor.get_results();
+            total_runtime = executor.get_total_runtime();
+            iteration_times = executor.get_iteration_times();
+        }
+
+        ResultsProcessor results_processor(*config, nullptr);
+        if (!results_processor.process(final_results, total_runtime, iteration_times)) {
             std::cerr << "Results processing failed" << std::endl;
             return EXIT_FAILURE;
         }

@@ -1,0 +1,101 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/cmake/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "linux-cmake",
+      "inherits": "base",
+      "displayName": "Linux (GCC)",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-cmake",
+      "inherits": "base",
+      "displayName": "macOS (Clang)",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "windows-mingw",
+      "inherits": "base",
+      "displayName": "Windows (MinGW-w64 GCC)",
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw.cmake"
+    },
+    {
+      "name": "linux-cmake-debug",
+      "inherits": "linux-cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "macos-cmake-debug",
+      "inherits": "macos-cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-mingw-debug",
+      "inherits": "windows-mingw",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-cmake",
+      "configurePreset": "linux-cmake"
+    },
+    {
+      "name": "macos-cmake",
+      "configurePreset": "macos-cmake"
+    },
+    {
+      "name": "windows-mingw",
+      "configurePreset": "windows-mingw"
+    },
+    {
+      "name": "linux-cmake-debug",
+      "configurePreset": "linux-cmake-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "macos-cmake-debug",
+      "configurePreset": "macos-cmake-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-mingw-debug",
+      "configurePreset": "windows-mingw-debug",
+      "configuration": "Debug"
+    }
+  ]
+}

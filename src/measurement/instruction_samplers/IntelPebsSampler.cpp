@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,6 +34,8 @@
  */
 #include "measurement/instruction_samplers/IntelPebsSampler.h"
 #include "Utils.h"
+#include "utils/FileUtils.h"
+#include "utils/StringUtils.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -47,32 +51,6 @@
 #include <cstdlib>
 
 namespace {
-    std::string shell_quote(const std::string &s) {
-        std::string out = "'";
-        for (char c : s) {
-            if (c == '\'') out += "'\\''";
-            else out += c;
-        }
-        out += "'";
-        return out;
-    }
-
-    std::string choose_temp_dir() {
-        const char *candidates[] = {"/dev/shm", "/tmp"};
-        for (const char *d : candidates) {
-            if (std::filesystem::exists(d) && access(d, W_OK) == 0) return d;
-        }
-        return "/tmp";
-    }
-
-    std::string read_sysfs(const std::string &path) {
-        std::ifstream f(path);
-        if (!f) return "";
-        std::string val;
-        f >> val;
-        return val;
-    }
-
     uint64_t parse_hex(const std::string &s, const std::string &key) {
         auto pos = s.find(key + "=");
         if (pos == std::string::npos) return 0;
@@ -99,11 +77,11 @@ std::vector<PmuConfig> IntelPebsSampler::discover_pmu_candidates() const {
         std::string base = std::string("/sys/bus/event_source/devices/") + dev;
         if (!std::filesystem::exists(base)) continue;
 
-        std::string type_str = read_sysfs(base + "/type");
+        std::string type_str = file_utils::read_token(base + "/type");
         if (type_str.empty()) continue;
         uint32_t type = std::stoul(type_str);
 
-        std::string aux_ev = read_sysfs(base + "/events/mem-loads-aux");
+        std::string aux_ev = file_utils::read_token(base + "/events/mem-loads-aux");
         if (!aux_ev.empty()) {
             uint64_t event = parse_hex(aux_ev, "event");
             uint64_t umask = parse_hex(aux_ev, "umask");
@@ -111,7 +89,7 @@ std::vector<PmuConfig> IntelPebsSampler::discover_pmu_candidates() const {
             candidates.push_back({type, cfg, 0, true, "mem-loads-aux (SPR+)"});
         }
 
-        std::string ev = read_sysfs(base + "/events/mem-loads");
+        std::string ev = file_utils::read_token(base + "/events/mem-loads");
         if (!ev.empty()) {
             uint64_t event = parse_hex(ev, "event");
             uint64_t umask = parse_hex(ev, "umask");
@@ -127,7 +105,7 @@ std::vector<PmuConfig> IntelPebsSampler::discover_pmu_candidates() const {
 }
 
 bool IntelPebsSampler::is_available() const {
-    std::string vendor = read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/vendor");
+    std::string vendor = file_utils::read_token("/sys/devices/system/cpu/cpu0/cpufreq/vendor");
     if (vendor.empty()) {
         std::ifstream cpuinfo("/proc/cpuinfo");
         std::string line;
@@ -149,7 +127,7 @@ bool IntelPebsSampler::is_available() const {
     return !candidates.empty();
 }
 
-bool IntelPebsSampler::start_async(const std::vector<int>& cores, const std::vector<pid_t>& /* pids */) {
+bool IntelPebsSampler::start_async(const std::vector<int>& cores, const std::vector<platform::ProcessId>& /* pids */) {
     if (is_running_) {
         return false;
     }
@@ -177,7 +155,7 @@ bool IntelPebsSampler::start_async(const std::vector<int>& cores, const std::vec
     flush_range(start, prev);
     selected_cpu_spec_ = spec;
 
-    std::string temp_dir = choose_temp_dir();
+    std::string temp_dir = file_utils::choose_temp_dir();
     current_perf_data_path_ = temp_dir + "/mem_sampler_perf_" + std::to_string(getpid()) + ".data";
     current_perf_log_path_ = temp_dir + "/mem_sampler_perf_" + std::to_string(getpid()) + ".log";
     unlink(current_perf_data_path_.c_str());
@@ -265,10 +243,10 @@ void IntelPebsSampler::sampling_thread_func() {
 
 bool IntelPebsSampler::parse_perf_script_data(
     const std::string &perf_data_path,
-    const std::vector<pid_t> &pids,
+    const std::vector<platform::ProcessId> &pids,
     std::vector<uint64_t> &ram_latencies) {
     
-    std::string cmd = "perf script -i " + shell_quote(perf_data_path) +
+    std::string cmd = "perf script -i " + string_utils::shell_quote(perf_data_path) +
                       " -F pid,weight,data_src 2>/dev/null";
 
     FILE *fp = popen(cmd.c_str(), "r");
@@ -329,11 +307,12 @@ bool IntelPebsSampler::parse_perf_script_data(
         bool is_ram = false;
 
         if (lvl_num && lvl_num != 0x0f) {
-            if (lvl_num == 0x0d) is_ram = hit; 
+            if (lvl_num == 0x0d || lvl_num == 0x0e || lvl_num == 0x09) is_ram = hit;
         } else {
             if (mem_lvl & 0x0080) is_ram = hit;
             if (mem_lvl & 0x0100) is_ram = hit;
             if (mem_lvl & 0x0200) is_ram = hit;
+            if (mem_lvl & 0x2000) is_ram = hit;
         }
 
         if (!is_ram) { ++not_ram; continue; }
@@ -361,11 +340,11 @@ bool IntelPebsSampler::parse_perf_script_data(
 
 bool IntelPebsSampler::parse_perf_report_data(
     const std::string &perf_data_path,
-    const std::vector<pid_t> &pids,
+    const std::vector<platform::ProcessId> &pids,
     std::vector<uint64_t> &ram_latencies) {
 
     std::string cmd = "perf report --mem-mode --stdio -t , --show-nr-samples "
-                      "-F local_weight,pid,mem -i " + shell_quote(perf_data_path) +
+                      "-F local_weight,pid,mem -i " + string_utils::shell_quote(perf_data_path) +
                       " 2>/dev/null";
 
     FILE *fp = popen(cmd.c_str(), "r");
@@ -411,8 +390,7 @@ bool IntelPebsSampler::parse_perf_report_data(
             ++pid_filtered;
             continue;
         }
-
-        if (!strstr(mem_desc, "RAM hit")) { ++not_ram; continue; }
+        if (!strstr(mem_desc, "RAM hit") && !strstr(mem_desc, "PMEM hit") && !strstr(mem_desc, "Uncached or N/A hit")) { ++not_ram; continue; }
 
         if (weight == 0) { ++zero_weight; continue; }
 
@@ -433,7 +411,7 @@ bool IntelPebsSampler::parse_perf_report_data(
 
 void IntelPebsSampler::collect_samples(
     const std::string &perf_data_path,
-    const std::vector<pid_t> &pids,
+    const std::vector<platform::ProcessId> &pids,
     std::vector<uint64_t> &ram_latencies) {
 
     parse_perf_script_data(perf_data_path, pids, ram_latencies);
@@ -464,7 +442,7 @@ InstructionSamplerStats IntelPebsSampler::stop_and_process(double cpu_freq_ghz) 
     InstructionSamplerStats stats{};
     std::vector<uint64_t> latencies;
     
-    std::vector<pid_t> all_pids; // We don't filter by PID right now because traffic gen has many children, perf -C is used
+    std::vector<platform::ProcessId> all_pids; // We don't filter by PID right now because traffic gen has many children, perf -C is used
     collect_samples(current_perf_data_path_, all_pids, latencies);
     
     unlink(current_perf_data_path_.c_str());
@@ -488,7 +466,7 @@ InstructionSamplerStats IntelPebsSampler::stop_and_process(double cpu_freq_ghz) 
 
         latencies.clear();
 
-        std::string temp_dir = choose_temp_dir();
+        std::string temp_dir = file_utils::choose_temp_dir();
         current_perf_data_path_ = temp_dir + "/mem_sampler_perf_" + std::to_string(getpid()) + ".data";
         current_perf_log_path_  = temp_dir + "/mem_sampler_perf_" + std::to_string(getpid()) + ".log";
         unlink(current_perf_data_path_.c_str());
@@ -521,49 +499,7 @@ InstructionSamplerStats IntelPebsSampler::stop_and_process(double cpu_freq_ghz) 
         return stats;
     }
 
-    std::sort(latencies.begin(), latencies.end());
-    stats.samples = latencies.size();
-    stats.raw_latencies = std::move(latencies);
-    
-    double sum = std::accumulate(stats.raw_latencies.begin(), stats.raw_latencies.end(), 0.0);
-    stats.mean_cycles = sum / stats.samples;
-    stats.min_cycles = stats.raw_latencies.front();
-    stats.max_cycles = stats.raw_latencies.back();
-    
-    auto pct = [&](double p) -> double {
-        size_t idx = static_cast<size_t>(p * (stats.samples - 1));
-        return stats.raw_latencies[idx];
-    };
-    
-    stats.median_cycles = pct(0.50);
-    stats.p90_cycles = pct(0.90);
-    stats.p95_cycles = pct(0.95);
-    stats.p99_cycles = pct(0.99);
-    stats.p99_9_cycles = pct(0.999);
-
-    {
-        size_t q1_idx = static_cast<size_t>(0.25 * (stats.samples - 1));
-        size_t q3_idx = static_cast<size_t>(0.75 * (stats.samples - 1));
-        double iqr_sum = std::accumulate(
-            stats.raw_latencies.begin() + q1_idx,
-            stats.raw_latencies.begin() + q3_idx + 1,
-            0.0);
-        stats.iqr_mean_cycles = iqr_sum / (q3_idx - q1_idx + 1);
-    }
-
-    if (cpu_freq_ghz > 0.0) {
-        stats.mean_ns = stats.mean_cycles / cpu_freq_ghz;
-        stats.iqr_mean_ns = stats.iqr_mean_cycles / cpu_freq_ghz;
-        stats.min_ns = stats.min_cycles / cpu_freq_ghz;
-        stats.median_ns = stats.median_cycles / cpu_freq_ghz;
-        stats.p90_ns = stats.p90_cycles / cpu_freq_ghz;
-        stats.p95_ns = stats.p95_cycles / cpu_freq_ghz;
-        stats.p99_ns = stats.p99_cycles / cpu_freq_ghz;
-        stats.p99_9_ns = stats.p99_9_cycles / cpu_freq_ghz;
-        stats.max_ns = stats.max_cycles / cpu_freq_ghz;
-    }
-
-    return stats;
+    return build_instruction_sampler_stats(std::move(latencies), cpu_freq_ghz);
 }
 
 void IntelPebsSampler::cleanup() {
@@ -584,4 +520,3 @@ void IntelPebsSampler::cleanup() {
     }
     perf_child_pid_ = -1;
 }
-

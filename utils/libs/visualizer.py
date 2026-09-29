@@ -1,14 +1,70 @@
 import os
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import warnings
-from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
-import matplotlib.patches as patches
-import seaborn as sns
-from matplotlib.lines import Line2D
 from matplotlib.colors import Normalize
 
 fontSizeMess = 24
+curveLineWidth = 1.0
+refLineWidth = 2.0
+markerSize = 4
+figSize = (16, 9)
+gradientLegendBoxSize = (0.25, 0.03)
+
+
+def configure_plot_style():
+    global fontSizeMess, curveLineWidth, refLineWidth, markerSize
+    global figSize, gradientLegendBoxSize
+    fontSizeMess = 38
+    curveLineWidth = 2.0
+    refLineWidth = 3.5
+    markerSize = 8
+    figSize = (16, 9)
+    gradientLegendBoxSize = (0.34, 0.028)
+
+
+def _legend_fontsize():
+    return fontSizeMess - 4
+
+
+def _center_ylabels_on_figure(fig):
+    try:
+        fig.canvas.draw()
+    except Exception:
+        return
+
+    fig_h = fig.bbox.height
+    for ax in fig.axes:
+        label = ax.yaxis.label
+        if not label.get_text():
+            continue
+        pos = ax.get_position()
+        ax_h = pos.height * fig_h
+        if ax_h <= 0:
+            continue
+        # x is in points (labelpad); keep it and only retarget the vertical anchor
+        # so the label's centre lands on the figure's vertical middle.
+        x_pts = label.get_position()[0]
+        yfrac = (fig_h / 2.0 - pos.y0 * fig_h) / ax_h
+        label.set_position((x_pts, yfrac))
+
+
+def _save_main_figure(fig, output_path):
+    fig.set_size_inches(figSize)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        fig.tight_layout()
+    # Tall y limits + large y-labels can clip the trailing "[ns]" without extra left room.
+    fig.subplots_adjust(left=max(fig.subplotpars.left, 0.10))
+    _center_ylabels_on_figure(fig)
+    save_kw = dict(bbox_inches='tight', dpi=300, pad_inches=0.15)
+    fig.savefig(output_path, **save_kw)
+    fig.savefig(os.path.splitext(output_path)[0] + '.png', **save_kw)
+    plt.close(fig)
+
 
 def _is_intel_pcm_config(config):
     if not isinstance(config, dict):
@@ -30,114 +86,243 @@ def _is_intel_pcm_config(config):
 
     return False
 
-def calculate_color(rw, cmap_name='Blues'):
+def calculate_color(rw, cmap_name='Blues', rw_min=50.0):
     """Map RW ratio to Blues using legacy intensity bounds (no near-white curves)."""
     cmap = plt.colormaps[cmap_name]
 
-    rw_clipped = max(50.0, min(100.0, float(rw)))
-    # Keep the same direction as legend labels: 100 on the left, 50 on the right.
-    # Legacy plotters did not use the near-white end of the colormap.
-    c = 0.2 + ((100.0 - rw_clipped) / 50.0) * 0.8
+    span = 100.0 - float(rw_min)
+    if span <= 0:
+        return cmap(0.2)
+    rw_clipped = max(float(rw_min), min(100.0, float(rw)))
+    # Keep the same direction as legend labels: 100 on the left, rw_min on the right.
+    c = 0.2 + ((100.0 - rw_clipped) / span) * 0.8
 
     return cmap(c)
 
 
-def add_gradient_legend(ax, label, rw_min=0, rw_max=100, colors=None, box_position=(0.05, 0.95), box_size=(0.25, 0.03), fontsize=12):
-    """
-    Adds a horizontal gradient legend inside the axes at a fixed position.
+def _derive_rw_min(ratios):
+    """Ratio-legend lower bound: widen to 0:100 when write-dominant curves are drawn."""
+    return 0 if any(float(rw) < 50 for rw in ratios) else 50
 
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        The axes to attach the legend to.
-    label : str
-        The dataset label for the gradient legend.
-    rw_min, rw_max : float
-        Minimum and maximum RW values to display.
-    colors : list of colors
-        List of colors for the gradient (if None, defaults to plt.cm.Blues).
-    box_position : tuple (x0, y0)
-        Position of the top-left corner of the box in axes fraction coordinates.
-    box_size : tuple (width, height)
-        Size of the legend box in axes fraction coordinates.
-    fontsize : int
-        Font size for the labels.
-    """
-    fig = ax.figure
 
+def _rd_wr_legend_label(rd_pct):
+    rd = int(round(rd_pct))
+    return f'RD:WR {rd}:{100 - rd}'
+
+
+def _draw_gradient_legend_bar(cbar_ax, colors, rw_min=50, rw_max=100, fontsize=12):
+    """Draw colormap bar + RD:WR end labels into an existing axes."""
     cmap = plt.get_cmap(colors)
     norm = Normalize(vmin=rw_min, vmax=rw_max)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
+    cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.outline.set_visible(False)
+    cbar.ax.set_xticks([])
+    cbar_ax.text(0.01, 0.5, _rd_wr_legend_label(rw_max), va='center', ha='right',
+                 transform=cbar_ax.transAxes, fontsize=fontsize - 3, clip_on=False)
+    cbar_ax.text(1.00, 0.5, _rd_wr_legend_label(rw_min), va='center', ha='left',
+                 transform=cbar_ax.transAxes, fontsize=fontsize - 3, clip_on=False)
 
-    # Convert axes fraction to figure fraction
+
+def add_gradient_legend(ax, colors, rw_min=50, rw_max=100, box_position=(0.05, 0.95), box_size=None, fontsize=12):
+    """Add a horizontal gradient legend (colormap bar + RD:WR end labels) on `ax`."""
+    if box_size is None:
+        box_size = gradientLegendBoxSize
     bbox = ax.get_position()
     fig_x = bbox.x0 + box_position[0] * bbox.width
     fig_y = bbox.y0 + box_position[1] * bbox.height
     fig_width = box_size[0] * bbox.width
     fig_height = box_size[1] * bbox.height
-
-    # Add a new axes for the gradient inside the plot
-    cbar_ax = fig.add_axes([fig_x, fig_y, fig_width, fig_height])
-    cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
-    cbar.outline.set_visible(False)
-    cbar.ax.set_xticks([])
-    # Add labels at the ends
-    cbar_ax.text(0.01, 0.5, f'RD:WR {rw_max}:{100-rw_max}', va='center', ha='right',
-                 transform=cbar_ax.transAxes, fontsize=fontsize-3)
-    cbar_ax.text(1.00, 0.5, f'RD:WR {rw_min}:{100-rw_min}', va='center', ha='left',
-            transform=cbar_ax.transAxes, fontsize=fontsize-3)
-
-     # Add dataset label on top of the gradient
-    cbar_ax.text(0.5, 1.0, label, va='bottom', ha='center',
-                 transform=cbar_ax.transAxes, fontsize=fontsize, color='black')
+    cbar_ax = ax.figure.add_axes([fig_x, fig_y, fig_width, fig_height])
+    _draw_gradient_legend_bar(cbar_ax, colors, rw_min, rw_max, fontsize)
 
 
+def _legend_only_layout_inches(n_legends, legend_fontsize, with_titles=True):
+    pad_in = 0.12
+    bar_width_in = 5.5
+    bar_height_in = max(0.26, (legend_fontsize / 72.0) * 0.72)
+    title_height_in = (legend_fontsize / 72.0) * 1.1 if with_titles else 0.0
+    title_gap_in = 0.05 if with_titles else 0.0
+    row_h = title_height_in + title_gap_in + bar_height_in
+    row_gap_in = max(0.10, row_h * 0.18)
+    stack_h = n_legends * row_h + max(0, n_legends - 1) * row_gap_in
+    total_w = bar_width_in + 2 * pad_in
+    total_h = stack_h + 2 * pad_in
+    return (
+            total_w,
+            total_h,
+            pad_in,
+            bar_width_in,
+            bar_height_in,
+            title_height_in,
+            title_gap_in,
+            row_h,
+            row_gap_in,
+            )
+
+
+def _combined_legend_entries(datasets):
+    return [(label, cmap_name) for label, _, _, cmap_name, _ in datasets]
+
+
+def save_gradient_legends_figure(output_base, legend_entries, rw_min=50):
+    """Save RD:WR gradient legend(s) as standalone <output_base>.legends.pdf/.png.
+
+    ``legend_entries`` is a list of ``(title, cmap_name)`` rows: a single row
+    with ``title=None`` gives the shared legend for a dataset's individual
+    charts; one titled row per dataset gives the combined-chart legend.
+    """
+    if not legend_entries:
+        return
+
+    legend_pdf = output_base + '.legends.pdf'
+    legend_png = output_base + '.legends.png'
+
+    legend_fs = _legend_fontsize()
+    n = len(legend_entries)
+    with_titles = any(title for title, _ in legend_entries)
+    layout = _legend_only_layout_inches(n, legend_fs, with_titles)
+    total_w, total_h, pad_in, bar_w, bar_h, title_h, title_gap, row_h, row_gap = layout
+
+    fig = plt.figure(figsize=(total_w, total_h))
+    legend_axes = []
+    title_artists = []
+    x_center = (pad_in + bar_w / 2.0) / total_w
+
+    for i, (dataset_name, cmap_name) in enumerate(legend_entries):
+        row_top_in = total_h - pad_in - i * (row_h + row_gap)
+        bar_bottom_in = row_top_in - row_h + title_h + title_gap
+        left_frac = pad_in / total_w
+        bottom_frac = bar_bottom_in / total_h
+        width_frac = bar_w / total_w
+        height_frac = bar_h / total_h
+        cbar_ax = fig.add_axes([left_frac, bottom_frac, width_frac, height_frac])
+        _draw_gradient_legend_bar(cbar_ax, cmap_name, rw_min, 100, legend_fs)
+        legend_axes.append(cbar_ax)
+
+        if dataset_name:
+            title_y = (bar_bottom_in + bar_h + title_gap + title_h / 2.0) / total_h
+            title_artists.append(
+                    fig.text(
+                        x_center,
+                        title_y,
+                        dataset_name,
+                        ha='center',
+                        va='center',
+                        fontsize=legend_fs,
+                        color='black',
+                        clip_on=False,
+                        )
+                    )
+
+    save_kw = dict(
+            dpi=300,
+            bbox_inches='tight',
+            bbox_extra_artists=legend_axes + title_artists,
+            pad_inches=0.06,
+            )
+    fig.savefig(legend_pdf, facecolor='white', **save_kw)
+    fig.savefig(legend_png, transparent=True, **save_kw)
+    plt.close(fig)
 
 
 def filter_clustered_points(
     df,
     bw_tolerance_gb=2.0,
-    min_latency_increase_percent=5.0,   
+    min_latency_increase_percent=5.0,
     bw_col='bandwidth_smooth',
     lat_col='latency_smooth'
 ):
     """
-    Keep points where:
-    - bandwidth increases by at least bw_tolerance_gb
-    - AND smoothed latency increases by at least min_latency_increase_percent %
+    Two-region point decimation:
+    - Flat region  (latency within min_latency_increase_percent of the base): keep by
+      BW spacing only so the low-BW shape is faithfully represented.
+    - Knee/saturation region (latency has risen beyond the threshold): require both
+      sufficient BW increase AND sufficient latency increase to thin out the dense
+      cluster near saturation.
     """
     if df.empty or len(df) <= 1:
         return df
-    
+
     if bw_col not in df.columns or lat_col not in df.columns:
         return df
-    
+
     df = df.sort_values(bw_col).reset_index(drop=True)
-    
+
+    threshold = min_latency_increase_percent / 100.0
+    base_lat = df.iloc[0][lat_col]   # lowest-BW point carries the baseline latency
+
     keep_idx = [0]
     last_bw = df.iloc[0][bw_col]
-    last_lat = df.iloc[0][lat_col]
-    
-    threshold = min_latency_increase_percent / 100.0 
-    
+    last_lat = base_lat
+
     for i in range(1, len(df)):
         current_bw = df.iloc[i][bw_col]
         current_lat = df.iloc[i][lat_col]
-        
-        bw_ok = current_bw - last_bw >= bw_tolerance_gb
-        
-        lat_ok = False
-        if last_lat > 0 and current_lat > last_lat:
-            increase_ratio = (current_lat - last_lat) / last_lat
-            lat_ok = increase_ratio >= threshold
-        
-        if bw_ok and lat_ok:
-            keep_idx.append(i)
-            last_bw = current_bw
-            last_lat = current_lat
-    
+
+        bw_ok = (current_bw - last_bw) >= bw_tolerance_gb
+
+        # Flat region: latency has not yet risen meaningfully from the base
+        in_flat = (base_lat > 0 and
+                   (current_lat - base_lat) / base_lat < threshold)
+
+        if in_flat:
+            # BW spacing alone is sufficient — preserve the flat curve shape
+            if bw_ok:
+                keep_idx.append(i)
+                last_bw = current_bw
+                last_lat = current_lat
+        else:
+            # Knee/saturation: thin out by requiring both BW and latency to grow
+            lat_ok = (last_lat > 0 and current_lat > last_lat and
+                      (current_lat - last_lat) / last_lat >= threshold)
+            if bw_ok and lat_ok:
+                keep_idx.append(i)
+                last_bw = current_bw
+                last_lat = current_lat
+
     return df.iloc[keep_idx].reset_index(drop=True)
+
+
+def filter_large_bw_jumps(df, bw_col='bandwidth_smooth', gap_fraction=0.4):
+    """
+    Drop the smaller BW segment separated by a large gap.
+
+    Raw-mode cleanup: removes spurious low-BW points (e.g. ~0 GB/s) that would
+    otherwise draw a diagonal line into the main curve.
+    """
+    if df.empty or len(df) <= 1:
+        return df
+    if bw_col not in df.columns:
+        return df
+
+    df = df.sort_values(bw_col).reset_index(drop=True)
+
+    while len(df) > 1:
+        bw = df[bw_col].to_numpy(dtype=float)
+        gaps = np.diff(bw)
+        span = bw[-1] - bw[0]
+        if span <= 0:
+            return df
+
+        max_allowed = span * gap_fraction
+        max_gap_idx = int(np.argmax(gaps))
+        if gaps[max_gap_idx] <= max_allowed:
+            return df
+
+        left = df.iloc[:max_gap_idx + 1]
+        right = df.iloc[max_gap_idx + 1:]
+        if len(right) > len(left):
+            df = right
+        elif len(left) > len(right):
+            df = left
+        else:
+            df = right if right[bw_col].max() >= left[bw_col].max() else left
+        df = df.reset_index(drop=True)
+
+    return df
+
 
 def is_valid_curve(df,
                    min_points=10,
@@ -161,7 +346,6 @@ def is_valid_curve(df,
 
     bw = df[bw_column].dropna()
 
-    # Check for large horizontal jumps
     bw_sorted = np.sort(bw)
     gaps = np.diff(bw_sorted)
     max_gap = gaps.max() if len(gaps) > 0 else 0
@@ -221,13 +405,212 @@ def _compute_theoretical_max_bw(config):
     return max_bw
 
 
+_MEMORY_SIGNATURE_KEYS = (
+        'MEMORY_BINDING',
+        'MEM_FREQ',
+        'N_CHANNELS',
+        'BUS_WIDTH',
+        'UPI_FREQ',
+        'N_DATA_LANES',
+        'FLIT_BIT',
+        'DATA_FLIT_BIT',
+        'N_UPI_CHANNELS',
+        'NVLINK_BW_GB_S',
+        )
 
-def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blues', limit_bw_override=None, limit_lat_override=None, ignore_guards=False, apply_corrections=True, y_label=None, draw_dots=False):
+_MEMORY_SYSTEM_REF_CMAPS = ('Blues', 'Greens')
+
+
+def _memory_system_signature(config):
+    """Keys from plotter.txt that determine theoretical memory bandwidth."""
+    return tuple(str(config.get(key, '')).strip() for key in _MEMORY_SIGNATURE_KEYS)
+
+
+def _datasets_share_memory_config(datasets):
+    signatures = [_memory_system_signature(cfg) for _, _, cfg, _, _ in datasets]
+    return len(set(signatures)) <= 1
+
+
+def _memory_system_signature_ranks(datasets):
+    """Rank unique memory configs by theoretical max BW (0 = highest)."""
+    sig_to_bw = {}
+    for _, _, cfg, _, _ in datasets:
+        sig = _memory_system_signature(cfg)
+        if sig not in sig_to_bw:
+            sig_to_bw[sig] = _compute_theoretical_max_bw(cfg)
+    sorted_sigs = sorted(sig_to_bw.keys(), key=lambda sig: sig_to_bw[sig], reverse=True)
+    return {sig: rank for rank, sig in enumerate(sorted_sigs)}
+
+
+def _memory_system_ref_cmap(config, sig_ranks):
+    rank = sig_ranks.get(_memory_system_signature(config), 0)
+    return _MEMORY_SYSTEM_REF_CMAPS[min(rank, len(_MEMORY_SYSTEM_REF_CMAPS) - 1)]
+
+
+def _prepare_combined_datasets_for_memory_compare(datasets):
+    """Remap curve colormaps when comparing different memory systems.
+
+    Highest theoretical BW → Blues, lower → Greens.  Unchanged for the regular
+    case of datasets sharing the same plotter.txt memory settings.
+    """
+    if _datasets_share_memory_config(datasets):
+        return datasets
+
+    sig_ranks = _memory_system_signature_ranks(datasets)
+    return [
+            (label, dfs_rw, cfg, _memory_system_ref_cmap(cfg, sig_ranks), measuring_dir)
+            for label, dfs_rw, cfg, _cmap_name, measuring_dir in datasets
+            ]
+
+
+def _combined_theoretical_max_bw_specs(datasets):
+    """Build max-BW reference line specs for combined plots.
+
+    When every dataset shares the same memory plotter.txt settings, return a
+    single neutral line.  When memory systems differ, return one coloured line
+    per unique config: highest theoretical BW in blue, lower in green (so the
+    reference colours do not clash with red/blue curve colormaps).
+    """
+    if _datasets_share_memory_config(datasets):
+        max_bw = max(_compute_theoretical_max_bw(cfg) for _, _, cfg, _, _ in datasets)
+        if max_bw <= 0:
+            return []
+        return [(max_bw, calculate_color(75), f'Max. theoretical BW = {int(max_bw)} GB/s')]
+
+    sig_ranks = _memory_system_signature_ranks(datasets)
+    unique = []
+    seen = set()
+    for _, _, cfg, _, _ in datasets:
+        sig = _memory_system_signature(cfg)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        max_bw = _compute_theoretical_max_bw(cfg)
+        if max_bw > 0:
+            unique.append((sig_ranks[sig], max_bw))
+
+    if not unique:
+        return []
+
+    unique.sort(key=lambda item: item[0])
+    specs = []
+    for rank, max_bw in unique:
+        cmap_name = _MEMORY_SYSTEM_REF_CMAPS[min(rank, len(_MEMORY_SYSTEM_REF_CMAPS) - 1)]
+        color = calculate_color(75, cmap_name)
+        specs.append((max_bw, color, f'Max. theoretical BW = {int(max_bw)} GB/s'))
+    return specs
+
+
+def _should_draw_combined_max_bw_line(datasets, max_bw, global_max_bw):
+    is_any_nvidia_pmu = any(
+            cfg.get("USE_NVIDIA_PMU", "False").lower() in ('true', '1', 't')
+            for _, _, cfg, _, _ in datasets)
+    any_nvlink_bw = any(float(cfg.get("NVLINK_BW_GB_S", 0)) > 0 for _, _, cfg, _, _ in datasets)
+    if max_bw <= 0 or (global_max_bw > max_bw * 1.5):
+        return False
+    return not (is_any_nvidia_pmu and not any_nvlink_bw)
+
+
+def _draw_combined_theoretical_max_bw(ax, datasets, limit_bw, y_top, max_bw_val, global_max_bw, *, label_x_offset_frac=0.005,
+                                      use_bbox=True, linewidth_scale=1.5):
+    """Draw one or more theoretical max-BW vertical reference lines.
+
+    Returns True when at least one line and label were drawn, so callers can
+    keep other top-of-chart labels clear of them.
+    """
+    if not _should_draw_combined_max_bw_line(datasets, max_bw_val, global_max_bw):
+        return False
+
+    specs = _combined_theoretical_max_bw_specs(datasets)
+    if not specs:
+        return False
+
+    label_fs = fontSizeMess - 4
+    text_kw = dict(
+            verticalalignment='top',
+            fontsize=label_fs,
+            zorder=10,
+            )
+    if use_bbox:
+        text_kw['bbox'] = dict(facecolor='white', edgecolor='none', alpha=1.0, pad=2)
+
+    for max_bw, color, _label in specs:
+        ax.axvline(
+                x=max_bw,
+                color=color,
+                linewidth=refLineWidth * linewidth_scale,
+                linestyle=':',
+                zorder=10,
+                )
+
+    if len(specs) == 1:
+        max_bw, color, label = specs[0]
+        label_color = 'black' if _datasets_share_memory_config(datasets) else color
+        ax.text(
+                x=max_bw - limit_bw * label_x_offset_frac,
+                y=y_top * 0.95,
+                s=label,
+                color=label_color,
+                horizontalalignment='right',
+                **text_kw,
+                )
+        return True
+
+    # Several memory systems: anchor labels in the top-right corner so long
+    # strings do not overlap when the vertical reference lines are close.
+    anchor_x = limit_bw * (1.0 - label_x_offset_frac) if label_x_offset_frac else limit_bw * 0.99
+    y_step = max(0.08, (label_fs / y_top) * 1.15) if y_top > 0 else 0.08
+    for i, (_max_bw, color, label) in enumerate(specs):
+        ax.text(
+                x=anchor_x,
+                y=y_top * (0.97 - i * y_step),
+                s=label,
+                color=color,
+                horizontalalignment='right',
+                **text_kw,
+                )
+    return True
+
+
+def _draw_max_bw_line(ax, config, max_bw, limit_bw, y_top, cmap_name, global_max_bw=0):
+    """Vertical theoretical max-BW reference line, same look on every chart.
+
+    Returns True when the line and its label were drawn, so callers can keep
+    other top-of-chart labels clear of the label strip.
+    """
+    is_nvidia_pmu = config.get("USE_NVIDIA_PMU", "False").lower() in ('true', '1', 't')
+    nvlink_bw = float(config.get("NVLINK_BW_GB_S", 0))
+    # Do not draw the line for NVIDIA counters if NVLINK_BW is not specified, or if max_bw is clearly wrong (e.g. CPU peak for GPU)
+    if max_bw <= 0 or (is_nvidia_pmu and nvlink_bw == 0) or (global_max_bw > max_bw * 1.5):
+        return False
+    ax.axvline(x=max_bw, color=calculate_color(75, cmap_name), linewidth=refLineWidth * 1.5, linestyle=':', zorder=10)
+    ax.text(x=max_bw - limit_bw * 0.005, y=y_top * 0.95,
+            s=f'Max. theoretical BW = {max_bw:.0f} GB/s',
+            horizontalalignment='right', verticalalignment='top',
+            fontsize=fontSizeMess - 4, zorder=10,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=1.0, pad=2))
+    return True
+
+
+def _memory_curve_lat_limit(global_max_lat, floor=700.0):
+    """Default Y limit for memory latency curves: floor, or 20% above peak if higher."""
+    if global_max_lat > 0:
+        return max(floor, global_max_lat * 1.2)
+    return floor
+
+
+
+
+def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blues',
+                limit_bw_override=None, limit_lat_override=None, ignore_guards=False,
+                apply_corrections=True, y_label=None, draw_dots=False,
+                draw_lines=True,
+                legend_rw_min=None):
     """Plot bandwidth-latency curves and save to PDF"""
     if not dfs_rw:
         print("No data to plot")
         return
-    
+
     fig, ax = plt.subplots(1, 1)
     
     max_bw = _compute_theoretical_max_bw(config)
@@ -244,7 +627,7 @@ def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blue
     
     for rw, df in dfs_rw.items():
         if not df.empty:
-            if apply_corrections:
+            if apply_corrections and draw_lines:
                 df_clean = filter_clustered_points(df.copy(), 1.0, bw_col='bandwidth_smooth')
             else:
                 df_clean = df.copy()
@@ -261,30 +644,33 @@ def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blue
     limit_bw = limit_bw_override
     if limit_bw is None:
         if max_bw > 0:
-            limit_bw = max_bw * 1.1
+            limit_bw = max(max_bw, global_max_bw) * 1.1
         else:
             limit_bw = global_max_bw * 1.1 if global_max_bw > 0 else 321
 
     limit_lat = limit_lat_override
     if limit_lat is None:
-        limit_lat = max(700, global_max_lat * 1.1) if global_max_lat > 0 else 700
-    
+        limit_lat = _memory_curve_lat_limit(global_max_lat)
+
     ax.set_xlim([0, limit_bw])
     ax.set_ylim([0, limit_lat])
 
-    marker = 'o' if draw_dots else None
-    markersize = 4 if draw_dots else None
+    marker = 'o' if (draw_dots or not draw_lines) else None
+    markersize = markerSize if (draw_dots or not draw_lines) else None
+    linewidth = curveLineWidth if draw_lines else 0
+
+    rw_min = legend_rw_min if legend_rw_min is not None else _derive_rw_min(processed_dfs)
 
     sorted_ratios = [rw for rw, _ in sorted(sorting_list, key=lambda x: x[0])]
     for rw in sorted_ratios:
         df = processed_dfs[rw]
         if not df.empty:
             if (not apply_corrections) or ignore_guards:
-                ax.plot(df['bandwidth_smooth'], df['latency_smooth'], 
-                    color=calculate_color(rw, cmap_name), linewidth=1,
+                ax.plot(df['bandwidth_smooth'], df['latency_smooth'],
+                    color=calculate_color(rw, cmap_name, rw_min), linewidth=linewidth,
                     marker=marker, markersize=markersize,
                     label=f'Rd:Wr {rw}:0')
-            else: 
+            else:
                 is_valid, reason = is_valid_curve(
                     df,
                     min_points=5,
@@ -292,8 +678,8 @@ def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blue
                     gap_fraction=0.7,
                     ignore_guards=False)
                 if is_valid:
-                    ax.plot(df['bandwidth_smooth'], df['latency_smooth'], 
-                        color=calculate_color(rw, cmap_name), linewidth=1,
+                    ax.plot(df['bandwidth_smooth'], df['latency_smooth'],
+                        color=calculate_color(rw, cmap_name, rw_min), linewidth=linewidth,
                         marker=marker, markersize=markersize,
                         label=f'Rd:Wr {rw}:0')
                 else:
@@ -301,132 +687,96 @@ def plot_curves(config, dfs_rw, output_path='memory_curves.pdf', cmap_name='Blue
                         skipped_ratios[reason] = []
                     skipped_ratios[reason].append(rw)
 
-    for reason, ratios in skipped_ratios.items():
-        #print(f"Warning: Ratios {ratios} not plotted: {reason}")
-        pass
+    _draw_max_bw_line(ax, config, max_bw, limit_bw, limit_lat, cmap_name, global_max_bw=global_max_bw)
 
-    
-    is_nvidia_pmu = config.get("USE_NVIDIA_PMU", "False").lower() in ('true', '1', 't')
-    nvlink_bw = float(config.get("NVLINK_BW_GB_S", 0))
-    
-    # Do not draw the line for NVIDIA counters if NVLINK_BW is not specified
-    should_draw_max_bw_line = not (is_nvidia_pmu and nvlink_bw == 0)
 
-    if max_bw > 0 and should_draw_max_bw_line:
-        ax.axvline(x=max_bw, color=calculate_color(75, cmap_name), linewidth=2, linestyle=':')
-        ax.text(x=max_bw, y=ax.get_ylim()[1] * 0.95, 
-               s=f'Max. theoretical BW = {max_bw} GB/s', 
-               horizontalalignment='right', fontsize=fontSizeMess - 4)
-    
     ax.tick_params(axis='both', labelsize=fontSizeMess)
-    
-    base_x = 0.1
-    base_y = 0.99
-    add_gradient_legend(ax, None, 50, 100, colors=cmap_name, box_position=(base_x, base_y), box_size=(0.25, 0.03), fontsize=20)
 
-    fig.set_size_inches([16, 9])
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        fig.tight_layout()
-    fig.savefig(output_path, bbox_inches='tight', dpi=300)
-    png_path = os.path.splitext(output_path)[0] + '.png'
-    fig.savefig(png_path, bbox_inches='tight', dpi=300)
-    plt.close()
-    
-    #print(f"Plot saved to: {output_path}")
-    #print(f"Plot saved to: {png_path}")
+    _save_main_figure(fig, output_path)
 
 
 
-def plot_combined_curves(datasets, output_path='combined_curves.pdf', limit_bw_override=None, limit_lat_override=None, ignore_guards=False, apply_corrections=True, draw_dots=False):
+
+def plot_combined_curves(datasets, output_path='combined_curves.pdf',
+                         limit_bw_override=None, limit_lat_override=None,
+                         ignore_guards=False, apply_corrections=True,
+                         draw_dots=False, draw_lines=True,
+                         legends_output_base=None, legend_rw_min=None):
     """
     Plot multiple datasets on the same figure.
     datasets: list of tuples (label, dfs_rw, config, cmap_name)
+
+    When ``legends_output_base`` is set, one standalone legends figure with a
+    titled RD:WR bar per dataset is saved there; it covers every combined
+    chart, so no per-chart legend files are written.
     """
     if not datasets:
         print("No datasets to plot")
         return
 
+    datasets = _prepare_combined_datasets_for_memory_compare(datasets)
+
     fig, ax = plt.subplots(1, 1)
-    
+
+    datasets = sorted(
+        datasets,
+        key=lambda d: max(
+            (df['bandwidth_smooth'].max() for _, df in d[1].items()
+            if not df.empty and 'bandwidth_smooth' in df.columns and not df['bandwidth_smooth'].empty),
+            default=0.0,
+        ),
+        reverse=True,
+    )
+
     max_bw = 0.0
     global_max_bw = 0.0
     global_max_lat = 0.0
     for _, dfs_rw, cfg, _, _ in datasets:
         max_bw = max(max_bw, _compute_theoretical_max_bw(cfg))
         for _, df in dfs_rw.items():
-            if not df.empty:
-                if 'bandwidth_smooth' in df.columns and not df['bandwidth_smooth'].empty:
-                    global_max_bw = max(global_max_bw, df['bandwidth_smooth'].max())
-                if 'latency_smooth' in df.columns and not df['latency_smooth'].empty:
-                    global_max_lat = max(global_max_lat, df['latency_smooth'].max())
-    datasets = sorted(
-        datasets,
-        key=lambda d: max(
-            (df['bandwidth_smooth'].max() for _, df in d[1].items() 
-            if not df.empty and 'bandwidth_smooth' in df.columns and not df['bandwidth_smooth'].empty),
-            default=0.0
-        ),
-        reverse=True  # largest bandwidth first
-    )
-    global_max_bw = 0.0
-    global_max_lat = 0.0
-    
-    for _, dfs_rw, _, _, _ in datasets:
-        for _, df in dfs_rw.items():
-            if not df.empty:
-                if 'bandwidth_smooth' in df.columns and not df['bandwidth_smooth'].empty:
-                    global_max_bw = max(global_max_bw, df['bandwidth_smooth'].max())
-                if 'latency_smooth' in df.columns and not df['latency_smooth'].empty:
-                    global_max_lat = max(global_max_lat, df['latency_smooth'].max())
-    
+            if df.empty:
+                continue
+            if 'bandwidth_smooth' in df.columns and not df['bandwidth_smooth'].empty:
+                global_max_bw = max(global_max_bw, df['bandwidth_smooth'].max())
+            if 'latency_smooth' in df.columns and not df['latency_smooth'].empty:
+                global_max_lat = max(global_max_lat, df['latency_smooth'].max())
+
     limit_bw = limit_bw_override
     if limit_bw is None:
         if max_bw > 0:
-            limit_bw = max_bw * 1.1
+            limit_bw = max(max_bw, global_max_bw) * 1.1
         else:
             limit_bw = global_max_bw * 1.1 if global_max_bw > 0 else 321
 
     limit_lat = limit_lat_override
     if limit_lat is None:
-        limit_lat = max(700, global_max_lat * 1.1) if global_max_lat > 0 else 700
-    
+        limit_lat = _memory_curve_lat_limit(global_max_lat)
+
     ax.set_xlim([0, limit_bw])
     ax.set_ylim([0, limit_lat])
     ax.set_xlabel('Used Memory bandwidth [GB/s]', fontsize=fontSizeMess + 3)
     ax.set_ylabel('Memory access latency [ns]', fontsize=fontSizeMess + 3)
-    # Starting position (top-left inside the axes)
-    base_x = 0.1
-    base_y = 0.99
 
-    # Vertical spacing between boxes (in axes fraction)
-    vertical_step = 0.08
-    marker = 'o' if draw_dots else None
-    markersize = 4 if draw_dots else None
+    marker = 'o' if (draw_dots or not draw_lines) else None
+    markersize = markerSize if (draw_dots or not draw_lines) else None
+    linewidth = curveLineWidth if draw_lines else 0
 
-    # Plot each dataset
-    for i, (label, dfs_rw, _, cmap_name, _) in enumerate(datasets):
-        y_pos = base_y - i * vertical_step
-        add_gradient_legend(ax, label, 50, 100, colors=cmap_name,
-                        box_position=(base_x, y_pos), box_size=(0.25, 0.03), fontsize=20)
+    rw_min = legend_rw_min if legend_rw_min is not None else _derive_rw_min(rw for _, dfs_rw, _, _, _ in datasets for rw in dfs_rw)
 
-
-        sorted_ratios = sorted(dfs_rw.keys())
-        first_curve = True
+    for _, dfs_rw, _, cmap_name, _ in datasets:
         skipped_ratios = {}
-        for rw in sorted_ratios:
+        for rw in sorted(dfs_rw.keys()):
             df = dfs_rw[rw]
             if not df.empty:
-                if apply_corrections:
+                if apply_corrections and draw_lines:
                     df = filter_clustered_points(df.copy(), 5.0)
                 else:
                     df = df.copy()
-                
+
                 if (not apply_corrections) or ignore_guards:
-                    curve_label = f'{label} (Rd:Wr {rw}:0)' if first_curve else None
-                    first_curve = False
-                    ax.plot(df['bandwidth_smooth'], df['latency_smooth'], color=calculate_color(rw, cmap_name),
-                           linewidth=1, marker=marker, markersize=markersize, label=curve_label, alpha=1.0)
+                    ax.plot(df['bandwidth_smooth'], df['latency_smooth'],
+                           color=calculate_color(rw, cmap_name, rw_min),
+                           linewidth=linewidth, marker=marker, markersize=markersize, alpha=1.0)
                 else:
                     is_valid, reason = is_valid_curve(
                         df,
@@ -435,170 +785,25 @@ def plot_combined_curves(datasets, output_path='combined_curves.pdf', limit_bw_o
                         gap_fraction=0.5,
                         ignore_guards=False)
                     if is_valid:
-                        curve_label = f'{label} (Rd:Wr {rw}:0)' if first_curve else None
-                        first_curve = False
-                        ax.plot(df['bandwidth_smooth'], df['latency_smooth'], color=calculate_color(rw, cmap_name),
-                               linewidth=1, marker=marker, markersize=markersize, label=curve_label, alpha=1.0)
+                        ax.plot(df['bandwidth_smooth'], df['latency_smooth'],
+                               color=calculate_color(rw, cmap_name, rw_min),
+                               linewidth=linewidth, marker=marker, markersize=markersize, alpha=1.0)
                     else:
                         if reason not in skipped_ratios:
                             skipped_ratios[reason] = []
                         skipped_ratios[reason].append(rw)
-        
-        for reason, ratios in skipped_ratios.items():
-            ratio_values = [int(r) for r in ratios]
-            ratio_values = [int(r) for r in ratios]
-            #print(f"Warning: {label} - Ratios {ratio_values} not plotted: {reason}")
-                
-    # Check configs from all datasets for NVIDIA PMU and NVLINK BW
-    is_any_nvidia_pmu = any(cfg.get("USE_NVIDIA_PMU", "False").lower() in ('true', '1', 't') for _, _, cfg, _, _ in datasets)
-    any_nvlink_bw = any(float(cfg.get("NVLINK_BW_GB_S", 0)) > 0 for _, _, cfg, _, _ in datasets)
 
-    should_draw_max_bw_line = not (is_any_nvidia_pmu and not any_nvlink_bw)
+    _draw_combined_theoretical_max_bw(ax, datasets, limit_bw, limit_lat, max_bw, global_max_bw)
 
-    if max_bw > 0 and should_draw_max_bw_line:
-        ax.axvline(x=max_bw, color=calculate_color(75), linewidth=2, linestyle=':')
-        ax.text(x=max_bw, y=limit_lat * 0.9, 
-               s=f'Max. theoretical BW = {int(max_bw)} GB/s', 
-               horizontalalignment='right', fontsize=fontSizeMess - 4)
-    
-    ax.tick_params(axis='both', labelsize=fontSizeMess)
-
-  
-    #custom_lines = [Line2D([0], [0], color=plt.colormaps[cmap](0.6), lw=4) for _, _, _, cmap, _ in datasets]
-    #custom_labels = [label for label, _, _, _, _ in datasets]
-    #ax.legend(custom_lines, custom_labels, fontsize=fontSizeMess)
-
-    fig.set_size_inches([16, 9])
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        fig.tight_layout()
-    fig.savefig(output_path, bbox_inches='tight', dpi=300)
-    png_path = os.path.splitext(output_path)[0] + '.png'
-    fig.savefig(png_path, bbox_inches='tight', dpi=300)
-    plt.close()
-    
-    #print(f"Combined plot saved to: {output_path}")
-    #print(f"Combined plot saved to: {png_path}")
-
-
-def plot_combined_metric_curves(datasets, metric_col, y_label,
-                                output_path='combined_metric_curves.pdf',
-                                limit_bw_override=None, limit_metric_override=None,
-                                ignore_guards=False, apply_corrections=True, draw_dots=False):
-    """Plot one metric for multiple datasets on the same figure."""
-    if not datasets:
-        return
-
-    fig, ax = plt.subplots(1, 1)
-
-    max_bw = 0.0
-    global_max_bw = 0.0
-    global_max_metric = 0.0
-
-    for _, dfs_rw, cfg, _, _ in datasets:
-        max_bw = max(max_bw, _compute_theoretical_max_bw(cfg))
-        for _, df in dfs_rw.items():
-            if df.empty or 'bandwidth_plot' not in df.columns:
-                continue
-            value_col = 'metric_plot' if 'metric_plot' in df.columns else metric_col
-            if value_col not in df.columns:
-                continue
-            df_local = df.dropna(subset=['bandwidth_plot', value_col])
-            if df_local.empty:
-                continue
-            global_max_bw = max(global_max_bw, df_local['bandwidth_plot'].max())
-            global_max_metric = max(global_max_metric, df_local[value_col].max())
-
-    limit_bw = limit_bw_override
-    if limit_bw is None:
-        if max_bw > 0:
-            limit_bw = max_bw * 1.1
-        else:
-            limit_bw = global_max_bw * 1.1 if global_max_bw > 0 else 321
-
-    limit_metric = limit_metric_override
-    if limit_metric is None:
-        limit_metric = global_max_metric * 1.15 if global_max_metric > 0 else 1.0
-        if limit_metric <= 0:
-            limit_metric = 1.0
-
-    ax.set_xlim([0, limit_bw])
-    ax.set_ylim([0, limit_metric])
-    ax.set_xlabel('Used Memory bandwidth [GB/s]', fontsize=fontSizeMess + 3)
-    ax.set_ylabel(y_label, fontsize=fontSizeMess + 3)
-
-    base_x = 0.1
-    base_y = 0.99
-    vertical_step = 0.08
-
-    marker = 'o' if draw_dots else None
-    markersize = 4 if draw_dots else None
-
-    for i, (label, dfs_rw, _, cmap_name, _) in enumerate(datasets):
-        y_pos = base_y - i * vertical_step
-        add_gradient_legend(ax, label, 50, 100, colors=cmap_name,
-                            box_position=(base_x, y_pos), box_size=(0.25, 0.03), fontsize=20)
-
-        sorted_ratios = sorted(dfs_rw.keys())
-        first_curve = True
-        for rw in sorted_ratios:
-            df = dfs_rw[rw]
-            if df.empty or 'bandwidth_plot' not in df.columns:
-                continue
-
-            value_col = 'metric_plot' if 'metric_plot' in df.columns else metric_col
-            if value_col not in df.columns:
-                continue
-
-            if apply_corrections:
-                df = filter_clustered_points(df.copy(), 5.0, bw_col='bandwidth_plot')
-            else:
-                df = df.copy()
-            df = df.dropna(subset=['bandwidth_plot', value_col])
-            if df.empty:
-                continue
-
-            if (not apply_corrections) or ignore_guards:
-                curve_label = f'{label} (Rd:Wr {rw}:0)' if first_curve else None
-                first_curve = False
-                ax.plot(df['bandwidth_plot'], df[value_col],
-                        color=calculate_color(rw, cmap_name),
-                        linewidth=1, marker=marker, markersize=markersize, label=curve_label, alpha=1.0)
-            else:
-                is_valid, _ = is_valid_curve(
-                    df,
-                    min_points=5,
-                    max_cluster_fraction=0.70,
-                    gap_fraction=0.5,
-                    bw_column='bandwidth_plot',
-                    ignore_guards=False)
-                if is_valid:
-                    curve_label = f'{label} (Rd:Wr {rw}:0)' if first_curve else None
-                    first_curve = False
-                    ax.plot(df['bandwidth_plot'], df[value_col],
-                            color=calculate_color(rw, cmap_name),
-                            linewidth=1, marker=marker, markersize=markersize, label=curve_label, alpha=1.0)
-
-    is_any_nvidia_pmu = any(cfg.get("USE_NVIDIA_PMU", "False").lower() in ('true', '1', 't') for _, _, cfg, _, _ in datasets)
-    any_nvlink_bw = any(float(cfg.get("NVLINK_BW_GB_S", 0)) > 0 for _, _, cfg, _, _ in datasets)
-    should_draw_max_bw_line = not (is_any_nvidia_pmu and not any_nvlink_bw)
-
-    if max_bw > 0 and should_draw_max_bw_line:
-        ax.axvline(x=max_bw, color=calculate_color(75), linewidth=2, linestyle=':')
-        ax.text(x=max_bw, y=limit_metric * 0.95,
-                s=f'Max. theoretical BW = {int(max_bw)} GB/s',
-                horizontalalignment='right', fontsize=fontSizeMess - 4)
 
     ax.tick_params(axis='both', labelsize=fontSizeMess)
 
-    fig.set_size_inches([16, 9])
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        fig.tight_layout()
-    fig.savefig(output_path, bbox_inches='tight', dpi=300)
-    png_path = os.path.splitext(output_path)[0] + '.png'
-    fig.savefig(png_path, bbox_inches='tight', dpi=300)
-    plt.close()
+    _save_main_figure(fig, output_path)
+
+    if legends_output_base:
+        save_gradient_legends_figure(legends_output_base, _combined_legend_entries(datasets), rw_min)
+
+
 
 
 def check_smooth_curves(df_rw,
@@ -610,7 +815,6 @@ def check_smooth_curves(df_rw,
     if ignore_guards:
         return True, "valid (forced)"
 
-    # Ensure we have the right bandwidth column
     if bw_column not in df_rw.columns:
         if 'bandwidth_smooth' in df_rw.columns:
             bw_column = 'bandwidth_smooth'
@@ -623,7 +827,6 @@ def check_smooth_curves(df_rw,
 
     smooth = True
     problematic_groups = []
-    # GROUP BY read percentage → each curve
     if 'read_pct_rounded' not in df_rw.columns: 
         group_column="rd_percentage"
     for read_pct, group in df_rw.groupby(group_column):
@@ -633,15 +836,12 @@ def check_smooth_curves(df_rw,
         if len(bw) < 2:
             continue  # nothing to compare
 
-        # Sort values
         bw_sorted = np.sort(bw)
 
-        # Compute gaps
         gaps = np.diff(bw_sorted)
         max_gap = gaps.max()
         span = bw_sorted.max() - bw_sorted.min()
 
-        # Avoid division issues if flat curve
         if span == 0:
             continue
 

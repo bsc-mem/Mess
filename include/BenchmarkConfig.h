@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -67,6 +70,11 @@ struct BenchmarkResult {
     double tlb1miss;
     double tlb2miss;
     double duration_s;
+    // Thread time is the raw sum over retained loops. Direct latency is ns/access
+    // after the same architecture-specific TLB correction as cycle timing.
+    double point_cpu_freq_ghz = 0.0;
+    double pointer_chase_thread_ns = 0.0;
+    double latency_direct_ns = 0.0;
     bool using_hugepages;
     long long bw_cas_rd;
     long long bw_cas_wr;
@@ -78,6 +86,7 @@ struct BenchmarkResult {
     std::string tlb2_event_name;
     
     std::map<std::string, long long> extra_perf_values;
+    std::map<std::string, double> extra_metric_values;
 
     long long sampler_samples = 0;
     double sampler_mean_ns = 0.0;
@@ -135,14 +144,16 @@ struct BenchmarkConfig {
 
     bool profile_output = false;
     bool dry_run = false;
+    bool run_gpu = false;
     bool generate_multiseq = true;
     bool instruction_sampling = false;
     bool persistent_traffic_gen = false;
 
-    std::string measurer = "auto";  // auto, perf, likwid, vtune, pcm
+    std::string measurer = "auto";  // auto, perf, likwid, vtune, pcm, ioreport
 
     int traffic_gen_cores = 0;
     std::vector<std::string> traffic_gen_explicit_cores;
+    mutable uint64_t traffic_gen_array_elements = 0;
     std::string output_root = "measuring";
 
     std::vector<std::string> add_counters;

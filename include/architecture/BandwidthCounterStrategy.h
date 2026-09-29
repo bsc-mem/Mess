@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -85,6 +87,7 @@ enum class CounterType {
     CAS_COUNT,
     UPI_FLITS,
     NVIDIA_GRACE,
+    TOTAL_BYTES,
     UNKNOWN
 };
 
@@ -94,11 +97,26 @@ enum class MeasurerType {
     PERF,
     LIKWID,
     VTUNE,
-    PCM
+    PCM,
+    IOREPORT,
+    IMC,
+    UPROF
 };
 
 std::string measurer_type_to_string(MeasurerType type);
 MeasurerType string_to_measurer_type(const std::string& str);
+
+#if defined(_WIN32)
+/** @brief What AUTO resolves to on Windows, and whether it can actually run. */
+struct WindowsAutoMeasurer {
+    MeasurerType type = MeasurerType::IMC;
+    bool         available = false;
+    std::string  diagnosis;
+    bool         fell_back = false;
+};
+
+const WindowsAutoMeasurer& windows_auto_measurer(int verbosity = 1);
+#endif
 
 /**
  * @brief Read/write counter selection for local-memory bandwidth measurement.
@@ -117,6 +135,8 @@ struct CasCounterSelection {
     bool requires_channel_aggregation = false;
     bool uses_read_subtract_formula = false;
 
+    int bytes_per_cas = 0;
+
     std::string get_read_events_string() const;
     std::string get_write_events_string() const;
     std::string get_all_events_string() const;
@@ -129,6 +149,7 @@ struct CasCounterSelection {
  */
 struct BandwidthCounterSelection {
     bool perf_available = false;
+    bool cross_socket = false;
     std::string failure_reason;
 
     CounterType type = CounterType::CAS_COUNT;
@@ -172,6 +193,10 @@ public:
     void set_extra_counters(const std::vector<std::string>& counters);
     void set_memory_type(const std::string& mem_type);
 
+#if defined(_WIN32)
+    void set_windows_auto_measurer(MeasurerType type) { windows_auto_measurer_ = type; }
+#endif
+
     void initialize(int src_cpu, const std::vector<int>& target_mem_nodes, const CPUCapabilities& caps);
     bool is_initialized() const { return initialized_; }
 
@@ -202,21 +227,17 @@ protected:
     BandwidthCounterStrategy() = default;
     
     void discover_counters(int src_cpu, const std::vector<int>& target_mem_nodes);
-    
-    static int getPhysicalPackageId(int cpu);
-    static int getNodeSocketId(int node_id);
-    static int getNodeId(int cpu);
-    static int getNodeDistance(int src_node, int dst_node);
-    
+
     static bool queryEventViaPerf(const std::string& event_name, uint32_t& type, uint64_t& config);
-    static bool readPmuType(const std::string& pmu_path, uint32_t& type);
-    static bool readPmuCpumask(const std::string& pmu_path, int& cpu);
-    
+
     static std::vector<std::string> extractCasEventsFromPerf();
     static std::vector<std::string> extractCasEventsFromVtune();
     static std::vector<std::string> extractUpiFlitEventsFromPerf();
     static std::vector<std::string> extractUpiFlitEventsFromVtune();
     static std::string lookupEventEncoding(const std::string& event_name);
+    static CasCounterSelection discoverIntelHbmFromPerf();
+    static CasCounterSelection discoverIntelConsumerImcFromPerf();
+    static CasCounterSelection discoverAmdUmcFromPerf();
     
     static CasCounterSelection discoverFromPerf();
     static CasCounterSelection discoverFromPerf(const std::vector<std::string>& preferred_read, const std::vector<std::string>& preferred_write, const std::vector<std::string>& preferred_combined);
@@ -278,6 +299,9 @@ protected:
     MeasurerType requested_measurer_type_ = MeasurerType::AUTO;
     MeasurerType resolved_measurer_type_ = MeasurerType::PERF;
     MeasurerType auto_selected_measurer_type_ = MeasurerType::PERF;
+#if defined(_WIN32)
+    MeasurerType windows_auto_measurer_ = MeasurerType::AUTO;  /**< see the setter */
+#endif
     bool cached_is_intel_cpu_ = false;
     BandwidthCounterSelection selection_;
 

@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -37,6 +39,7 @@
 #include "arch/riscv/RiscvCounters.h"
 #include "architecture/ArchitectureRegistry.h"
 #include "architecture/ISA.h"
+#include "utils/StringUtils.h"
 #include <algorithm>
 #include <string>
 #include <cctype>
@@ -67,22 +70,11 @@ std::unique_ptr<KernelAssembler> RiscvArchitecture::createAssembler(const Kernel
 }
 
 std::unique_ptr<BandwidthCounterStrategy> RiscvArchitecture::createCounterStrategy(const CPUCapabilities& caps) const {
-    auto toLower = [](const std::string& str) {
-        std::string result = str;
-        std::transform(result.begin(), result.end(), result.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        return result;
-    };
-    
-    auto modelContains = [&](const std::string& token) {
-        return toLower(caps.model_name).find(toLower(token)) != std::string::npos;
-    };
-    
-    if (modelContains("fu740") || modelContains("hifive")) {
+    if (string_utils::contains_ci(caps.model_name,"fu740") || string_utils::contains_ci(caps.model_name,"hifive")) {
         return std::make_unique<SiFiveCounters>();
     }
     
-    if (modelContains("sifive")) {
+    if (string_utils::contains_ci(caps.model_name,"sifive")) {
         return std::make_unique<SiFiveCounters>();
     }
     

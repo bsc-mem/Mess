@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,11 +35,13 @@
 
 #include "architecture/BandwidthCounterStrategy.h"
 #include "architecture/ArchitectureRegistry.h"
+#include "platform/Sys.h"
 #include "SystemDetection.h"
 #include "Utils.h"
 #include "utils/PmuSysfs.h"
 #include "utils/CpuTopology.h"
 #include "utils/SubprocessCapture.h"
+#include "utils/StringUtils.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -49,13 +53,9 @@
 #include <sstream>
 #include <map>
 #include <chrono>
-#include <poll.h>
-#include <signal.h>
 #include <thread>
-#include <fcntl.h>
-#include <unistd.h>
+#include <unistd.h> // access(F_OK) on the sysfs PMU probe
 #include <dirent.h>
-#include <sys/wait.h>
 
 std::string measurer_type_to_string(MeasurerType type) {
     switch (type) {
@@ -64,6 +64,9 @@ std::string measurer_type_to_string(MeasurerType type) {
         case MeasurerType::LIKWID: return "likwid";
         case MeasurerType::VTUNE: return "vtune";
         case MeasurerType::PCM: return "pcm";
+        case MeasurerType::IOREPORT: return "ioreport";
+        case MeasurerType::IMC: return "imc";
+        case MeasurerType::UPROF: return "uprof";
         default: return "unknown";
     }
 }
@@ -76,33 +79,13 @@ MeasurerType string_to_measurer_type(const std::string& str) {
     if (lower == "likwid") return MeasurerType::LIKWID;
     if (lower == "vtune") return MeasurerType::VTUNE;
     if (lower == "pcm") return MeasurerType::PCM;
+    if (lower == "ioreport") return MeasurerType::IOREPORT;
+    if (lower == "imc") return MeasurerType::IMC;
+    if (lower == "uprof") return MeasurerType::UPROF;
     return MeasurerType::AUTO;
 }
 
 namespace {
-
-std::string trim_event_token(const std::string& str) {
-    size_t first = str.find_first_not_of(" \t\r\n");
-    if (std::string::npos == first) {
-        return "";
-    }
-    size_t last = str.find_last_not_of(" \t\r\n");
-    return str.substr(first, (last - first + 1));
-}
-
-std::string to_lower_copy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
-bool contains_ci(const std::string& haystack, const std::string& needle) {
-    if (needle.size() > haystack.size()) return false;
-    return std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-        [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); }
-    ) != haystack.end();
-}
 
 std::string join_events(const std::vector<std::string>& events, const std::string& sep = ",") {
     std::string result;
@@ -119,11 +102,29 @@ bool has_usable_bandwidth_counters(const BandwidthCounterSelection& selection) {
             return selection.upi.has_rxl_txl;
         case CounterType::CAS_COUNT:
         case CounterType::NVIDIA_GRACE:
+        case CounterType::TOTAL_BYTES:
             return selection.cas.has_read_write || selection.cas.has_combined_counter;
         case CounterType::UNKNOWN:
         default:
             return false;
     }
+}
+
+bool selection_uses_perf_hbm(const BandwidthCounterSelection& selection) {
+    if (selection.type != CounterType::CAS_COUNT) {
+        return false;
+    }
+    for (const auto& event : selection.cas.read_events) {
+        if (string_utils::contains_ci(event, "uncore_hbm_") || string_utils::contains_ci(event, "uncore_type_14_")) {
+            return true;
+        }
+    }
+    for (const auto& event : selection.cas.write_events) {
+        if (string_utils::contains_ci(event, "uncore_hbm_") || string_utils::contains_ci(event, "uncore_type_14_")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void append_unique_events(std::vector<std::string>& target, const std::vector<std::string>& extra) {
@@ -140,6 +141,63 @@ bool has_vtune_binary_available() {
 
 std::vector<std::string> find_pmu_instances(const std::string& base_pmu_name) {
     return pmu_sysfs::list_prefixed(base_pmu_name);
+}
+
+bool perf_event_probe_succeeds(const std::string& events) {
+    if (events.empty()) {
+        return false;
+    }
+
+    subprocess::Options opts;
+    opts.timeout = std::chrono::seconds(3);
+    opts.max_output_bytes = 8192;
+    const subprocess::Result result = subprocess::capture(
+        "perf",
+        {"stat", "-a", "-e", events, "--", "sleep", "0.01"},
+        opts);
+    const std::string& output = result.output;
+
+    return result.ok() &&
+           output.find("Performance counter stats") != std::string::npos &&
+           output.find("Cannot find PMU") == std::string::npos &&
+           output.find("event syntax error") == std::string::npos &&
+           output.find("No permission") == std::string::npos &&
+           output.find("not supported") == std::string::npos &&
+           output.find("<not supported>") == std::string::npos;
+}
+
+std::string intel_hbm_type14_event(const std::string& pmu_name, const char* umask, const std::string& label) {
+    return pmu_name + "/event=0x05,umask=" + umask + ",name=" + label + "/";
+}
+
+std::string pick_canonical_alias(std::vector<std::string> candidates, const std::string& canonical) {
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto& candidate : candidates) {
+        if (string_utils::contains_ci(candidate, canonical)) {
+            return candidate;
+        }
+    }
+    return candidates.front();
+}
+
+bool discover_hbm_alias_events(const std::vector<std::string>& pmus,
+                               std::vector<std::string>& read_events,
+                               std::vector<std::string>& write_events) {
+    auto is_cas = [](const std::string& event, const char* a, const char* b) {
+        return string_utils::contains_ci(event, "cas") && (string_utils::contains_ci(event, a) || string_utils::contains_ci(event, b));
+    };
+    for (const auto& pmu : pmus) {
+        const auto reads = pmu_sysfs::list_events(pmu, [&](const std::string& e) { return is_cas(e, "rd", "read"); });
+        const auto writes = pmu_sysfs::list_events(pmu, [&](const std::string& e) { return is_cas(e, "wr", "write"); });
+        if (reads.empty() || writes.empty()) {
+            read_events.clear();
+            write_events.clear();
+            return false;
+        }
+        read_events.push_back(pick_canonical_alias(reads, "cas_count_rd"));
+        write_events.push_back(pick_canonical_alias(writes, "cas_count_wr"));
+    }
+    return !read_events.empty() && read_events.size() == write_events.size();
 }
 
 std::vector<std::string> scan_pmu_event_dir(const std::string& pmu_name,
@@ -316,6 +374,64 @@ void BandwidthCounterStrategy::initialize(int src_cpu, const std::vector<int>& t
         delegate_strategy_ = arch->createCounterStrategy(caps);
     }
 
+    if (caps.isAppleSilicon()) {
+        selection_ = BandwidthCounterSelection{};
+        selection_.type = CounterType::CAS_COUNT;
+        selection_.perf_available = true;
+        if (delegate_strategy_) {
+            selection_.cas = delegate_strategy_->detectCasCounters();
+        }
+        append_unique_events(selection_.extra_counters, extra_counters_);
+        auto_selected_measurer_type_ = MeasurerType::IOREPORT;
+        resolved_measurer_type_ = (requested_measurer_type_ != MeasurerType::AUTO)
+                                      ? requested_measurer_type_
+                                      : MeasurerType::IOREPORT;
+        initialized_ = true;
+        return;
+    }
+
+#if defined(_WIN32)
+    auto_selected_measurer_type_ = (windows_auto_measurer_ != MeasurerType::AUTO)
+                                        ? windows_auto_measurer_
+                                        : (platform::cpu_is_amd() ? MeasurerType::UPROF : MeasurerType::IMC);
+    resolved_measurer_type_ = (requested_measurer_type_ != MeasurerType::AUTO)
+                                  ? requested_measurer_type_
+                                  : auto_selected_measurer_type_;
+
+    const char* read_label = "imc_dram_data_reads";
+    const char* write_label = "imc_dram_data_writes";
+    switch (resolved_measurer_type_) {
+        case MeasurerType::UPROF:
+            read_label = "uprof_umc_data_reads";
+            write_label = "uprof_umc_data_writes";
+            break;
+        case MeasurerType::VTUNE:
+            read_label = "vtune_imc_data_reads";
+            write_label = "vtune_imc_data_writes";
+            break;
+        default:
+            break;
+    }
+
+    selection_ = BandwidthCounterSelection{};
+    selection_.type = CounterType::CAS_COUNT;
+    selection_.perf_available = true;
+    selection_.cas.perf_available = true;
+    selection_.cas.has_read_write = true;
+    selection_.cas.read_events = {read_label};
+    selection_.cas.write_events = {write_label};
+    selection_.cas.bytes_per_cas = 64;
+
+    append_unique_events(selection_.extra_counters, extra_counters_);
+
+    if (delegate_strategy_) {
+        delegate_strategy_->getTlbMissCounters(cached_tlb1_raw_, cached_tlb2_raw_,
+                                               cached_use_tlb1_, cached_use_tlb2_);
+    }
+
+    initialized_ = true;
+    return;
+#else
     discover_counters(src_cpu, target_mem_nodes);
 
     append_unique_events(selection_.extra_counters, extra_counters_);
@@ -328,6 +444,7 @@ void BandwidthCounterStrategy::initialize(int src_cpu, const std::vector<int>& t
     }
 
     initialized_ = true;
+#endif // _WIN32
 }
 
 void BandwidthCounterStrategy::resolve_measurer_type() {
@@ -335,7 +452,8 @@ void BandwidthCounterStrategy::resolve_measurer_type() {
         resolved_measurer_type_ = requested_measurer_type_;
 
         bool needs_cross_socket = needs_upi();
-        if (requested_measurer_type_ == MeasurerType::PERF && is_hbm_ && !needs_cross_socket) {
+        if (requested_measurer_type_ == MeasurerType::PERF && is_hbm_ && !needs_cross_socket &&
+            !selection_uses_perf_hbm(selection_)) {
             std::cerr << "Warning: Using perf on HBM system. Consider --measurer=likwid for better counter support." << std::endl;
         }
         if (requested_measurer_type_ == MeasurerType::LIKWID && cached_memory_type_ == "CXL") {
@@ -371,15 +489,22 @@ void BandwidthCounterStrategy::discover_counters(int src_cpu, const std::vector<
         return;
     }
 
-    bool needs_cross_socket = false;
+    bool has_remote_target = false;
+    bool has_local_target = false;
     for (int node : target_mem_nodes) {
-        if (detectCounterType(src_cpu, node) == CounterType::UPI_FLITS) {
-            needs_cross_socket = true;
-            break;
+        const CounterType target_type = detectCounterType(src_cpu, node);
+        if (target_type == CounterType::UPI_FLITS) {
+            has_remote_target = true;
+        } else if (target_type == CounterType::CAS_COUNT) {
+            has_local_target = true;
         }
     }
+    bool needs_cross_socket = has_remote_target && !has_local_target;
 
-    const bool prefer_likwid = is_hbm_ && !needs_cross_socket;
+    if (is_hbm_) {
+        needs_cross_socket = false;
+    }
+
     const bool allow_vtune_fallback = cached_is_intel_cpu_ && cached_memory_type_ != "CXL" && has_vtune_binary_available();
 
     auto discover_with_measurer = [&](MeasurerType type) {
@@ -396,16 +521,16 @@ void BandwidthCounterStrategy::discover_counters(int src_cpu, const std::vector<
         return;
     }
 
-    if (prefer_likwid) {
-        selection_ = discover_with_measurer(MeasurerType::LIKWID);
-        auto_selected_measurer_type_ = MeasurerType::LIKWID;
-        return;
-    }
-
     BandwidthCounterSelection perf_selection = discover_with_measurer(MeasurerType::PERF);
     if (has_usable_bandwidth_counters(perf_selection)) {
         selection_ = perf_selection;
         auto_selected_measurer_type_ = MeasurerType::PERF;
+        return;
+    }
+
+    if (is_hbm_ && !needs_cross_socket) {
+        selection_ = discover_with_measurer(MeasurerType::LIKWID);
+        auto_selected_measurer_type_ = MeasurerType::LIKWID;
         return;
     }
 
@@ -434,10 +559,18 @@ std::string BandwidthCounterStrategy::get_tool_name() const {
             return "Intel VTune";
         case MeasurerType::PCM:
             return "PCM (CXL Mode)";
+        case MeasurerType::IMC:
+            return "IMC counters";
+        case MeasurerType::UPROF:
+            return "AMD uProf (Data Fabric UMC counters)";
+        case MeasurerType::IOREPORT:
+            return "IOReport (Apple Silicon AMC)";
         case MeasurerType::PERF:
         default:
             if (is_hbm_ && needs_upi()) {
                 return "perf (HBM with remote/cross-socket access)";
+            } else if (selection_uses_perf_hbm(selection_)) {
+                return "perf (HBM CAS)";
             } else if (selection_.type == CounterType::UPI_FLITS) {
                 return "perf (UPI/Interconnect)";
             } else {
@@ -467,7 +600,11 @@ void BandwidthCounterStrategy::print_counter_info(std::ostream& out) const {
 
     switch (resolved_measurer_type_) {
         case MeasurerType::LIKWID:
-            out << "  LIKWID Counters: CAS_COUNT_RD/WR (via likwid-perfctr)" << std::endl;
+            if (!selection_.failure_reason.empty()) {
+                out << "  Error: " << selection_.failure_reason << std::endl;
+            } else {
+                out << "  LIKWID Counters: CAS_COUNT_RD/WR (via likwid-perfctr)" << std::endl;
+            }
             break;
 
         case MeasurerType::VTUNE:
@@ -498,7 +635,16 @@ void BandwidthCounterStrategy::print_counter_info(std::ostream& out) const {
         case MeasurerType::PCM:
             out << "  PCM Counters: (CXL support via Intel PCM)" << std::endl;
             break;
-
+        case MeasurerType::IOREPORT:
+            out << "IOReport Counters (Apple Silicon AMC):" << std::endl;
+            if (selection_.cas.has_read_write) {
+                out << "  Read Events: " << selection_.cas.get_read_events_string() << std::endl;
+                out << "  Write Events: " << selection_.cas.get_write_events_string() << std::endl;
+            } else {
+                out << "  No suitable Apple Memory Controller counters found." << std::endl;
+            }
+            break;
+            
         case MeasurerType::PERF:
         default:
             if (selection_.type == CounterType::UPI_FLITS) {
@@ -520,7 +666,11 @@ void BandwidthCounterStrategy::print_counter_info(std::ostream& out) const {
                     out << "  perf not available." << std::endl;
                 }
             } else {
-                out << "CAS Counters (Local Bandwidth):" << std::endl;
+                if (selection_.type == CounterType::TOTAL_BYTES) {
+                    out << "Raw Byte Counters (Local Bandwidth):" << std::endl;
+                } else {
+                    out << "CAS Counters (Local Bandwidth):" << std::endl;
+                }
                 if (selection_.perf_available) {
                     if (selection_.cas.has_read_write) {
                         out << "  Read Events: " << selection_.cas.get_read_events_string() << std::endl;
@@ -541,39 +691,6 @@ void BandwidthCounterStrategy::print_counter_info(std::ostream& out) const {
                 }
             }
             break;
-    }
-}
-
-int BandwidthCounterStrategy::getNodeId(int cpu) {
-    return cpu_topology::numa_node_of(cpu);
-}
-
-int BandwidthCounterStrategy::getNodeDistance(int src_node, int dst_node) {
-    return cpu_topology::distance(src_node, dst_node);
-}
-
-bool BandwidthCounterStrategy::readPmuType(const std::string& pmu_path, uint32_t& type) {
-    std::ifstream f(pmu_path + "/type");
-    if (!f.is_open()) return false;
-    f >> type;
-    return f.good() || f.eof();
-}
-
-bool BandwidthCounterStrategy::readPmuCpumask(const std::string& pmu_path, int& cpu) {
-    std::ifstream f(pmu_path + "/cpumask");
-    if (!f.is_open()) return false;
-
-    std::string line;
-    if (!std::getline(f, line)) return false;
-
-    size_t pos = line.find_first_of(",-");
-    std::string first_cpu = (pos != std::string::npos) ? line.substr(0, pos) : line;
-
-    try {
-        cpu = std::stoi(first_cpu);
-        return true;
-    } catch (...) {
-        return false;
     }
 }
 
@@ -665,9 +782,8 @@ ResolvedPerfEvent BandwidthCounterStrategy::resolveEvent(const std::string& even
     size_t slash = event_name.find('/');
     if (slash != std::string::npos) {
         std::string pmu_name = event_name.substr(0, slash);
-        std::string pmu_path = "/sys/bus/event_source/devices/" + pmu_name;
 
-        if (!readPmuType(pmu_path, resolved.type)) {
+        if (!pmu_sysfs::read_type(pmu_name, resolved.type)) {
             if (!queryEventViaPerf(event_name, resolved.type, resolved.config)) {
                 return resolved; 
             }
@@ -676,7 +792,7 @@ ResolvedPerfEvent BandwidthCounterStrategy::resolveEvent(const std::string& even
             return resolved;
         }
 
-        if (!readPmuCpumask(pmu_path, resolved.cpu)) {
+        if (!pmu_sysfs::read_cpumask(pmu_name, resolved.cpu)) {
             resolved.cpu = 0;
         }
     }
@@ -695,10 +811,9 @@ ResolvedPerfEvent BandwidthCounterStrategy::resolveEvent(const std::string& even
                     std::string pmu_name = entry->d_name;
                     if (pmu_name[0] == '.') continue;
 
-                    std::string pmu_path = "/sys/bus/event_source/devices/" + pmu_name;
                     uint32_t pmu_type;
-                    if (readPmuType(pmu_path, pmu_type) && pmu_type == resolved.type) {
-                        readPmuCpumask(pmu_path, resolved.cpu);
+                    if (pmu_sysfs::read_type(pmu_name, pmu_type) && pmu_type == resolved.type) {
+                        pmu_sysfs::read_cpumask(pmu_name, resolved.cpu);
                         break;
                     }
                 }
@@ -734,30 +849,42 @@ EventClassification EventClassification::classify(const std::string& event_name,
 
     auto match_any = [&](const std::vector<std::string>& list) -> bool {
         for (const auto& e : list) {
-            if (contains_ci(event_name, e)) return true;
+            if (string_utils::contains_ci(event_name, e)) return true;
         }
         return false;
     };
     
     for (const auto& extra : selection.extra_counters) {
-        if (contains_ci(event_name, extra)) {
+        if (string_utils::contains_ci(event_name, extra)) {
             result.is_extra = true;
             result.extra_key = extra;
             return result;
         }
     }
     
-    if (selection.type == CounterType::CAS_COUNT || selection.type == CounterType::NVIDIA_GRACE) {
+    if (selection.type == CounterType::CAS_COUNT ||
+        selection.type == CounterType::NVIDIA_GRACE ||
+        selection.type == CounterType::TOTAL_BYTES) {
         if (match_any(selection.cas.combined_events)) { result.is_combined = true; return result; }
+
+        if (string_utils::contains_ci(event_name, "umc_cas_cmd")) {
+            if (string_utils::contains_ci(event_name, ".rd")) { result.is_read = true; return result; }
+            if (string_utils::contains_ci(event_name, ".wr")) { result.is_write = true; return result; }
+            if (string_utils::contains_ci(event_name, ".all")) { result.is_combined = true; return result; }
+        }
+
         if (match_any(selection.cas.read_events)) { result.is_read = true; return result; }
 
         if (!result.is_read) {
-            if (contains_ci(event_name, "cas_count") && 
-               (contains_ci(event_name, "rd") || contains_ci(event_name, "read"))) {
+            if (string_utils::contains_ci(event_name, "cas_count") && 
+               (string_utils::contains_ci(event_name, "rd") || string_utils::contains_ci(event_name, "read"))) {
                 result.is_read = true;
             }
-            if (contains_ci(event_name, "nvidia_scf_pmu") && 
-                (contains_ci(event_name, "cmem_rd_data") || contains_ci(event_name, "remote_socket_rd_data"))) {
+            if (selection_uses_perf_hbm(selection) && string_utils::contains_ci(event_name, "hbm") && string_utils::contains_ci(event_name, "_rd")) {
+                result.is_read = true;
+            }
+            if (string_utils::contains_ci(event_name, "nvidia_scf_pmu") && 
+                (string_utils::contains_ci(event_name, "cmem_rd_data") || string_utils::contains_ci(event_name, "remote_socket_rd_data"))) {
                 result.is_read = true;
             }
         }
@@ -765,12 +892,15 @@ EventClassification EventClassification::classify(const std::string& event_name,
         if (!result.is_read) {
             if (match_any(selection.cas.write_events)) { result.is_write = true; return result; }
             if (!result.is_write) {
-                if (contains_ci(event_name, "cas_count") && 
-                   (contains_ci(event_name, "wr") || contains_ci(event_name, "write"))) {
+                if (string_utils::contains_ci(event_name, "cas_count") && 
+                   (string_utils::contains_ci(event_name, "wr") || string_utils::contains_ci(event_name, "write"))) {
                     result.is_write = true;
                 }
-                if (contains_ci(event_name, "nvidia_scf_pmu") && 
-                    (contains_ci(event_name, "cmem_wr_total_bytes") || contains_ci(event_name, "remote_socket_wr_total_bytes"))) {
+                if (selection_uses_perf_hbm(selection) && string_utils::contains_ci(event_name, "hbm") && string_utils::contains_ci(event_name, "_wr")) {
+                    result.is_write = true;
+                }
+                if (string_utils::contains_ci(event_name, "nvidia_scf_pmu") && 
+                    (string_utils::contains_ci(event_name, "cmem_wr_total_bytes") || string_utils::contains_ci(event_name, "remote_socket_wr_total_bytes"))) {
                     result.is_write = true;
                 }
             }
@@ -831,6 +961,194 @@ std::string CasCounterSelection::get_popen_events_string() const {
     return join_events(events);
 }
 
+CasCounterSelection BandwidthCounterStrategy::discoverIntelHbmFromPerf() {
+    CasCounterSelection selection;
+    if (!run_command_success("which perf > /dev/null 2>&1")) {
+        selection.failure_reason = "perf binary not found";
+        return selection;
+    }
+
+    std::vector<std::string> read_events;
+    std::vector<std::string> write_events;
+
+    const std::vector<std::string> named_hbm_pmus = find_pmu_instances("uncore_hbm");
+    bool found_hbm_pmus = !named_hbm_pmus.empty();
+    if (found_hbm_pmus) {
+        discover_hbm_alias_events(named_hbm_pmus, read_events, write_events);
+    }
+
+    if (read_events.empty() || write_events.empty()) {
+        read_events.clear();
+        write_events.clear();
+
+        const std::vector<std::string> type14_pmus = find_pmu_instances("uncore_type_14");
+        found_hbm_pmus = found_hbm_pmus || !type14_pmus.empty();
+        read_events.reserve(type14_pmus.size());
+        write_events.reserve(type14_pmus.size());
+
+        for (size_t i = 0; i < type14_pmus.size(); ++i) {
+            const std::string tag = "hbm" + std::to_string(i);
+            read_events.push_back(intel_hbm_type14_event(type14_pmus[i], "0xcf", tag + "_rd"));
+            write_events.push_back(intel_hbm_type14_event(type14_pmus[i], "0xf0", tag + "_wr"));
+        }
+
+        if (!read_events.empty()) {
+            selection.bytes_per_cas = 32;
+        }
+    }
+
+    if (read_events.empty() || write_events.empty()) {
+        selection.failure_reason = found_hbm_pmus
+            ? "Intel HBM PMUs are exposed but no perf CAS_COUNT read/write events were found"
+            : "Intel HBM PMUs are not exposed by the kernel";
+        return selection;
+    }
+
+    std::vector<std::string> probe_events;
+    probe_events.reserve(read_events.size() + write_events.size());
+    probe_events.insert(probe_events.end(), read_events.begin(), read_events.end());
+    probe_events.insert(probe_events.end(), write_events.begin(), write_events.end());
+    if (!perf_event_probe_succeeds(join_events(probe_events))) {
+        selection.failure_reason = "Intel HBM PMUs are present but perf cannot open all CAS_COUNT events";
+        return selection;
+    }
+
+    selection.perf_available = true;
+    selection.read_events = std::move(read_events);
+    selection.write_events = std::move(write_events);
+    selection.has_read_write = true;
+    selection.has_combined_counter = false;
+    selection.requires_channel_aggregation = true;
+    return selection;
+}
+
+CasCounterSelection BandwidthCounterStrategy::discoverIntelConsumerImcFromPerf() {
+    CasCounterSelection selection;
+    if (!run_command_success("which perf > /dev/null 2>&1")) {
+        selection.failure_reason = "perf binary not found";
+        return selection;
+    }
+
+    const std::vector<std::string> imc_pmus = pmu_sysfs::list([](const std::string& name) {
+        return name.rfind("uncore_imc", 0) == 0;
+    });
+
+    auto exact_event = [](const std::string& target) {
+        return [target](const std::string& name) { return name == target; };
+    };
+
+    std::vector<std::string> read_events;
+    std::vector<std::string> write_events;
+    for (const auto& pmu : imc_pmus) {
+        auto reads  = pmu_sysfs::list_events(pmu, exact_event("data_read"));
+        auto writes = pmu_sysfs::list_events(pmu, exact_event("data_write"));
+        if (reads.empty() || writes.empty()) {
+            reads  = pmu_sysfs::list_events(pmu, exact_event("data_reads"));
+            writes = pmu_sysfs::list_events(pmu, exact_event("data_writes"));
+        }
+   
+        if (!reads.empty() && !writes.empty()) {
+            read_events.push_back(reads.front());
+            write_events.push_back(writes.front());
+        }
+    }
+
+    if (read_events.empty() || write_events.empty()) {
+        selection.failure_reason = imc_pmus.empty()
+            ? "Intel consumer uncore_imc PMU is not exposed by the kernel"
+            : "Intel consumer uncore_imc PMU exposes no data_read/data_write events";
+        return selection;
+    }
+
+    std::vector<std::string> probe_events = read_events;
+    probe_events.insert(probe_events.end(), write_events.begin(), write_events.end());
+    if (!perf_event_probe_succeeds(join_events(probe_events))) {
+        selection.failure_reason =
+            "Intel consumer uncore_imc data_read/data_write events present but perf cannot open them";
+        return selection;
+    }
+
+    selection.perf_available = true;
+    selection.read_events = std::move(read_events);
+    selection.write_events = std::move(write_events);
+    selection.has_read_write = true;
+    selection.has_combined_counter = false;
+    selection.requires_channel_aggregation = (selection.read_events.size() > 1);
+    return selection;
+}
+
+CasCounterSelection BandwidthCounterStrategy::discoverAmdUmcFromPerf() {
+    CasCounterSelection selection;
+    if (!run_command_success("which perf > /dev/null 2>&1")) {
+        selection.failure_reason = "perf binary not found";
+        return selection;
+    }
+
+    // One amd_umc_N PMU per unified memory controller (one per DDR5 channel).
+    const std::vector<std::string> umc_pmus = find_pmu_instances("amd_umc");
+    const bool has_collapsed_pmu = pmu_sysfs::exists("amd_umc");
+    if (umc_pmus.empty() && !has_collapsed_pmu) {
+        selection.failure_reason = "amd_umc PMUs are not exposed by the kernel";
+        return selection;
+    }
+
+    auto umc_cas_event = [](const std::string& suffix) {
+        return [suffix](const std::string& name) {
+            return string_utils::contains_ci(name, "cas_cmd") && string_utils::contains_ci(name, suffix);
+        };
+    };
+
+    std::vector<std::pair<std::vector<std::string>, std::vector<std::string>>> candidates;
+
+    {
+        std::vector<std::string> reads;
+        std::vector<std::string> writes;
+        for (const auto& pmu : umc_pmus) {
+            const auto pmu_reads  = pmu_sysfs::list_events(pmu, umc_cas_event(".rd"));
+            const auto pmu_writes = pmu_sysfs::list_events(pmu, umc_cas_event(".wr"));
+            if (pmu_reads.empty() || pmu_writes.empty()) {
+                continue;
+            }
+            reads.push_back(pmu_reads.front());
+            writes.push_back(pmu_writes.front());
+        }
+        if (reads.size() == umc_pmus.size() && writes.size() == umc_pmus.size()) {
+            candidates.emplace_back(std::move(reads), std::move(writes));
+        }
+    }
+
+    if (!umc_pmus.empty()) {
+        std::vector<std::string> reads;
+        std::vector<std::string> writes;
+        for (const auto& pmu : umc_pmus) {
+            reads.push_back(pmu + "/umc_cas_cmd.rd/");
+            writes.push_back(pmu + "/umc_cas_cmd.wr/");
+        }
+        candidates.emplace_back(std::move(reads), std::move(writes));
+    }
+
+    candidates.push_back({{"amd_umc/umc_cas_cmd.rd/"}, {"amd_umc/umc_cas_cmd.wr/"}});
+
+    for (auto& candidate : candidates) {
+        std::vector<std::string> probe_events = candidate.first;
+        probe_events.insert(probe_events.end(), candidate.second.begin(), candidate.second.end());
+        if (!perf_event_probe_succeeds(join_events(probe_events))) {
+            continue;
+        }
+
+        selection.perf_available = true;
+        selection.read_events = std::move(candidate.first);
+        selection.write_events = std::move(candidate.second);
+        selection.has_read_write = true;
+        selection.has_combined_counter = false;
+        selection.requires_channel_aggregation = (selection.read_events.size() > 1);
+        return selection;
+    }
+
+    selection.failure_reason = "amd_umc PMUs are present but perf cannot open umc_cas_cmd read/write events";
+    return selection;
+}
+
 CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     CasCounterSelection selection;
     if (!run_command_success("which perf > /dev/null 2>&1")) {
@@ -841,6 +1159,10 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     selection.perf_available = true;
     std::vector<std::string> detected_events = extractCasEventsFromPerf();
     if (detected_events.empty()) {
+        CasCounterSelection consumer_imc = discoverIntelConsumerImcFromPerf();
+        if (consumer_imc.has_read_write || consumer_imc.has_combined_counter) {
+            return consumer_imc;
+        }
         selection.failure_reason = "perf list did not report CAS counters";
         return selection;
     }
@@ -852,34 +1174,34 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     bool has_unc_m_wr = false;
 
     auto is_weird_specific = [](const std::string& name) {
-        return contains_ci(name, "reg") || contains_ci(name, "underfill") ||
-               contains_ci(name, "pre") || contains_ci(name, "nonpre");
+        return string_utils::contains_ci(name, "reg") || string_utils::contains_ci(name, "underfill") ||
+               string_utils::contains_ci(name, "pre") || string_utils::contains_ci(name, "nonpre");
     };
 
     for (const auto& event : detected_events) {
         if (event.empty()) continue;
         if (event.size() <= 1 && event.back() == '/') continue;
 
-        const std::string lowered_event = to_lower_copy(event);
+        const std::string lowered_event = string_utils::to_lower(event);
         if (lowered_event == "unc_m_cas_count.rd") {
             has_unc_m_rd = true;
         } else if (lowered_event == "unc_m_cas_count.wr") {
             has_unc_m_wr = true;
         }
 
-        bool is_combined = contains_ci(event, "all");
-        bool is_read = contains_ci(event, "cas_count") && (contains_ci(event, "rd") || contains_ci(event, "read"));
-        bool is_write = contains_ci(event, "cas_count") && (contains_ci(event, "wr") || contains_ci(event, "write"));
+        bool is_combined = string_utils::contains_ci(event, "all");
+        bool is_read = string_utils::contains_ci(event, "cas_count") && (string_utils::contains_ci(event, "rd") || string_utils::contains_ci(event, "read"));
+        bool is_write = string_utils::contains_ci(event, "cas_count") && (string_utils::contains_ci(event, "wr") || string_utils::contains_ci(event, "write"));
 
-        if (contains_ci(event, "nvidia_scf_pmu")) {
-            if (contains_ci(event, "cmem_rd_data") || contains_ci(event, "remote_socket_rd_data")) {
+        if (string_utils::contains_ci(event, "nvidia_scf_pmu")) {
+            if (string_utils::contains_ci(event, "cmem_rd_data") || string_utils::contains_ci(event, "remote_socket_rd_data")) {
                 is_read = true;
-            } else if (contains_ci(event, "cmem_wr_total_bytes") || contains_ci(event, "remote_socket_wr_total_bytes")) {
+            } else if (string_utils::contains_ci(event, "cmem_wr_total_bytes") || string_utils::contains_ci(event, "remote_socket_wr_total_bytes")) {
                 is_write = true;
             }
         }
 
-        if (contains_ci(event, "dram_channel_data_controller")) {
+        if (string_utils::contains_ci(event, "dram_channel_data_controller")) {
             is_combined = true;
         }
         
@@ -893,9 +1215,9 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     }
 
     auto is_channel_specific = [](const std::string& name) {
-        if (contains_ci(name, "_sch") || contains_ci(name, "_imc") ||
-            contains_ci(name, "/imc") || contains_ci(name, "uncore_imc") ||
-            contains_ci(name, "dram_channel_data_controller")) return true;
+        if (string_utils::contains_ci(name, "_sch") || string_utils::contains_ci(name, "_imc") ||
+            string_utils::contains_ci(name, "/imc") || string_utils::contains_ci(name, "uncore_imc") ||
+            string_utils::contains_ci(name, "dram_channel_data_controller")) return true;
 
         static const std::regex channel_regex(R"((ch|channel|unit|imc)[0-9]+)", std::regex_constants::icase);
         if (std::regex_search(name, channel_regex)) return true;
@@ -980,6 +1302,10 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     }
 
     if (!selection.has_read_write && !selection.has_combined_counter) {
+        CasCounterSelection consumer_imc = discoverIntelConsumerImcFromPerf();
+        if (consumer_imc.has_read_write || consumer_imc.has_combined_counter) {
+            return consumer_imc;
+        }
         selection.failure_reason = "No usable CAS counters detected";
     }
 
@@ -1054,7 +1380,7 @@ std::vector<std::string> BandwidthCounterStrategy::extractCasEventsFromVtune() {
 
     std::vector<std::string> candidates = extract_vtune_tokens_from_output(output);
     for (const auto& evt : candidates) {
-        const std::string lowered = to_lower_copy(evt);
+        const std::string lowered = string_utils::to_lower(evt);
         if (lowered.find("cas_count") != std::string::npos ||
             lowered.find("dram_channel_data_controller") != std::string::npos ||
             lowered.find("nvidia_scf_pmu") != std::string::npos) {
@@ -1085,26 +1411,26 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromVtune() {
     std::vector<std::string> combined_candidates;
 
     auto is_weird_specific = [](const std::string& name) {
-        return contains_ci(name, "reg") || contains_ci(name, "underfill") ||
-               contains_ci(name, "pre") || contains_ci(name, "nonpre");
+        return string_utils::contains_ci(name, "reg") || string_utils::contains_ci(name, "underfill") ||
+               string_utils::contains_ci(name, "pre") || string_utils::contains_ci(name, "nonpre");
     };
 
     for (const auto& event : detected_events) {
         if (event.empty()) continue;
 
-        bool is_combined = contains_ci(event, ".all") || contains_ci(event, "_all");
-        bool is_read = contains_ci(event, "cas_count") && (contains_ci(event, ".rd") || contains_ci(event, "_rd") || contains_ci(event, "read"));
-        bool is_write = contains_ci(event, "cas_count") && (contains_ci(event, ".wr") || contains_ci(event, "_wr") || contains_ci(event, "write"));
+        bool is_combined = string_utils::contains_ci(event, ".all") || string_utils::contains_ci(event, "_all");
+        bool is_read = string_utils::contains_ci(event, "cas_count") && (string_utils::contains_ci(event, ".rd") || string_utils::contains_ci(event, "_rd") || string_utils::contains_ci(event, "read"));
+        bool is_write = string_utils::contains_ci(event, "cas_count") && (string_utils::contains_ci(event, ".wr") || string_utils::contains_ci(event, "_wr") || string_utils::contains_ci(event, "write"));
 
-        if (contains_ci(event, "nvidia_scf_pmu")) {
-            if (contains_ci(event, "cmem_rd_data") || contains_ci(event, "remote_socket_rd_data")) {
+        if (string_utils::contains_ci(event, "nvidia_scf_pmu")) {
+            if (string_utils::contains_ci(event, "cmem_rd_data") || string_utils::contains_ci(event, "remote_socket_rd_data")) {
                 is_read = true;
-            } else if (contains_ci(event, "cmem_wr_total_bytes") || contains_ci(event, "remote_socket_wr_total_bytes")) {
+            } else if (string_utils::contains_ci(event, "cmem_wr_total_bytes") || string_utils::contains_ci(event, "remote_socket_wr_total_bytes")) {
                 is_write = true;
             }
         }
 
-        if (contains_ci(event, "dram_channel_data_controller")) {
+        if (string_utils::contains_ci(event, "dram_channel_data_controller")) {
             is_combined = true;
         }
 
@@ -1178,7 +1504,7 @@ CasCounterSelection BandwidthCounterStrategy::discoverFromVtune(
         std::vector<std::string> found;
         for (const auto& event : preferred) {
             for (const auto& available_event : available) {
-                if (contains_ci(available_event, event)) {
+                if (string_utils::contains_ci(available_event, event)) {
                     found.push_back(available_event);
                 }
             }
@@ -1381,7 +1707,9 @@ std::string UpiFlitSelection::get_all_events_string() const {
 }
 
 std::string BandwidthCounterSelection::get_bw_events_string() const {
-    if (type == CounterType::CAS_COUNT || type == CounterType::NVIDIA_GRACE) {
+    if (type == CounterType::CAS_COUNT ||
+        type == CounterType::NVIDIA_GRACE ||
+        type == CounterType::TOTAL_BYTES) {
         return cas.get_all_events_string();
     } else if (type == CounterType::UPI_FLITS) {
         return upi.get_all_events_string();
@@ -1402,7 +1730,9 @@ std::string BandwidthCounterSelection::get_all_events_string() const {
 
 std::string BandwidthCounterSelection::get_popen_events_string() const {
     std::string result;
-    if (type == CounterType::CAS_COUNT || type == CounterType::NVIDIA_GRACE) {
+    if (type == CounterType::CAS_COUNT ||
+        type == CounterType::NVIDIA_GRACE ||
+        type == CounterType::TOTAL_BYTES) {
         result = cas.get_popen_events_string();
     } else if (type == CounterType::UPI_FLITS) {
         result = upi.get_all_events_string();
@@ -1418,7 +1748,9 @@ std::string BandwidthCounterSelection::get_popen_events_string() const {
 
 bool BandwidthCounterSelection::is_valid() const {
     if (!perf_available) return false;
-    if (type == CounterType::CAS_COUNT || type == CounterType::NVIDIA_GRACE) {
+    if (type == CounterType::CAS_COUNT ||
+        type == CounterType::NVIDIA_GRACE ||
+        type == CounterType::TOTAL_BYTES) {
         return cas.has_read_write || cas.has_combined_counter;
     } else if (type == CounterType::UPI_FLITS) {
         return upi.has_rxl_txl;
@@ -1441,10 +1773,10 @@ std::vector<std::string> BandwidthCounterStrategy::extractUpiFlitEventsFromPerf(
         std::istringstream output_stream(output);
         std::string line;
         while (std::getline(output_stream, line)) {
-            std::string token = trim_event_token(line);
+            std::string token = string_utils::trim(line);
             if (token.empty()) continue;
 
-            std::string lowered = to_lower_copy(token);
+            std::string lowered = string_utils::to_lower(token);
             if ((lowered.find("upi") != std::string::npos && lowered.find("flits") != std::string::npos) ||
                 (lowered.find("qpi") != std::string::npos && lowered.find("flits") != std::string::npos) ||
                 (lowered.find("amd_df") != std::string::npos)) {
@@ -1477,7 +1809,7 @@ std::vector<std::string> BandwidthCounterStrategy::extractUpiFlitEventsFromVtune
 
     std::vector<std::string> candidates = extract_vtune_tokens_from_output(output);
     for (const auto& evt : candidates) {
-        std::string lowered = to_lower_copy(evt);
+        std::string lowered = string_utils::to_lower(evt);
         if ((lowered.find("upi") != std::string::npos && lowered.find("flit") != std::string::npos) ||
             (lowered.find("qpi") != std::string::npos && lowered.find("flit") != std::string::npos) ||
             (lowered.find("amd_df") != std::string::npos)) {
@@ -1508,7 +1840,7 @@ UpiFlitSelection BandwidthCounterStrategy::discoverUpiFlitsFromPerf() {
 
     for (const auto& event : detected_events) {
         if (event.empty()) continue;
-        std::string lowered = to_lower_copy(event);
+        std::string lowered = string_utils::to_lower(event);
         
         if (event.back() == '/') continue;
 
@@ -1546,12 +1878,12 @@ UpiFlitSelection BandwidthCounterStrategy::discoverUpiFlitsFromPerf() {
     auto is_link_specific = [](const std::string& name) {
         static const std::regex link_regex(R"((upi|qpi|df)[0-9]+)", std::regex_constants::icase);
         if (std::regex_search(name, link_regex)) return true;
-        if (contains_ci(name, "/upi") || contains_ci(name, "/amd_df")) return true;
+        if (string_utils::contains_ci(name, "/upi") || string_utils::contains_ci(name, "/amd_df")) return true;
         return false;
     };
 
     auto is_aggregate_event = [&is_link_specific](const std::string& name) -> bool {
-        return contains_ci(name, "all_data") && !is_link_specific(name);
+        return string_utils::contains_ci(name, "all_data") && !is_link_specific(name);
     };
 
     auto select_best_counters = [&](const std::vector<std::string>& candidates) -> std::vector<std::string> {
@@ -1616,7 +1948,7 @@ UpiFlitSelection BandwidthCounterStrategy::discoverUpiFlitsFromVtune() {
     }
 
     for (const auto& event : detected_events) {
-        std::string lowered = to_lower_copy(event);
+        std::string lowered = string_utils::to_lower(event);
         if (lowered.find("rxl") != std::string::npos ||
             lowered.find("rx_data") != std::string::npos ||
             lowered.find("receive") != std::string::npos) {
@@ -1636,17 +1968,9 @@ UpiFlitSelection BandwidthCounterStrategy::discoverUpiFlitsFromVtune() {
     return selection;
 }
 
-int BandwidthCounterStrategy::getPhysicalPackageId(int cpu) {
-    return cpu_topology::physical_package_id(cpu);
-}
-
-int BandwidthCounterStrategy::getNodeSocketId(int node_id) {
-    return cpu_topology::socket_of_node(node_id);
-}
-
 CounterType BandwidthCounterStrategy::detectCounterType(int src_cpu, int target_mem_node) {
-    int src_socket = getPhysicalPackageId(src_cpu);
-    int dst_socket = getNodeSocketId(target_mem_node);
+    int src_socket = cpu_topology::physical_package_id(src_cpu);
+    int dst_socket = cpu_topology::socket_of_node(target_mem_node);
 
     if (src_socket != -1 && dst_socket != -1) {
         if (src_socket == dst_socket) {
@@ -1656,9 +1980,9 @@ CounterType BandwidthCounterStrategy::detectCounterType(int src_cpu, int target_
         }
     }
 
-    int src_node = getNodeId(src_cpu);
+    int src_node = cpu_topology::numa_node_of(src_cpu);
     if (src_node != -1) {
-        int distance = getNodeDistance(src_node, target_mem_node);
+        int distance = cpu_topology::distance(src_node, target_mem_node);
         if (distance > 15) {
             return CounterType::UPI_FLITS;
         } else if (distance != -1) {
@@ -1697,14 +2021,23 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
         strategy->set_measurer_type(measurer_type);
     }
 
-    bool use_upi = false;
+    bool has_remote_target = false;
+    bool has_local_target = false;
     for (int node : target_mem_nodes) {
-        if (detectCounterType(src_cpu, node) == CounterType::UPI_FLITS) {
-            use_upi = true;
-            break;
+        const CounterType target_type = detectCounterType(src_cpu, node);
+        if (target_type == CounterType::UPI_FLITS) {
+            has_remote_target = true;
+        } else if (target_type == CounterType::CAS_COUNT) {
+            has_local_target = true;
         }
     }
+    bool use_upi = has_remote_target && !has_local_target;
 
+    if (strategy && strategy->is_hbm()) {
+        use_upi = false;
+    }
+
+    selection.cross_socket = use_upi;
     if (use_upi) {
         selection.type = CounterType::UPI_FLITS;
     } else {
@@ -1738,9 +2071,13 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
 
     CasCounterSelection cas_counters;
     
-    if (strategy) {
+    if (!use_upi && !use_vtune && strategy && strategy->is_hbm()) {
+        cas_counters = discoverIntelHbmFromPerf();
+    }
+
+    if (!cas_counters.has_read_write && !cas_counters.has_combined_counter && strategy) {
         cas_counters = strategy->detectCasCounters();
-    } else {
+    } else if (!cas_counters.has_read_write && !cas_counters.has_combined_counter) {
         cas_counters = use_vtune ? discoverFromVtune() : discoverFromPerf();
     }
     
@@ -1792,6 +2129,7 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
         if (is_nvidia) {
             selection.type = CounterType::NVIDIA_GRACE;
         }
+
     }
 
     if (!cas_available) {

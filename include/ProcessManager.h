@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -38,9 +40,9 @@
 #include "SystemInfo.h"
 #include "PtrchasePerfHelper.h"
 #include "Utils.h"
-#include <semaphore.h>
+#include "platform/Ipc.h"
+#include "platform/Process.h"
 #include <string>
-#include <sys/types.h>
 #include <vector>
 
 /**
@@ -76,17 +78,18 @@ public:
     void drain_start_sem();
     bool wait_for_done(int timeout_ms);
 
-    pid_t pid() const { return ptr_chase_pid_; }
-    sem_t* start_sem() const { return ptrchase_start_sem_; }
-    sem_t* done_sem() const { return ptrchase_done_sem_; }
+    platform::ProcessId pid() const { return ptr_chase_pid_; }
+
+    platform::Semaphore& start_sem() { return ptrchase_start_sem_; }
+    platform::Semaphore& done_sem() { return ptrchase_done_sem_; }
     const std::string& pipe_path() const { return pipe_path_; }
 
 private:
     const BenchmarkConfig& config_;
 
-    pid_t ptr_chase_pid_;
-    sem_t* ptrchase_start_sem_;
-    sem_t* ptrchase_done_sem_;
+    platform::ProcessId ptr_chase_pid_;
+    platform::Semaphore ptrchase_start_sem_;
+    platform::Semaphore ptrchase_done_sem_;
     ptrchase_perf::PtrchasePerfFDs ptrchase_perf_fds_;
 
     std::string start_sem_name_;
@@ -94,6 +97,10 @@ private:
     std::string ready_flag_path_;
     std::string pipe_path_;
     std::string unique_id_;
+
+#if defined(_WIN32)
+    platform::ProcessGroup ptr_chase_group_;
+#endif
 
     void generate_unique_names();
     bool launch_process();
@@ -103,12 +110,8 @@ private:
  * @brief Captures the outcome of preparing a traffic-generator launch.
  */
 struct TrafficGenPreparation {
-    pid_t pid = 0;
+    platform::ProcessId pid = 0;
     bool reused_existing = false;
-    long long prev_cas_rd = 0;
-    long long prev_cas_wr = 0;
-    double prev_elapsed = 0.0;
-    double prev_bw_gb_s = 0.0;
 };
 
 /**
@@ -133,7 +136,8 @@ public:
                            const std::vector<int>& traffic_gen_mem_nodes,
                            const std::string& traffic_gen_log_file,
                            TrafficGenPreparation& prep,
-                           ExecutionMode mode = ExecutionMode::MULTISEQUENTIAL);
+                           ExecutionMode mode = ExecutionMode::MULTISEQUENTIAL,
+                           bool reuse_existing = false);
 
     bool relaunch_traffic_gen(double ratio_pct,
                          int pause,
@@ -142,54 +146,40 @@ public:
                          const std::string& traffic_gen_log_file,
                          ExecutionMode mode = ExecutionMode::MULTISEQUENTIAL);
 
-    bool is_traffic_gen_running(pid_t pid) const;
-    void terminate_traffic_gen(pid_t pid);
+    bool is_traffic_gen_running(platform::ProcessId pid) const;
+    void terminate_traffic_gen(platform::ProcessId pid);
     void kill_all_traffic_gen();
-
-    void stash_bandwidth_retry(pid_t traffic_gen_pid,
-                               long long cas_rd,
-                               long long cas_wr,
-                               double elapsed,
-                               double bw_gb_s);
-    bool consume_bandwidth_retry(long long& cas_rd,
-                                 long long& cas_wr,
-                                 double& elapsed,
-                                 double& bw_gb_s);
 
     bool wait_for_traffic_gen_ready(int timeout_seconds = 120);
 
-    pid_t current_traffic_gen_pid() const { return current_traffic_gen_pid_; }
-    pid_t active_traffic_gen_pid() const { return active_traffic_gen_pid_; }
-    std::vector<pid_t> traffic_gen_worker_pids() const;
+    platform::ProcessId current_traffic_gen_pid() const { return current_traffic_gen_pid_; }
+    platform::ProcessId active_traffic_gen_pid() const { return active_traffic_gen_pid_; }
+    std::vector<platform::ProcessId> traffic_gen_worker_pids() const;
 
 private:
     const BenchmarkConfig& config_;
     const system_info& sys_info_;
 
-    bool keep_traffic_gen_on_retry_;
-    long long retry_bw_cas_rd_;
-    long long retry_bw_cas_wr_;
-    double retry_bw_elapsed_;
-    double retry_bw_gb_s_;
-    pid_t current_traffic_gen_pid_;
-    pid_t active_traffic_gen_pid_;
+    platform::ProcessId current_traffic_gen_pid_;
+    platform::ProcessId active_traffic_gen_pid_;
 
     bool persistent_traffic_gen_valid_;
     double persistent_ratio_pct_;
     int persistent_pause_;
     ExecutionMode persistent_mode_;
     int persistent_traffic_gen_cores_;
+    uint64_t persistent_traffic_gen_array_elements_;
     std::vector<int> persistent_traffic_gen_mem_nodes_;
 
-    bool launch_traffic_gen_multiseq(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, pid_t& out_pid) const;
+    bool launch_traffic_gen_multiseq(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
     
 
-    bool launch_traffic_gen_impl(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, pid_t& out_pid) const;
+    bool launch_traffic_gen_impl(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
     
 #if USE_MPI_SPAWN
-    bool launch_traffic_gen_mpi(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, pid_t& out_pid) const;
+    bool launch_traffic_gen_mpi(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
 #endif
-    bool read_traffic_gen_pid(const std::string& pid_filename, pid_t& traffic_gen_pid) const;
+    bool read_traffic_gen_pid(const std::string& pid_filename, platform::ProcessId& traffic_gen_pid) const;
     bool cleanup_zombie_traffic_gen() const;
     std::string get_membind_arg(int default_node) const;
 
@@ -200,6 +190,11 @@ private:
 
     void generate_unique_names();
     void print_recent_traffic_gen_log_excerpt() const;
+    uint64_t active_traffic_gen_array_elements() const;
+
+#if defined(_WIN32)
+    mutable platform::ProcessGroup traffic_gen_group_;
+#endif
 
     mutable std::vector<std::string> cached_core_list_;
     mutable int cached_traffic_gen_cores_;

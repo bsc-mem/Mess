@@ -1,7 +1,8 @@
 import os
 import re
-import sys
 import pandas as pd
+
+from .latency_timing import read_cpu_frequency_ghz, resolve_pointer_chase_timing, point_timing_alternatives, saved_direct_latency_ns
 
 
 
@@ -34,38 +35,6 @@ def _classify_tlb_formula(slot1_label, slot2_label):
     return 'intel_cycles'
 
 
-def _resolve_cpu_freq_ghz(cycles, seconds_user, config):
-
-    def _as_float(key, default=0.0):
-        try:
-            return float(config.get(key, default))
-        except (ValueError, TypeError):
-            return default
-
-    measured = (cycles / seconds_user) / 1e9 if seconds_user > 0 else 0.0
-    base_ghz = _as_float('CPU_BASE_FREQ', 0.0)
-    max_ghz = _as_float('CPU_MAX_FREQ', 0.0)
-    cfg_ghz = _as_float('CPU_FREQ', 0.0)
-    if base_ghz <= 0.0:
-        base_ghz = cfg_ghz
-    if max_ghz <= 0.0:
-        max_ghz = cfg_ghz
-
-    lo = base_ghz * 0.7 if base_ghz > 0.0 else 0.0
-    hi = max_ghz * 1.1 if max_ghz > 0.0 else 0.0
-
-    in_band = measured > 0.0 and measured >= lo and (hi <= 0.0 or measured <= hi)
-    if in_band:
-        return measured
-    if cfg_ghz > 0.0:
-        return cfg_ghz
-    if base_ghz > 0.0:
-        return base_ghz
-    if max_ghz > 0.0:
-        return max_ghz
-    return measured if measured > 0.0 else 3.0
-
-
 def _compute_tlb_overhead_ns(slot1, slot2, freq_ghz, stlb_hit_latency_ns,
                              formula_tag, page_walk_latency_ns):
     """Mirror of BandwidthCounterStrategy::computeTlbOverheadNs (see C++)."""
@@ -81,31 +50,26 @@ def _compute_tlb_overhead_ns(slot1, slot2, freq_ghz, stlb_hit_latency_ns,
     pagewalk_ns = page_walk_latency_ns * slot1 if page_walk_latency_ns > 0.0 else 0.0
     return pagewalk_ns + stlb_hit_latency_ns * stlb_hits
 
-def csv_to_json_compact(
-    input_csv: str,
+def curves_to_json_compact(
+    dfs_rw,
     output_json: str,
-    group_col: str = "rd_percentage",
-    sort_col: str = "pause",
-    bw_col: str = "bandwidth_mean",
-    lat_col: str = "latency_mean",
+    bw_col: str = "bandwidth_smooth",
+    lat_col: str = "latency_smooth",
 ) -> None:
-    df = pd.read_csv(input_csv)
-   # ensure numeric
-    for c in (group_col, sort_col, bw_col, lat_col):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    """Write the plotted curves ({ratio: dataframe}) as compact JSON.
 
-    # multiply all the bws by 1000:
-    df[bw_col] = df[bw_col] 
-
-    df[lat_col] = df[lat_col]
-
-    # group & sort
+    Rows keep the order in which they are drawn (pause-sweep order), so the
+    JSON mirrors exactly the curves rendered in memory_curves.pdf.
+    """
     groups = {}
-    for grp, sub in df.groupby(group_col):
-        sub = sub.sort_values(sort_col)
-        groups[int(grp)] = sub[[bw_col, lat_col]].values.tolist()
+    for ratio, df in dfs_rw.items():
+        if bw_col not in df.columns or lat_col not in df.columns:
+            continue
+        sub = df[[bw_col, lat_col]].dropna()
+        if sub.empty:
+            continue
+        groups[int(round(float(ratio)))] = sub.values.tolist()
 
-    # write manually
     with open(output_json, "w") as f:
         f.write("{\n")
         for i, (grp, pairs) in enumerate(sorted(groups.items())):
@@ -116,8 +80,6 @@ def csv_to_json_compact(
             end_comma = "," if i < len(groups) - 1 else ""
             f.write(f"    ]{end_comma}\n")
         f.write("}\n")
-
-    #print(f"Done — wrote {len(groups)} groups to {output_json}")
 
 
 
@@ -139,8 +101,66 @@ def _extract_counter_value(parts, cast=int):
     return None
 
 
+def _detect_imc_scale_factor(filepath, cache_line_size):
+    try:
+        dirpath = os.path.dirname(filepath)
+        zero_files = [f for f in os.listdir(dirpath) if f.endswith('_0.txt')]
+        if not zero_files:
+            return cache_line_size
+
+        zero_filepath = os.path.join(dirpath, zero_files[0])
+        with open(zero_filepath, 'r') as f:
+            lines = f.readlines()
+
+        rd_val = None
+        wr_val = None
+        runtime = None
+        for line in lines:
+            if 'S1' in line:
+                continue
+            line_lower = line.lower()
+            if ('uncore_imc' in line_lower or 'imc_dram' in line_lower
+                    or 'uprof_umc' in line_lower):
+                val = _extract_counter_value(line.split())
+                if val is not None:
+                    if 'data_reads' in line_lower:
+                        rd_val = val
+                    elif 'data_writes' in line_lower:
+                        wr_val = val
+            elif 'seconds time elapsed' in line_lower:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        runtime = float(parts[0])
+                    except ValueError:
+                        pass
+                break
+
+        if rd_val is not None and wr_val is not None and runtime is not None and runtime > 0:
+            total_counts = rd_val + wr_val
+            if (total_counts / runtime) > 2.0e9:
+                return 1.0
+            else:
+                return cache_line_size
+    except Exception:
+        pass
+    return cache_line_size
+
+
+def _issued_read_fraction(rd_percentage_from_filename):
+    if rd_percentage_from_filename is None:
+        return 1.0
+    return max(0.0, min(1.0, rd_percentage_from_filename / 100.0))
+
+
 def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
     try:
+        try:
+            cache_line_size_init = int(config.get('CACHE_LINE_SIZE', 64))
+        except (ValueError, TypeError):
+            cache_line_size_init = 64
+        imc_scale_factor = _detect_imc_scale_factor(filepath, cache_line_size_init)
+
         with open(filepath, 'r') as f:
             lines = f.readlines()
         
@@ -185,16 +205,23 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                         ('data_from_local_dram' in line_lower)
             is_cas_wr = ('cas_count' in line_lower and ('wr' in line_lower or 'write' in line_lower)) or \
                         ('amd_umc' in line_lower and ('wr' in line_lower or 'write' in line_lower))
+            is_imc = ('uncore_imc' in line_lower or 'imc_dram' in line_lower
+                      or 'uprof_umc' in line_lower)
+            is_imc_rd = is_imc and 'data_reads' in line_lower
+            is_imc_wr = is_imc and 'data_writes' in line_lower
             is_grace_rd = 'cmem_rd' in line_lower or 'remote_socket_rd_data' in line_lower
             is_grace_wr = 'cmem_wr' in line_lower or 'remote_socket_wr_total_bytes' in line_lower
+            is_gpu_rd = 'dram__bytes_read.sum.per_second' in line_lower
+            is_gpu_wr = 'dram__bytes_write.sum.per_second' in line_lower
             is_a64fx_rd = 'a64fx_read_effective' in line_lower
             is_a64fx_wr = 'a64fx_write_effective' in line_lower
+            is_amc_rd = 'amc.dcs_rd' in line_lower
+            is_amc_wr = 'amc.dcs_wr' in line_lower
             is_runtime_line = 'seconds time elapsed' in line
 
             if file_has_bus_access and not (is_bus_rd or is_bus_wr or is_runtime_line):
                 continue
 
-            # (matched, counter_type_tag, target_list) -- evaluated in order, first match wins.
             counter_dispatch = (
                 (is_bus_rd,       'BUS_ACCESS',   rd_counts),
                 (is_bus_wr,       'BUS_ACCESS',   wr_counts),
@@ -203,10 +230,16 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                 (is_upi_tx,       'UPI_FLITS',    wr_counts),
                 (is_cas_rd,       'CAS_COUNT',    rd_counts),
                 (is_cas_wr,       'CAS_COUNT',    wr_counts),
+                (is_imc_rd,       'IMC_COUNT',    rd_counts),
+                (is_imc_wr,       'IMC_COUNT',    wr_counts),
                 (is_grace_rd,     'NVIDIA_GRACE', rd_counts),
                 (is_grace_wr,     'NVIDIA_GRACE', wr_counts),
+                (is_gpu_rd,       'GPU_NCU',      rd_counts),
+                (is_gpu_wr,       'GPU_NCU',      wr_counts),
                 (is_a64fx_rd,     'A64FX',        rd_counts),
                 (is_a64fx_wr,     'A64FX',        wr_counts),
+                (is_amc_rd,       'APPLE_AMC',    rd_counts),
+                (is_amc_wr,       'APPLE_AMC',    wr_counts),
             )
 
             matched = False
@@ -215,9 +248,22 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                     continue
                 if counter_type is None:
                     counter_type = tag
-                value = _extract_counter_value(line.split())
-                if value is not None:
-                    target.append(value)
+                if tag == 'GPU_NCU':
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == 'S0':
+                        try:
+                            target.append(float(parts[2].replace(',', '')))
+                        except ValueError:
+                            pass
+                    elif len(parts) >= 2:
+                        try:
+                            target.append(float(parts[0].replace(',', '')))
+                        except ValueError:
+                            pass
+                else:
+                    value = _extract_counter_value(line.split())
+                    if value is not None:
+                        target.append(value)
                 matched = True
                 break
 
@@ -233,10 +279,14 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                         pass
                 if (current_pcm_total_mbps is not None) or \
                    (current_pcm_read_mbps is not None and current_pcm_write_mbps is not None):
+                    has_split_pcm = current_pcm_read_mbps is not None and current_pcm_write_mbps is not None
                     read_mbps = current_pcm_read_mbps if current_pcm_read_mbps is not None else 0.0
                     write_mbps = current_pcm_write_mbps if current_pcm_write_mbps is not None else 0.0
                     total_mbps = current_pcm_total_mbps if current_pcm_total_mbps is not None else (read_mbps + write_mbps)
-                    rd_percentage_actual = (read_mbps / total_mbps) if total_mbps > 0.0 else 0.0
+                    if has_split_pcm:
+                        rd_percentage_actual = (read_mbps / total_mbps) if total_mbps > 0.0 else 0.0
+                    else:
+                        rd_percentage_actual = _issued_read_fraction(rd_percentage_from_filename)
                     try:
                         runtime_value = float(parts[0])
                     except (ValueError, IndexError):
@@ -244,6 +294,7 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                     pcm_measurements.append({
                         'bandwidth': total_mbps / 1000.0,
                         'rd_percentage_actual': rd_percentage_actual,
+                        'bandwidth_counter_combined': not has_split_pcm,
                         'runtime': runtime_value
                     })
                     current_pcm_read_mbps = None
@@ -263,7 +314,7 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                 if runtime <= 0:
                     continue
                 
-                rd_percentage_actual = (rd_percentage_from_filename / 100.0) if rd_percentage_from_filename is not None else 1.0
+                rd_percentage_actual = _issued_read_fraction(rd_percentage_from_filename)
                 
                 try:
                     cache_line_size = int(config.get('CACHE_LINE_SIZE', 64))
@@ -275,6 +326,7 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                 measurements.append({
                     'bandwidth': bandwidth,
                     'rd_percentage_actual': rd_percentage_actual,
+                    'bandwidth_counter_combined': True,
                     'runtime': runtime
                 })
             
@@ -312,6 +364,17 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
                     rd = rd*32.0
                     total_counts = (rd) + wr
                     rd_percentage_actual = (rd / total_counts) if total_counts > 0 else 0
+                elif counter_type == 'GPU_NCU':
+                    # GPU_NCU provides values directly in bytes per second
+                    bandwidth = total_counts / 1000 / 1000 / 1000
+                elif counter_type == 'IMC_COUNT':
+                    bandwidth = total_counts * imc_scale_factor / runtime / 1000 / 1000 / 1000
+                elif counter_type == 'APPLE_AMC':
+                    try:
+                        bytes_per_count = int(config.get('CACHE_LINE_SIZE', 1))
+                    except (ValueError, TypeError):
+                        bytes_per_count = 1
+                    bandwidth = total_counts * bytes_per_count / runtime / 1000 / 1000 / 1000
                 else:
                     bandwidth = total_counts * cache_line_size / runtime / 1000 / 1000 / 1000
                 
@@ -323,10 +386,8 @@ def parse_bandwidth_file(filepath, config, rd_percentage_from_filename=None):
             
             return measurements
         else:
-            #print(f"  Missing or mismatched data in {filepath}: rd={len(rd_counts)}, wr={len(wr_counts)}, time={len(runtimes)}, combined={len(combined_counts)}")
             pass
     except Exception as e:
-        #print(f"Error parsing {filepath}: {e}")
         pass
     
     return None
@@ -340,7 +401,6 @@ def parse_latency_file(filepath, config):
         
         measurements = []
         
-        # Detect PEBS percentile format (mean_ns, p90_ns, etc.)
         is_pebs = any('mean_ns' in line for line in lines)
         if is_pebs:
             current = {}
@@ -374,7 +434,7 @@ def parse_latency_file(filepath, config):
                         current['samples'] = int(value)
                     elif metric in PEBS_LATENCY_METRICS:
                         current[metric] = value
-                    elif metric.endswith('_cycles'):
+                    elif metric.endswith('_cycles') or metric == 'point_cpu_freq_ghz':
                         current[metric] = value
             return measurements if measurements else None
 
@@ -393,10 +453,24 @@ def parse_latency_file(filepath, config):
                 tlb_values = []   # [(value, label)] in file order: slot1 then slot2
                 accesses = None
                 seconds_user = None
+                seconds_cpu = None
+                timing_metrics = {}
 
                 j = i
-                while j < len(lines) and j < i + 10:
+                while j < len(lines):
                     block_line = lines[j].strip()
+                    # End a malformed/incomplete block before consuming the next one.
+                    if j > i and (block_line.startswith("Performance counter stats") or
+                                  (cycles is not None and re.search(r"\bcycles(?::u)?$", block_line))):
+                        break
+                    parts = block_line.split()
+                    if len(parts) == 2 and parts[1] in (
+                            'point_cpu_freq_ghz', 'pointer_chase_elapsed_ns',
+                            'pointer_chase_bursts', 'latency_direct_ns', 'pointer_chase_thread_ns',
+                            'cycles_enabled_ns', 'cycles_running_ns'):
+                        timing_metrics[parts[1]] = float(parts[0])
+                        j += 1
+                        continue
 
                     if 'cycles:u' in block_line or ('cycles' in block_line and 'instructions' not in block_line):
                         parts = block_line.split()
@@ -425,6 +499,15 @@ def parse_latency_file(filepath, config):
                             except ValueError:
                                 continue
 
+                    elif 'seconds thread cpu time' in block_line:
+                        parts = block_line.split()
+                        for part in parts:
+                            try:
+                                seconds_cpu = float(part)
+                                break
+                            except ValueError:
+                                continue
+
                     elif 'seconds time elapsed' in block_line:
                         parts = block_line.split()
                         for part in parts:
@@ -446,42 +529,67 @@ def parse_latency_file(filepath, config):
                                     continue
 
                     j += 1
+                    if 'seconds time elapsed' in block_line:
+                        break
 
-                if cycles is not None and seconds_user is not None and seconds_user > 0:
+                direct_latency = saved_direct_latency_ns(timing_metrics)
+                elapsed_seconds = seconds_cpu if seconds_cpu is not None and seconds_cpu > 0 else seconds_user
+                if direct_latency is not None or (elapsed_seconds is not None and elapsed_seconds > 0):
                     tlb1miss, tlb1_label = (tlb_values[0] if len(tlb_values) >= 1 else (0, ''))
                     tlb2miss, tlb2_label = (tlb_values[1] if len(tlb_values) >= 2 else (0, ''))
                     if accesses is None:
                         accesses = instructions if instructions is not None else 0
 
-                    if accesses is None or accesses <= 0:
+                    if accesses <= 0 and direct_latency is None:
                         j = i + 1
                         i = j
                         continue
-
-                    cpu_freq_ghz = _resolve_cpu_freq_ghz(cycles, seconds_user, config)
 
                     try:
                         tlb_hit_latency_ns = float(config.get('TLB_NS', 10.0))
                     except (ValueError, TypeError):
                         tlb_hit_latency_ns = 10.0
-
                     formula_tag = _classify_tlb_formula(tlb1_label, tlb2_label)
                     try:
                         page_walk_lat_ns = float(config.get('PAGE_WALK_LAT_NS', -1.0))
                     except (ValueError, TypeError):
                         page_walk_lat_ns = -1.0
-                    tlb_overhead_ns = _compute_tlb_overhead_ns(
-                        tlb1miss, tlb2miss, cpu_freq_ghz, tlb_hit_latency_ns,
-                        formula_tag, page_walk_lat_ns)
 
-                    total_ns = (cycles / cpu_freq_ghz) if cpu_freq_ghz > 0.0 else (seconds_user * 1e9)
-                    effective_ns = total_ns - tlb_overhead_ns
-                    latency = effective_ns / accesses if effective_ns > 0.0 and accesses > 0 else 0.0
+                    counter_latency = None
+                    has_startup_calibration = config.get('CPU_FREQ_SOURCE') == 'startup_probe'
+                    if cycles is not None and cycles > 0 and accesses > 0 and (
+                            direct_latency is None or has_startup_calibration):
+                        try:
+                            total_ns, cpu_freq_ghz = resolve_pointer_chase_timing(
+                                cycles, seconds_user, config)
+                            tlb_overhead_ns = _compute_tlb_overhead_ns(
+                                tlb1miss, tlb2miss, cpu_freq_ghz, tlb_hit_latency_ns,
+                                formula_tag, page_walk_lat_ns)
+                            counter_latency = max(0.0, total_ns - tlb_overhead_ns) / accesses
+                        except (ValueError, TypeError):
+                            if direct_latency is None:
+                                raise
+                    elif direct_latency is None and accesses > 0 and elapsed_seconds is not None:
+                        counter_latency = elapsed_seconds * 1e9 / accesses
 
+                    # A saved direct measurement already has units of ns/access.
+                    # It needs neither frequency conversion nor TLB subtraction.
+                    latency = direct_latency if direct_latency is not None else counter_latency
+                    alternatives = point_timing_alternatives(
+                        cycles or 0, accesses, timing_metrics, config)
+                    point_frequency = timing_metrics.get('point_cpu_freq_ghz', 0.0)
+                    if point_frequency > 0 and cycles is not None and cycles > 0 and accesses > 0:
+                        point_overhead = _compute_tlb_overhead_ns(
+                            tlb1miss, tlb2miss, point_frequency, tlb_hit_latency_ns,
+                            formula_tag, page_walk_lat_ns)
+                        alternatives['latency_point_probe_ns'] = max(
+                            0.0, cycles / point_frequency - point_overhead) / accesses
                     measurements.append({
+                        **alternatives,
+                        'latency_startup_ns': counter_latency,
                         'latency': latency,
-                        'cycles': cycles,
-                        'instructions': instructions,
+                        'cycles': cycles if cycles is not None else 0,
+                        'instructions': instructions if instructions is not None else 0,
                         'accesses': accesses,
                         'tlb1miss': tlb1miss,
                         'tlb2miss': tlb2miss
@@ -494,10 +602,8 @@ def parse_latency_file(filepath, config):
         if measurements:
             return measurements
         else:
-            #print(f"  No complete measurements found in {filepath}")
             return None
     except Exception as e:
-        #print(f"Error parsing {filepath}: {e}")
         return None
     return None
 
@@ -516,7 +622,7 @@ def parse_bwlat_file(filepath, config):
                             
                             bw_gbps = bw_mbps / 1000.0
                             
-                            cpu_freq_ghz = float(config.get('CPU_FREQ'))
+                            cpu_freq_ghz = read_cpu_frequency_ghz(config)
                             latency_ns = latency_cycles / cpu_freq_ghz
                             
                             data_points.append({
@@ -529,10 +635,8 @@ def parse_bwlat_file(filepath, config):
         if data_points:
             return data_points
         else:
-            #print(f"  No valid data found in {filepath}")
             pass
     except Exception as e:
-        #print(f"Error parsing {filepath}: {e}")
         pass
     
     return None
@@ -552,7 +656,6 @@ def parse_filename(filename):
             pause = int(parts[2])
             return rd_percentage, pause
         except (ValueError, IndexError) as e:
-            #print(f"    Error parsing parts: {e}")
             pass
     
     return None, None

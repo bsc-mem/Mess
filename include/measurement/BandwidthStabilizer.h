@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -46,6 +48,7 @@
 #include <sstream>
 
 #include "measurement/TheoreticalPeakCalculator.h"
+#include "platform/Console.h"   // platform::glyph
 
 /**
  * @file BandwidthStabilizer.h
@@ -59,6 +62,7 @@ struct BWSample {
     long long cas_rd;
     long long cas_wr;
     double bw_gb_s = 0.0;
+    double elapsed_s = 0.0;
 };
 
 /** @brief Possible outcomes of one stabilization update. */
@@ -126,7 +130,7 @@ public:
         warmup_threshold_gb_s_ = TheoreticalPeakCalculator::get_warmup_threshold(theoretical_peak_gb_s_);
     }
 
-    StabilizationResult add_sample(long long cas_rd, long long cas_wr, double bw_gb_s) {
+    StabilizationResult add_sample(long long cas_rd, long long cas_wr, double bw_gb_s, double elapsed_s = 0.0) {
         last_result_ = StabilizationResult::PENDING;
         total_samples_seen_++;
         
@@ -156,7 +160,7 @@ public:
             }
         }
         
-        samples_.push_back({cas_rd, cas_wr, bw_gb_s});
+        samples_.push_back({cas_rd, cas_wr, bw_gb_s, elapsed_s});
         if (samples_.size() > window_size_) {
             samples_.pop_front();
         }
@@ -226,7 +230,10 @@ public:
                       << " | CV: " << std::fixed << std::setprecision(2) << (cv_ * 100.0) << "%"
                       << " | " << (in_active_mode ? "ACTIVE" : "SILENT")
                       << rd_str
-                      << (is_stable() ? " STABLE" : (has_active_trend_ ? " ✗ trending" : " ✗ unstable"))
+                      << (is_stable()
+                              ? std::string(" STABLE")
+                              : std::string(" ") + platform::glyph::kFail +
+                                    (has_active_trend_ ? " trending" : " unstable"))
                       << '\n';
         }
     }

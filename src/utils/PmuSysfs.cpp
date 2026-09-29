@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,13 +34,13 @@
  */
 
 #include "utils/PmuSysfs.h"
+#include "utils/FileUtils.h"
 
 #include <algorithm>
 #include <cctype>
 #include <fstream>
 
 #if defined(__linux__)
-#include <dirent.h>
 #include <unistd.h>
 #endif
 
@@ -49,22 +51,6 @@ namespace {
 constexpr const char* kRoot = "/sys/bus/event_source/devices";
 
 #if defined(__linux__)
-
-bool for_each_entry(const std::string& dir_path,
-                    const std::function<void(const std::string&)>& visit) {
-    DIR* dir = opendir(dir_path.c_str());
-    if (!dir) return false;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        const char* name = entry->d_name;
-        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
-            continue;
-        }
-        visit(name);
-    }
-    closedir(dir);
-    return true;
-}
 
 bool has_only_digits(const std::string& s) {
     if (s.empty()) return false;
@@ -98,7 +84,7 @@ bool exists(const std::string& pmu_name) {
 std::vector<std::string> list(std::function<bool(const std::string&)> filter) {
     std::vector<std::string> names;
 #if defined(__linux__)
-    for_each_entry(kRoot, [&](const std::string& name) {
+    file_utils::for_each_dir_entry(kRoot, [&](const std::string& name) {
         if (!filter || filter(name)) names.push_back(name);
     });
     std::sort(names.begin(), names.end());
@@ -112,7 +98,7 @@ std::vector<std::string> list_prefixed(const std::string& prefix) {
     std::vector<std::string> names;
 #if defined(__linux__)
     const std::string needle = prefix + "_";
-    for_each_entry(kRoot, [&](const std::string& name) {
+    file_utils::for_each_dir_entry(kRoot, [&](const std::string& name) {
         if (name.rfind(needle, 0) != 0) return;
         if (!has_only_digits(name.substr(needle.size()))) return;
         names.push_back(name);
@@ -173,10 +159,11 @@ std::vector<std::string> list_events(const std::string& pmu_name,
     std::vector<std::string> events;
 #if defined(__linux__)
     const std::string events_dir = path(pmu_name) + "/events";
-    for_each_entry(events_dir, [&](const std::string& event_name) {
+    file_utils::for_each_dir_entry(events_dir, [&](const std::string& event_name) {
         if (filter && !filter(event_name)) return;
         events.push_back(pmu_name + "/" + event_name + "/");
     });
+    std::sort(events.begin(), events.end());
 #else
     (void)pmu_name;
     (void)filter;

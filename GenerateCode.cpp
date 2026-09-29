@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,6 +35,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -46,8 +50,14 @@
 #include <vector>
 #include <thread>
 #include <unistd.h>
+#include "platform/Console.h"
+#include "platform/Fs.h"
+#include "platform/BuildPaths.h"
+#include "platform/Ipc.h"
+#include "platform/Process.h"
 #include <libgen.h>
 #include <limits.h>
+#include <cmath>
 
 #include "Codegen.h"
 #include "Utils.h"
@@ -55,10 +65,30 @@
 #include "architecture/ArchitectureRegistry.h"
 #include "architecture/ISA.h"
 #include "architecture/KernelAssembler.h"
+#include "measurement/TrafficGenArrayCalibrator.h"
 #include "PtrchasePerfHelper.h"
 #include "SystemDetection.h"
 
 namespace {
+
+[[maybe_unused]] bool executable_in_path(const char* exe) {
+    const char* path_env = std::getenv("PATH");
+    if (!path_env) return false;
+    std::string path_str = path_env;
+    std::istringstream ss(path_str);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+        std::string full = dir + "/" + exe;
+        if (access(full.c_str(), X_OK) == 0) return true;
+    }
+    return false;
+}
+
+[[maybe_unused]] std::string detect_timeout_command() {
+    if (executable_in_path("timeout")) return "timeout";
+    if (executable_in_path("gtimeout")) return "gtimeout";
+    return "";
+}
 
 ArchitectureConfig default_architecture_config(const Architecture& architecture) {
     ArchitectureConfig arch_config;
@@ -106,6 +136,300 @@ void printConsoleIssue(const std::string& label, const std::string& reason) {
     if (!detail.empty()) {
         std::cout << "│ Detail: " << detail << std::endl;
     }
+}
+
+[[maybe_unused]] std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+[[maybe_unused]] std::string run_command_capture(const std::string& command, int& exit_code) {
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        exit_code = -1;
+        return output;
+    }
+
+    char buffer[512];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+    const int status = pclose(pipe);
+    exit_code = platform::exit_code_of(status);
+    return output;
+}
+
+#if defined(_WIN32)
+
+
+
+bool run_build_step(const std::string& program,
+                    const std::vector<std::string>& args,
+                    const std::filesystem::path& cwd,
+                    bool verbose,
+                    std::string& log) {
+    platform::RunOptions opts;
+    opts.timeout          = std::chrono::minutes(10);
+    opts.max_output_bytes = 1u << 20;
+    opts.working_dir      = cwd.string();
+
+    if (verbose) {
+        std::cout << "│   " << program;
+        for (const std::string& a : args) std::cout << ' ' << a;
+        std::cout << std::endl;
+    }
+
+    const platform::RunResult r = platform::run(program, args, opts);
+    if (!r.output.empty()) {
+        log += r.output;
+    }
+    if (r.spawn_failed) {
+        log += "failed to launch " + program + "\n";
+        return false;
+    }
+    if (r.timed_out) {
+        log += program + " timed out\n";
+        return false;
+    }
+    if (r.exit_status != 0 && verbose) {
+        std::cout << r.output << std::endl;
+    }
+    return r.exit_status == 0;
+}
+
+bool expand_loop_header(const std::filesystem::path& templ,
+                        const std::filesystem::path& out,
+                        uint64_t repeats) {
+    std::ifstream in(templ);
+    if (!in) return false;
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+
+    std::ofstream dst(out, std::ios::binary);
+    if (!dst) return false;
+    for (const std::string& l : lines) {
+        for (uint64_t i = 0; i < repeats; ++i) {
+            dst << l << '\n';
+        }
+    }
+    return dst.good();
+}
+
+struct PtrChaseBuildSpec {
+    uint64_t array_elems        = 0;
+    uint64_t active_array_elems = 0;
+    uint64_t iterations         = 0;
+    uint64_t burst_iterations   = 0;
+    uint64_t cache_line         = 64;
+    uint64_t loop_instr         = 0;
+};
+
+bool build_ptr_chase_windows(const std::filesystem::path& src_dir,
+                             const PtrChaseBuildSpec& spec,
+                             bool verbose,
+                             std::string& log) {
+    const std::string cc = platform::kernel_c_compiler();
+
+    if (!expand_loop_header(src_dir / "loop_template.h", src_dir / "loop.h",
+                            spec.loop_instr)) {
+        log += "could not expand loop_template.h into loop.h\n";
+        return false;
+    }
+
+    const std::vector<std::string> defines = {
+        "-DARRAY_ELEMS=" + std::to_string(spec.array_elems),
+        "-DACTIVE_ARRAY_ELEMS=" + std::to_string(spec.active_array_elems),
+        "-DITERS=" + std::to_string(spec.iterations),
+        "-DBURST_ITERS=" + std::to_string(spec.burst_iterations),
+        "-DCACHE_LINE=" + std::to_string(spec.cache_line),
+        "-DLOOP_ACCESSES=" + std::to_string(spec.loop_instr),
+    };
+
+    std::vector<std::string> walker = {"-O0", "-pthread", "-static"};
+    walker.insert(walker.end(), defines.begin(), defines.end());
+    walker.push_back("-DLOOP_FOREVER=1");
+    walker.push_back("-o");
+    walker.push_back(platform::exe_name("ptr_chase"));
+    walker.push_back("ptr_chase.c");
+    if (!run_build_step(cc, walker, src_dir, verbose, log)) {
+        return false;
+    }
+
+    std::vector<std::string> gen = {"-O3", "-static",
+                                    defines[0], defines[1], defines[4],
+                                    "-o", platform::exe_name("arraygen"),
+                                    "arraygen.c"};
+    if (!run_build_step(cc, gen, src_dir, verbose, log)) {
+        return false;
+    }
+
+    const std::string arraygen = (src_dir / platform::exe_name("arraygen")).string();
+    if (!run_build_step(arraygen, {}, src_dir, verbose, log)) {
+        return false;
+    }
+
+    return std::filesystem::exists(src_dir / "array.dat");
+}
+
+
+bool build_traffic_gen_windows(const std::filesystem::path& tg_dir,
+                               const std::string& target_name,
+                               const std::string& arch_flags,
+                               uint64_t array_elements,
+                               bool verbose,
+                               std::string& log) {
+    const std::string cc = platform::kernel_c_compiler();
+    const std::filesystem::path build_dir = tg_dir / "build";
+
+    std::error_code ec;
+    std::filesystem::create_directories(build_dir, ec);
+
+    std::vector<std::string> cflags = {arch_flags, "-Wall", "-fopenmp",
+                                       "-DTrafficGen_ARRAY_SIZE=" + std::to_string(array_elements)};
+
+    struct Unit {
+        const char* src;
+        const char* obj;
+        bool        no_unused_warning;
+    };
+    const Unit units[] = {
+        {"src/nop.c",         "build/nop.o",                    false},
+        {"src/utils.c",       "build/utils.o",                  true},
+        {"src/traffic_gen.c", "build/traffic_gen_multiseq_c.o", false},
+    };
+
+    for (const Unit& u : units) {
+        std::vector<std::string> args = cflags;
+        if (u.no_unused_warning) args.push_back("-Wno-unused-but-set-variable");
+        args.push_back("-O0");
+        args.push_back("-c");
+        args.push_back(u.src);
+        args.push_back("-o");
+        args.push_back(u.obj);
+        if (!run_build_step(cc, args, tg_dir, verbose, log)) {
+            return false;
+        }
+    }
+
+    std::vector<std::string> link = cflags;
+    link.push_back("-O0");
+    link.push_back("-pthread");
+    link.push_back("-fopenmp");
+    link.push_back("-static");
+    for (const Unit& u : units) link.push_back(u.obj);
+    link.push_back("-o");
+    link.push_back(platform::exe_name(target_name));
+    return run_build_step(cc, link, tg_dir, verbose, log);
+}
+#endif // _WIN32
+
+double parse_trafficgen_self_bandwidth(const std::string& output) {
+    const std::string key = "MESS_TGEN_SELF_BW_GBPS=";
+    const size_t pos = output.find(key);
+    if (pos == std::string::npos) {
+        return 0.0;
+    }
+    const size_t begin = pos + key.size();
+    char* end = nullptr;
+    const double value = std::strtod(output.c_str() + begin, &end);
+    return (end != output.c_str() + begin && value > 0.0) ? value : 0.0;
+}
+
+uint64_t calibrate_trafficgen_array_elements(
+    const std::filesystem::path& root,
+    const std::string& target_name,
+    const std::vector<uint64_t>& candidates,
+    uint64_t llc_size_bytes,
+    const CPUCapabilities& caps,
+    int verbosity) {
+    TrafficGenArrayCalibrator calibrator(verbosity);
+    auto elements_to_mb = [](uint64_t elements) -> uint64_t {
+        return (elements * sizeof(double)) / (1000ULL * 1000ULL);
+    };
+    auto elements_to_llc_multiplier = [&](uint64_t elements) -> std::string {
+        if (llc_size_bytes == 0) {
+            return "?*LLC";
+        }
+        const double bytes = static_cast<double>(elements) * static_cast<double>(sizeof(double));
+        const double multiplier = bytes / static_cast<double>(llc_size_bytes);
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1) << multiplier << "*LLC";
+        return oss.str();
+    };
+
+    auto probe = [&](uint64_t elements) -> TrafficGenArrayProbeResult {
+        const std::filesystem::path binary =
+            root / "src/traffic_gen" / platform::exe_name(target_name);
+        const uint64_t probe_mb = elements_to_mb(elements);
+        const uint64_t timeout_seconds = std::min<uint64_t>(24ULL, std::max<uint64_t>(8ULL, 6ULL + probe_mb / 128ULL));
+        std::string extra_args;
+        const double probe_seconds = caps.isAppleSilicon() ? 1.0 : 0.12;
+
+        int exit_code = -1;
+        std::string output;
+#if defined(_WIN32)
+
+        (void)extra_args;
+        std::vector<std::string> probe_args = {
+            "-r", "100", "-p", "0", "-w", "1", "-a", std::to_string(elements)};
+        probe_args.push_back("-B");
+        probe_args.push_back(std::to_string(probe_seconds));
+        probe_args.push_back("-v");
+        probe_args.push_back("0");
+
+        platform::RunOptions probe_opts;
+        probe_opts.timeout = std::chrono::seconds(static_cast<long long>(timeout_seconds));
+        const platform::RunResult probe_result = platform::run(binary.string(), probe_args, probe_opts);
+        output    = probe_result.output;
+        exit_code = probe_result.exit_status;
+#else
+        static const std::string timeout_cmd = detect_timeout_command();
+        std::string command;
+        if (!timeout_cmd.empty()) {
+            command = timeout_cmd + " " + std::to_string(timeout_seconds) + "s " + shell_quote(binary.string());
+        } else {
+            command = shell_quote(binary.string());
+        }
+        command += " -r 100 -p 0 -w 1 -a " + std::to_string(elements) +
+                   extra_args + " -B " + std::to_string(probe_seconds) + " -v 0 2>&1";
+
+        output = run_command_capture("OMP_NUM_THREADS=1 " + command, exit_code);
+#endif
+        const double bw = (exit_code == 0) ? parse_trafficgen_self_bandwidth(output) : 0.0;
+
+        TrafficGenArrayProbeResult result;
+        result.elements = elements;
+        result.bandwidth_gb_s = bw;
+        result.ok = (bw > 0.0);
+
+        std::cout << "│   Probe " << elements_to_llc_multiplier(elements)
+                  << " (" << elements_to_mb(elements) << " MB): ";
+        if (result.ok) {
+            std::cout << std::fixed << std::setprecision(2) << bw << " GB/s" << std::endl;
+        } else {
+            std::cout << "failed" << std::endl;
+        }
+
+        return result;
+    };
+
+    TrafficGenArrayCalibrationResult result = calibrator.run(candidates, probe);
+    return result.selected_elements;
 }
 
 
@@ -194,10 +518,11 @@ std::string replace_template_variables(const std::string& template_content,
 
 
 int main(int argc, char* argv[]) {
+    platform::init_console();
+
     try {
     bool debug_mode = false;
     bool build_multisequential = true;
-    
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--debug") {
@@ -206,7 +531,12 @@ int main(int argc, char* argv[]) {
     }
     
 
-    std::filesystem::path root = get_project_root();
+    const std::filesystem::path root = get_project_root();
+    const auto bin_dir = platform::runtime_directory();
+    const auto generation_root = platform::codegen_directory();
+    std::filesystem::create_directories(generation_root);
+    auto generation_lock = platform::FileLock::acquire(generation_root / "generation.lock");
+    if (!generation_lock.valid()) throw std::runtime_error("Cannot lock kernel generation directory");
 
     bool installation_success = true;
     std::vector<std::string> pending_issues;
@@ -238,8 +568,6 @@ int main(int argc, char* argv[]) {
 
     int num_cores = (sys_info.socket_count > 0) ? sys_info.sockets[0].core_count : 1;
     if (num_cores < 1) num_cores = 1;
-
-    bool using_avx512 = (config.isa_mode == ISAMode::AVX512);
 
     std::string ptr_chase_asm = assembler->getPointerChaseInstruction();
     std::string ptr_chase_loop = assembler->getPointerChaseLoopAsm();
@@ -291,6 +619,18 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
     
+    auto gpu_capabilities = detector.get_gpu_capabilities();
+    if(gpu_capabilities.has_gpu) {
+        std::cout << "│ GPUs detected: ";
+        for (size_t i = 0; i < gpu_capabilities.gpus.size(); ++i) {
+            std::cout << "[" << gpu_capabilities.gpus[i].name << ", " 
+                  << (gpu_capabilities.gpus[i].memory_bytes / (1024*1024*1024)) << "GB]";
+        }
+        std::cout << std::endl;
+    } else {
+        std::cout << "│ \033[33mNo GPU detected\033[0m" << std::endl;
+    }
+    
     int cache_line_size = 64;
     double measured_tlb_ns = 0;
 
@@ -313,6 +653,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "│ TLB latency: " << std::fixed << std::setprecision(5) << measured_tlb_ns << " ns" << std::endl;
     
+#if !defined(_WIN32)
     std::ifstream paranoid_file("/proc/sys/kernel/perf_event_paranoid");
     int paranoid_level = 3;
     if (paranoid_file.is_open()) {
@@ -327,23 +668,28 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (!hw_counter_accessible) {
+    if (!hw_counter_accessible && !capabilities.isAppleSilicon()) {
         std::cout << "│ \033[33mWarning: No access to hardware performance counters (paranoid level: " << paranoid_level << ")\033[0m" << std::endl;
         std::cout << "│ \033[33mThe benchmark will compile, but make sure you have access to hardware counters when running the benchmark\033[0m" << std::endl;
         pending_issues.push_back("Performance counter access denied (paranoid level: " + std::to_string(paranoid_level) + ")");
     } else {
-        std::cout << "│ Access to HWC: OK (paranoid level: " << paranoid_level << ")" << std::endl;
+        if (capabilities.isAppleSilicon()) {
+            std::cout << "| Access to AMC (Apple Memory Controller) performance counters: OK" << std::endl;
+        } else {
+            std::cout << "│ Access to HWC: OK (paranoid level: " << paranoid_level << ")" << std::endl;
+        }
     }
+#endif
     std::cout << "└─" << std::endl;
 
     codegen::BuildManager build_manager;
-    build_manager.EnsureDirectories({(root / "build").string(),
-                                     (root / "build/bin").string(),
-                                     (root / "build/lib").string(),
-                                     (root / "build/lib/ptr_chase_src").string(),
-                                     (root / "measuring").string()});
+    build_manager.EnsureDirectories({(generation_root / "build").string(),
+                                     (bin_dir).string(),
+                                     (generation_root / "build/lib").string(),
+                                     (generation_root / "build/lib/ptr_chase_src").string()});
     
     const bool is_a64fx_system = capabilities.isA64FX();
+    const bool is_apple_silicon = capabilities.isAppleSilicon();
 
     uint64_t default_array_size = 1ULL * 1024 * 1024 * 1024;
     uint64_t a64fx_array_size = 512ULL * 1024 * 1024;
@@ -357,7 +703,7 @@ int main(int argc, char* argv[]) {
         .use_nontemporal = false
     };
 
-    const uint64_t ptrchase_cache_line = is_a64fx_system ? 128ULL : 64ULL;
+    const uint64_t ptrchase_cache_line = (is_a64fx_system || is_apple_silicon) ? 128ULL : 64ULL;
     uint64_t array_elements = pc_params.array_size / ptrchase_cache_line;
     uint64_t active_array_elements = array_elements;
     uint64_t iterations = is_a64fx_system ? 50000ULL : 10ULL;
@@ -419,43 +765,58 @@ int main(int argc, char* argv[]) {
 
     std::string ptr_chase_template = read_template((root / "templates/ptr_chase_template.c").string());
     std::string ptr_chase_code = replace_template_variables(ptr_chase_template, replacements);
-    build_manager.WriteFile((root / "build/lib/ptr_chase_src/ptr_chase.c").string(), ptr_chase_code);
+    build_manager.WriteFile((generation_root / "build/lib/ptr_chase_src/ptr_chase.c").string(), ptr_chase_code);
     
     std::cout << "│ Generated kernel: ptr_chase" << std::endl;
 
     std::string arraygen_template_content = read_template((root / "templates/arraygen_template.c").string());
     std::string arraygen_template_code = replace_template_variables(arraygen_template_content, replacements);
     
-    build_manager.WriteFile((root / "build/lib/ptr_chase_src/arraygen.c").string(), arraygen_template_code);
+    build_manager.WriteFile((generation_root / "build/lib/ptr_chase_src/arraygen.c").string(), arraygen_template_code);
 
     std::string loop_template_content = read_template((root / "templates/loop_template.h").string());
     std::string loop_template_code = replace_template_variables(loop_template_content, replacements);
     
-    build_manager.WriteFile((root / "build/lib/ptr_chase_src/loop_template.h").string(), loop_template_code);
+    build_manager.WriteFile((generation_root / "build/lib/ptr_chase_src/loop_template.h").string(), loop_template_code);
 
     std::string makefile_template = read_template((root / "templates/Makefile_template").string());
     std::string makefile_code = replace_template_variables(makefile_template, replacements);
     
-    build_manager.WriteFile((root / "build/lib/ptr_chase_src/Makefile").string(), makefile_code);
+    build_manager.WriteFile((generation_root / "build/lib/ptr_chase_src/Makefile").string(), makefile_code);
 
     std::string ptr_array_env = std::to_string(pc_params.array_size);
-    setenv("PTRCHASE_ARRAY_SIZE", ptr_array_env.c_str(), 1);
-    std::string ptr_instr_env = std::to_string(total_accesses);
-    std::string ptr_iters_env = std::to_string(iterations);
-    setenv("PTRCHASE_NUM_INSTRUCTIONS", ptr_instr_env.c_str(), 1);
-    setenv("PTRCHASE_NUM_ITERATIONS", ptr_iters_env.c_str(), 1);
-    std::string ptr_burst_iters_env = std::to_string(burst_iterations);
-    setenv("PTRCHASE_BURST_ITERATIONS", ptr_burst_iters_env.c_str(), 1);
+    platform::set_env("PTRCHASE_ARRAY_SIZE", ptr_array_env.c_str());
     const unsigned int host_threads = std::max(1u, std::thread::hardware_concurrency());
     const int compile_jobs = static_cast<int>(std::max(1u, std::min(8u, host_threads)));
 
+#if defined(_WIN32)
+    PtrChaseBuildSpec pc_spec;
+    pc_spec.array_elems        = array_elements;
+    pc_spec.active_array_elems = active_array_elements;
+    pc_spec.iterations         = iterations;
+    pc_spec.burst_iterations   = burst_iterations;
+    pc_spec.cache_line         = ptrchase_cache_line;
+    pc_spec.loop_instr         = (iterations > 0) ? (total_accesses / iterations) : loop_accesses;
+
+    std::string ptr_chase_build_log;
+    const bool ptr_chase_built = build_ptr_chase_windows(generation_root / "build/lib/ptr_chase_src",
+                                                         pc_spec, debug_mode,
+                                                         ptr_chase_build_log);
+    if (!ptr_chase_built && !ptr_chase_build_log.empty()) {
+        std::cout << "│ " << compactConsoleIssue(ptr_chase_build_log) << std::endl;
+    }
+#else
     std::string make_cmd =
-        "cd " + (root / "build/lib/ptr_chase_src").string() + " && " + std::string(debug_mode ? "make clean && make" : "make -s clean && make -s");
+        "cd " + shell_quote((generation_root / "build/lib/ptr_chase_src").string()) + " && " + std::string(debug_mode ? "make clean && make" : "make -s clean && make -s") +
+        " CC=" + shell_quote(shell_quote(platform::kernel_c_compiler()));
     if (!debug_mode) {
         make_cmd += " >/dev/null 2>&1";
     }
 
-    if (!run_command_success(make_cmd)) {
+    const bool ptr_chase_built = run_command_success(make_cmd);
+#endif
+
+    if (!ptr_chase_built) {
         installation_success = false;
         std::string arch_name = capabilities.arch == CPUArchitecture::X86_64 ? "x86_64" :
                                 capabilities.arch == CPUArchitecture::ARM64 ? "ARM64" :
@@ -464,17 +825,24 @@ int main(int argc, char* argv[]) {
         pending_issues.push_back("Pointer chase kernel compilation failed (" + arch_name + " architecture)");
         std::cout << "│ compiled successfully: No (compilation failed for " << arch_name << ")" << std::endl;
         
+        const std::string ptr_chase_out = platform::exe_name("ptr_chase");
+#if !defined(_WIN32)
         std::string placeholder = "#!/bin/bash\n"
                                   "# Placeholder -compilation failed\n"
                                   "echo \"ERROR: ptr_chase compilation failed for this architecture.\"\n"
                                   "exit 1\n";
-        build_manager.WriteFile((root / "build/bin/ptr_chase").string(), placeholder);
-        build_manager.RunCommand("chmod +x " + (root / "build/bin/ptr_chase").string());
-        build_manager.WriteFile((root / "build/bin/array.dat").string(), "");
+        build_manager.WriteFile((bin_dir / ptr_chase_out).string(), placeholder);
+        build_manager.RunCommand("chmod +x " + shell_quote((bin_dir / ptr_chase_out).string()));
+#else
+        std::error_code placeholder_ec;
+        std::filesystem::remove(bin_dir / ptr_chase_out, placeholder_ec);
+#endif
+        build_manager.WriteFile((bin_dir / "array.dat").string(), "");
     } else {
-        build_manager.CopyFile((root / "build/lib/ptr_chase_src/ptr_chase").string(), (root / "build/bin/ptr_chase").string());
-        if (std::filesystem::exists(root / "build/lib/ptr_chase_src/array.dat")) {
-            build_manager.CopyFile((root / "build/lib/ptr_chase_src/array.dat").string(), (root / "build/bin/array.dat").string());
+        build_manager.CopyFile((generation_root / "build/lib/ptr_chase_src" / platform::exe_name("ptr_chase")).string(),
+                               (bin_dir / platform::exe_name("ptr_chase")).string());
+        if (std::filesystem::exists(generation_root / "build/lib/ptr_chase_src/array.dat")) {
+            build_manager.CopyFile((generation_root / "build/lib/ptr_chase_src/array.dat").string(), (bin_dir / "array.dat").string());
         }
         
         std::cout << "│ Compiled successfully: Yes" << std::endl;
@@ -486,7 +854,14 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "└─" << std::endl;
 
-    build_manager.EnsureDirectory((root / "src/traffic_gen/src").string());
+    build_manager.EnsureDirectory((generation_root / "src/traffic_gen/src").string());
+    // Only immutable inputs come from the source tree. Generated C and object
+    // files belong to this configuration, never to src/traffic_gen.
+    for (const char* input : {"Makefile", "src/traffic_gen.c", "src/utils.h"}) {
+        std::filesystem::copy_file(root / "src/traffic_gen" / input,
+            generation_root / "src/traffic_gen" / input,
+            std::filesystem::copy_options::overwrite_existing);
+    }
     std::string utils_generation_error;
     if (!preflight_multiseq_sve_error.empty()) {
         utils_generation_error = preflight_multiseq_sve_error;
@@ -494,7 +869,7 @@ int main(int argc, char* argv[]) {
     if (!utils_generation_error.empty()) {
         installation_success = false;
         pending_issues.push_back(utils_generation_error);
-        std::filesystem::remove(root / arch_config.utils_multiseq_file);
+        std::filesystem::remove(generation_root / arch_config.utils_multiseq_file);
     }
     
     std::cout << "\n┌─ Generating Architecture-Specific NOP" << std::endl;
@@ -504,10 +879,10 @@ int main(int argc, char* argv[]) {
         try {
             KernelGenerator kernel_gen(config, capabilities);
             arch_config = kernel_gen.setup_architecture_config();
-            std::string output_dir = (root / "src/traffic_gen/src").string();
+            std::string output_dir = (generation_root / "src/traffic_gen/src").string();
             kernel_gen.generate_kernel(output_dir);
 
-            std::string nop_path = (root / "src/traffic_gen/src/nop.c").string();
+            std::string nop_path = (generation_root / "src/traffic_gen/src/nop.c").string();
             if (std::filesystem::exists(nop_path)) {
                 std::cout << "│ Architecture: " << architecture->getName() << std::endl;
             } else {
@@ -518,7 +893,7 @@ int main(int argc, char* argv[]) {
             utils_generation_error = e.what();
             pending_issues.push_back(utils_generation_error);
             std::cout << "│ ERROR: " << compactConsoleIssue(utils_generation_error) << std::endl;
-            std::filesystem::remove(root / arch_config.utils_multiseq_file);
+            std::filesystem::remove(generation_root / arch_config.utils_multiseq_file);
         }
     }
     std::cout << "└─" << std::endl;
@@ -526,7 +901,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n┌─ Generating Optimized MultiSequential Utils" << std::endl;
     try {
         std::string arch_name = architecture->getName();
-        std::string output_path = (root / "src/traffic_gen/src" / ("generated_utils_multiseq_" + arch_name + ".c")).string();
+        std::string output_path = (generation_root / "src/traffic_gen/src" / ("generated_utils_multiseq_" + arch_name + ".c")).string();
         
         if (!utils_generation_error.empty()) {
             printConsoleIssue("ERROR: ", utils_generation_error);
@@ -621,7 +996,13 @@ int main(int argc, char* argv[]) {
     std::cout << "│ Target: " << target_line << std::endl;
 
     auto write_fallback_trafficgen_binary = [&](const std::string& target_name, const std::string& reason) {
-        const std::filesystem::path fallback_path = root / "build/bin" / target_name;
+        const std::filesystem::path fallback_path =
+            bin_dir / platform::exe_name(target_name);
+#if defined(_WIN32)
+        (void)reason;
+        std::error_code ec;
+        std::filesystem::remove(fallback_path, ec);
+#else
         std::string sanitized_reason = reason;
         std::replace(sanitized_reason.begin(), sanitized_reason.end(), '\n', ' ');
         std::replace(sanitized_reason.begin(), sanitized_reason.end(), '"', '\'');
@@ -633,7 +1014,8 @@ int main(int argc, char* argv[]) {
         }
         fallback << "exit 1\n";
         fallback.close();
-        system(("chmod +x " + fallback_path.string()).c_str());
+        system(("chmod +x " + shell_quote(fallback_path.string())).c_str());
+#endif
     };
 
     if (available_modes.empty()) {
@@ -642,7 +1024,7 @@ int main(int argc, char* argv[]) {
         std::cout << "│ Status: No utils files found" << std::endl;
         std::cout << "└─" << std::endl;
     } else {
-        std::filesystem::create_directories(root / "src/traffic_gen/src");
+        std::filesystem::create_directories(generation_root / "src/traffic_gen/src");
         
         bool all_compiled = true;
 
@@ -652,9 +1034,9 @@ int main(int argc, char* argv[]) {
             std::string utils_file = arch_config.utils_multiseq_file;
 
 
-            std::filesystem::path utils_path = root / utils_file;
+            std::filesystem::path utils_path = generation_root / utils_file;
             std::string target_name = "traffic_gen_" + mode_name + ".x";
-            std::string utils_link = (root / "src/traffic_gen/src/utils.c").string();
+            std::string utils_link = (generation_root / "src/traffic_gen/src/utils.c").string();
                         
             if (!std::filesystem::exists(utils_path)) {
                 all_compiled = false;
@@ -665,7 +1047,7 @@ int main(int argc, char* argv[]) {
                 if (utils_generation_error.empty()) {
                     pending_issues.push_back("Utils file not found: " + utils_path.string());
                 }
-                std::cout << "│ Compiled: " << target_name << " ✗ (" << compactConsoleIssue(reason) << ")" << std::endl;
+                std::cout << "│ Compiled: " << target_name << " " << platform::glyph::kFail << " (" << compactConsoleIssue(reason) << ")" << std::endl;
                 write_fallback_trafficgen_binary(target_name, reason);
             }
             
@@ -677,14 +1059,16 @@ int main(int argc, char* argv[]) {
                 all_compiled = false;
                 installation_success = false;
             }
-            uint64_t min_traffic_gen_size = calculate_traffic_gen_array_size(capabilities.l3_size);
-            if (using_avx512) {
-                min_traffic_gen_size *= 2;
-            }
+            KernelConfig sizing_config = config;
+            sizing_config.isa_mode = resolve_effective_isa_mode(config, capabilities, *architecture);
+            uint64_t min_traffic_gen_size =
+                TrafficGenArrayCalibrator::capacity_elements(sizing_config, capabilities);
 
-            std::cout << "│ Compiling " << target_name << " (array: " << (min_traffic_gen_size * sizeof(double) / (1000*1000)) << " MB)" << std::endl;
+            std::cout << "│ Compiling " << target_name << " (max array: "
+                      << (min_traffic_gen_size * sizeof(double) / (1000*1000))
+                      << " MB)" << std::endl;
 
-            std::filesystem::create_directories(root / "src/traffic_gen/build");
+            std::filesystem::create_directories(generation_root / "src/traffic_gen/build");
 
             // Determine architecture-specific compiler flags
             std::string arch_flags = "-march=native";
@@ -695,38 +1079,110 @@ int main(int argc, char* argv[]) {
                 arch_flags = "-march=rv64g";
             }
             const int trafficgen_compile_jobs = std::max(1, std::min(compile_jobs, num_cores));
-            std::string build_cmd = "cd " + (root / "src/traffic_gen").string() + " && mkdir -p build && make -j" + std::to_string(trafficgen_compile_jobs) + " " + target_name +
-                                   " CFLAGS=\"" + arch_flags + " -Wall -fopenmp -DTrafficGen_ARRAY_SIZE=" + std::to_string(min_traffic_gen_size) + "\"" +
-                                   " LDFLAGS=\"-pthread -lrt -fopenmp\"" +
-                                   (debug_mode ? "" : " >/dev/null 2>&1");
-            
-            int build_result = system(build_cmd.c_str());
-            
-            if (WIFEXITED(build_result) && WEXITSTATUS(build_result) == 0) {
-                std::string source_binary = (root / "src/traffic_gen" / target_name).string();
-                std::string dest_binary = (root / "build/bin" / target_name).string();
-                
+            std::string omp_cflag = " -fopenmp";
+            std::string omp_ldflags = "-pthread -lrt -fopenmp";
+            if (capabilities.isAppleSilicon()) {
+                omp_cflag.clear();
+                omp_ldflags = "-pthread";
+            }
+            auto build_trafficgen = [&](uint64_t array_elements, bool quiet) -> bool {
+#if defined(_WIN32)
+                (void)trafficgen_compile_jobs;
+                (void)omp_cflag;
+                (void)omp_ldflags;
+                (void)quiet;
+                std::string tg_log;
+                const bool ok = build_traffic_gen_windows(generation_root / "src/traffic_gen",
+                                                          target_name, arch_flags,
+                                                          array_elements, debug_mode, tg_log);
+                if (!ok && !tg_log.empty()) {
+                    std::cout << "│   " << compactConsoleIssue(tg_log) << std::endl;
+                }
+                return ok;
+#else
+                std::string build_cmd =
+                    "cd " + shell_quote((generation_root / "src/traffic_gen").string()) +
+                    " && mkdir -p build && rm -f build/traffic_gen_multiseq_c.o build/utils.o " + target_name +
+                    " && make -j" + std::to_string(trafficgen_compile_jobs) + " " + target_name +
+                    " CC=" + shell_quote(shell_quote(platform::kernel_c_compiler())) +
+                    " CFLAGS=\"" + arch_flags + " -Wall" + omp_cflag + " -DTrafficGen_ARRAY_SIZE=" + std::to_string(array_elements) + "\"" +
+                    " LDFLAGS=\"" + omp_ldflags + "\"" +
+                    ((debug_mode || !quiet) ? "" : " >/dev/null 2>&1");
+                int build_result = system(build_cmd.c_str());
+                return platform::exit_code_of(build_result) == 0;
+#endif
+            };
+
+            bool build_ok = build_trafficgen(min_traffic_gen_size, true);
+
+            if (build_ok) {
+                uint64_t calibrated_traffic_gen_capacity = min_traffic_gen_size;
+                std::vector<uint64_t> candidates =
+                    TrafficGenArrayCalibrator::build_candidates(sizing_config, capabilities);
+                candidates.erase(
+                    std::remove_if(candidates.begin(), candidates.end(),
+                                   [&](uint64_t elements) {
+                                       return elements == 0 || elements > calibrated_traffic_gen_capacity;
+                                   }),
+                    candidates.end());
+                if (candidates.empty()) {
+                    candidates.push_back(TrafficGenArrayCalibrator::fallback_elements(sizing_config, capabilities));
+                }
+
+                std::cout << "│ Calibrating " << target_name << " array size..." << std::endl;
+                uint64_t calibrated_traffic_gen_size =
+                    calibrate_trafficgen_array_elements(generation_root, target_name, candidates,
+                                                        static_cast<uint64_t>(capabilities.l3_size),
+                                                        capabilities,
+                                                        debug_mode ? 2 : 1);
+                if (calibrated_traffic_gen_size == 0) {
+                    calibrated_traffic_gen_size =
+                        TrafficGenArrayCalibrator::fallback_elements(sizing_config, capabilities);
+                    if (calibrated_traffic_gen_size > calibrated_traffic_gen_capacity) {
+                        calibrated_traffic_gen_size = calibrated_traffic_gen_capacity;
+                    }
+                    std::cout << "│   Calibration failed; using fallback "
+                              << (calibrated_traffic_gen_size * sizeof(double) / (1000 * 1000))
+                              << " MB total" << std::endl;
+                } else {
+                    std::cout << "│   Selected "
+                              << (calibrated_traffic_gen_size * sizeof(double) / (1000 * 1000))
+                              << " MB total" << std::endl;
+                }
+                if (calibrated_traffic_gen_size != min_traffic_gen_size) {
+                    min_traffic_gen_size = calibrated_traffic_gen_size;
+                    std::cout << "│ Recompiling " << target_name << " with selected array size" << std::endl;
+                    build_ok = build_trafficgen(min_traffic_gen_size, true);
+                }
+            }
+
+            if (build_ok) {
+                const std::string target_file = platform::exe_name(target_name);
+                std::string source_binary = (generation_root / "src/traffic_gen" / target_file).string();
+                std::string dest_binary = (bin_dir / target_file).string();
+
                 if (std::filesystem::exists(source_binary)) {
                     std::filesystem::copy_file(source_binary, dest_binary,
                                               std::filesystem::copy_options::overwrite_existing);
                     std::filesystem::remove(source_binary);
-                    std::cout << "│ Compiled: " << target_name << " ✓" << std::endl;
+                    std::cout << "│ Compiled: " << target_name << " " << platform::glyph::kOk << std::endl;
                 } else {
                     all_compiled = false;
                     pending_issues.push_back("TrafficGen " + mode_name + " binary not found after compilation");
-                    std::cout << "│ Compiled: " << target_name << " ✗ (binary not found)" << std::endl;
+                    std::cout << "│ Compiled: " << target_name << " " << platform::glyph::kFail << " (binary not found)" << std::endl;
                 }
             } else {
                 all_compiled = false;
                 installation_success = false;
                 pending_issues.push_back("TrafficGen " + mode_name + " compilation failed");
-                std::cout << "│ Compiled: " << target_name << " ✗ (compilation failed)" << std::endl;
+                std::cout << "│ Compiled: " << target_name << " " << platform::glyph::kFail << " (compilation failed)" << std::endl;
                 write_fallback_trafficgen_binary(target_name, "Compilation failed");
             }
         }
         
-        system(("rm -rf " + (root / "src/traffic_gen/build").string()).c_str());
-        std::filesystem::remove(root / "src/traffic_gen/src/utils.c");
+        std::error_code build_dir_ec;
+        std::filesystem::remove_all(generation_root / "src/traffic_gen/build", build_dir_ec);
+        std::filesystem::remove(generation_root / "src/traffic_gen/src/utils.c");
         
         std::cout << "│ Status: " << (all_compiled ? "All variants compiled successfully" : "Some variants failed") << std::endl;
         std::cout << "└─" << std::endl;
@@ -736,18 +1192,18 @@ int main(int argc, char* argv[]) {
     bool only_hw_counter_issue = (pending_issues.size() == 1 && 
                                 pending_issues[0].find("Performance counter access denied") != std::string::npos);
     
-    if ((installation_success && pending_issues.empty()) || 
-        (installation_success && only_hw_counter_issue)) {
-        std::cout << "\nInstallation complete. Generated kernels are ready in build/bin/" << std::endl;
+    const bool success = installation_success && (pending_issues.empty() || only_hw_counter_issue);
+    if (success) {
+        std::cout << "\nInstallation complete. Generated kernels are ready in " << bin_dir << std::endl;
     } else {
-        std::cout << "\n✗ Installation failed. Pending issues to correct:" << std::endl;
+        std::cout << "\n" << platform::glyph::kFail << " Installation failed. Pending issues to correct:" << std::endl;
         for (const auto& issue : pending_issues) {
             std::cout << "  - " << issue << std::endl;
         }
         std::cout << "\nSome components may not function correctly until these issues are resolved." << std::endl;
     }
 
-    return 0;
+    return success ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;

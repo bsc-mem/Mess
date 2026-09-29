@@ -2,3 +2,4 @@ pandas
 scipy
 matplotlib
 seaborn
+numpy>=2.0.0

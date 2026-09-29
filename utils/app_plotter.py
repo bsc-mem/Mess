@@ -280,7 +280,7 @@ def plot_app_on_curves(dfs_rw, profiler_df, output_path, config=None,
     else:
         limit_bw = global_max_bw * 1.1 if global_max_bw > 0 else 321
 
-    limit_lat = max(700, global_max_lat * 1.1) if global_max_lat > 0 else 700
+    limit_lat = max(800, global_max_lat * 1.1) if global_max_lat > 0 else 800
     
     ax.set_xlim([0, limit_bw])
     ax.set_ylim([0, limit_lat])
@@ -354,7 +354,7 @@ def plot_app_on_curves(dfs_rw, profiler_df, output_path, config=None,
     
     base_x = 0.1
     base_y = 0.99
-    add_gradient_legend(ax, None, 50, 100, colors=cmap_name, box_position=(base_x, base_y), box_size=(0.25, 0.03), fontsize=20)
+    add_gradient_legend(ax, cmap_name, box_position=(base_x, base_y), fontsize=20)
 
     fig.set_size_inches([16, 9])
     fig.tight_layout()

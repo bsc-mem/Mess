@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -41,9 +44,8 @@
 #include <iostream>
 #include <sstream>
 #include <system_error>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/file.h>
+#include "platform/Ipc.h"
+#include <unistd.h>   // getpid, for the temporary-file name
 
 #include "Utils.h"
 
@@ -287,7 +289,7 @@ std::vector<double> MeasurementStorage::parse_bw_measurements(
             if (is_grace_rd || is_grace_wr) {
                 bw_gb_s = (static_cast<double>(rd_count) * 32.0 + static_cast<double>(wr_count)) / (elapsed * 1e9);
             } else {
-                bw_gb_s = ((rd_count + wr_count) * cache_line_size_ * scaling_factor) / (elapsed * 1e9);
+                bw_gb_s = ((rd_count + wr_count) * bw_bytes_per_cas() * scaling_factor) / (elapsed * 1e9);
             }
             bw_values.push_back(bw_gb_s);
             rd_count = wr_count = 0;
@@ -307,36 +309,18 @@ std::vector<double> MeasurementStorage::parse_bw_measurements(
 }
 
 bool MeasurementStorage::append_to_file_with_lock(const std::string& filepath, const std::string& content) const {
-    int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd == -1) {
-        std::cerr << "Error opening file for locking: " << filepath << std::endl;
-        return false;
-    }
-
-    struct flock fl;
-    fl.l_type = F_WRLCK;  
-    fl.l_whence = SEEK_SET; 
-    fl.l_start = 0;
-    fl.l_len = 0;        
-
-    if (fcntl(fd, F_SETLKW, &fl) == -1) {
+    platform::FileLock lock = platform::FileLock::acquire(filepath);
+    if (!lock.valid()) {
         std::cerr << "Error acquiring lock for file: " << filepath << std::endl;
-        close(fd);
         return false;
     }
 
-    ssize_t bytes_written = write(fd, content.c_str(), content.length());
-    if (bytes_written == -1) {
+    if (!lock.append(content)) {
         std::cerr << "Error writing to file: " << filepath << std::endl;
+        return false;
     }
 
-    fl.l_type = F_UNLCK;
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        std::cerr << "Error releasing lock for file: " << filepath << std::endl;
-    }
-
-    close(fd);
-    return (bytes_written != -1);
+    return true;
 }
 
 bool MeasurementStorage::append_sampler_samples(double ratio_pct, int pause,
@@ -394,11 +378,12 @@ void MeasurementStorage::copy_plotter_to(const std::string& source_plotter,
 }
 
 
-void MeasurementStorage::write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns) const {
+void MeasurementStorage::write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) const {
     if (measurement_root_is_temp_) {
         return;
     }
 
     std::filesystem::path plotter_path = std::filesystem::path(measurement_root_) / "plotter.txt";
-    append_memory_config_to_plotter(plotter_path, caps, binding_type, tlb_ns, cache_line_size, upi_scaling_factor, page_walk_lat_ns);
+    const int plotter_bytes_per_cas = bytes_per_cas_ > 0 ? bytes_per_cas_ : cache_line_size;
+    append_memory_config_to_plotter(plotter_path, caps, binding_type, tlb_ns, plotter_bytes_per_cas, upi_scaling_factor, page_walk_lat_ns, gpu_caps);
 }

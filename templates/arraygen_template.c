@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -54,15 +56,41 @@ struct line{
 int *res;
 struct line *array;
 
+#if defined(_WIN32)
+static uint64_t mess_rng_state = 0x9E3779B97F4A7C15ULL;
+
+static uint64_t mess_next_u64(void) {
+    uint64_t z = (mess_rng_state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static uint64_t mess_below(uint64_t bound) {
+    uint64_t threshold = (~bound + 1u) % bound;   // 2^64 mod bound 
+    for (;;) {
+        uint64_t r = mess_next_u64();
+        if (r >= threshold) return r % bound;
+    }
+}
+#endif
+
 void shuffle(int *array, size_t n) {
     /* Deterministic seed keeps pointer-chase walk reproducible across runs. */
     srand(0);
+#if defined(_WIN32)
+    mess_rng_state = 0x9E3779B97F4A7C15ULL;
+#endif
     if (n > 1)
     {
         size_t i;
         for (i = 0; i < n - 1; i++)
         {
+#if defined(_WIN32)
+          size_t j = i + (size_t)mess_below((uint64_t)(n - i));
+#else
           size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
+#endif
           int t = array[j];
           array[j] = array[i];
           array[i] = t;

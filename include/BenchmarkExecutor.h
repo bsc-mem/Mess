@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -70,7 +72,7 @@
  * For each traffic ratio point configured, it:
  * 1. Synchronizes the traffic generation worker processes (`TrafficGenProcessManager`).
  * 2. Synchronizes the latency probing process (`PtrChaseProcessManager`).
- * 3. Manages the lifecycle of hardware performance monitors (`BandwidthMeasurer`, `PowerMeasurer`).
+ * 3. Manages the lifecycle of hardware performance monitors (e.g. `BandwidthMeasurer`).
  * 4. Filters out noise and hardware anomalies via the `OutlierDetector`.
  * 5. Collects the stable measurement loops into `BenchmarkResult` instances.
  * 
@@ -82,7 +84,7 @@ private:
     const system_info& sys_info_;
     const CPUCapabilities& caps_;
     std::vector<BenchmarkResult> results_;
-    int cache_line_size_;                          
+    int bw_bytes_per_cas_;
 
     static const int LAT_REQUIRED_STABLE_COUNT = 3;
     BandwidthCounterStrategy* counter_strategy_;
@@ -97,12 +99,10 @@ private:
 
     
     std::unique_ptr<InstructionSampler> instruction_sampler_;
+    // Instruction sampling has no pointer-chase bursts; calibrate lazily once.
+    double sampler_frequency_ghz_ = 0.0;
 
     static double cached_tlb_hit_latency_ns_;
-    static bool frequency_written_to_plotter_; 
-    static double cached_cpuinfo_freq_ghz_;
-
-    double max_cpu_freq_ghz_ = 0.0;
     
     std::unique_ptr<ProgressTracker> progress_tracker_;
 
@@ -112,8 +112,8 @@ private:
 
     enum class BenchmarkStatus {
         SUCCESS,
-        FAILURE,
-        RETRY_BW_GROWTH
+        RETRY_BANDWIDTH,
+        FAILURE
     };
 
     struct AdaptiveMeasuredPoint {
@@ -121,11 +121,10 @@ private:
         std::vector<BenchmarkResult> results;
     };
 
-    BenchmarkStatus run_single_benchmark(double ratio_pct, int pause, int rep, BenchmarkResult& result, ExecutionMode mode);
-    void write_frequency_to_plotter(double cpu_freq_ghz);
+    BenchmarkStatus run_single_benchmark(double ratio_pct, int pause, int rep, BenchmarkResult& result, ExecutionMode mode, bool reuse_traffic_gen = false);
     
-    double calculate_latency_from_perf_values(double cycles, double accesses, double tlb1miss, double tlb2miss, double interval_duration, bool using_hugepages = false);
-    
+    double calculate_burst_latency(const PerfBurstCounters& burst) const;
+
     std::vector<int> get_memory_binding_nodes() const;    
 
     void cleanup_measurement_files(double ratio_pct, int pause) const;
@@ -167,7 +166,6 @@ private:
                                          double bw_peak,
                                          bool count_progress = true,
                                          bool replace_existing = false);
-
 public:
     /**
      * @brief Builds an executor bound to a resolved runtime configuration.

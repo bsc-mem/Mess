@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -37,7 +39,6 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include "SystemInfo.h"
 #include "SystemDetection.h"
 #include "KernelTypes.h"
 

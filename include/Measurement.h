@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -85,7 +88,10 @@ public:
 
     void cleanup_measurement_files(double ratio_pct, int pause) const;
     void ensure_directories_exist() const;
-    void write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0) const;
+    void write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr) const;
+
+    void set_bytes_per_cas(int bytes) { bytes_per_cas_ = bytes; }
+    int bw_bytes_per_cas() const { return bytes_per_cas_ > 0 ? bytes_per_cas_ : cache_line_size_; }
 
     bool append_to_file_with_lock(const std::string& filepath, const std::string& content) const;
     bool append_sampler_samples(double ratio_pct, int pause, const std::vector<uint64_t>& latencies_cycles) const;
@@ -97,6 +103,7 @@ public:
 private:
     const BenchmarkConfig& config_;
     int cache_line_size_;
+    int bytes_per_cas_ = 0;
     int verbosity_;
     std::string output_root_override_;
 
@@ -141,6 +148,7 @@ public:
 
     void set_sampling_interval_ms(double interval) { sampling_interval_ms_ = interval; }
     double sampling_interval_ms() const { return sampling_interval_ms_; }
+    double stability_noise_floor_gbps() const { return stability_noise_floor_gbps_; }
 
     /**
      * @brief Collects one raw bandwidth sample.
@@ -174,6 +182,9 @@ public:
         if (selection.cas.uses_read_subtract_formula) {
             cached_cache_line_size_ = 256;
         }
+        if (selection.cas.bytes_per_cas > 0) {
+            cached_cache_line_size_ = selection.cas.bytes_per_cas;
+        }
     }
 
     const BandwidthCounterSelection& get_counter_selection() const {
@@ -204,6 +215,7 @@ protected:
     std::function<std::vector<int>()> numa_resolver_;
     ExecutionMode mode_;
     double sampling_interval_ms_;
+    double stability_noise_floor_gbps_ = 0.0;
     BandwidthCounterSelection counter_selection_;
     mutable std::map<std::string, long long> extra_perf_values_;
     
@@ -211,6 +223,7 @@ protected:
     double cached_scaling_factor_ = 1.0;
     mutable bool scaling_factor_initialized_ = false;
 
+    // Success means all workers have reported ready and remain alive.
     bool relaunch_traffic_gen(int ratio, int pause, int traffic_gen_cores);
     void ensure_scaling_factor_cached() const;
     int get_traffic_gen_cores() const;
@@ -256,6 +269,8 @@ struct PerfBurstCounters {
     double tlb1miss;
     double tlb2miss;
     double duration_s;
+    double accesses = 0.0;
+    double pointer_chase_thread_ns = 0.0;
     bool using_hugepages;
     
     std::string tlb1_event_name;
@@ -275,31 +290,29 @@ public:
                     int cache_line_size);
 
     void set_tlb_hit_latency_ns(double ns) { tlb_hit_latency_ns_ = ns; }
-    double get_accesses_per_burst() const { return ptrchase_accesses_per_burst_; }
-    void init_ptrchase_scaling();
 
     void setExpectedTlbEvents(const std::string& tlb1_event, const std::string& tlb2_event) {
         expected_tlb1_event_ = tlb1_event;
         expected_tlb2_event_ = tlb2_event;
     }
 
-    int pipe_fd_ = -1;
-    bool burst_running_ = false;
-    std::chrono::steady_clock::time_point burst_start_time_;
-
     bool start_burst_async();
     bool try_collect_burst_async(PerfBurstCounters& out);
     bool is_burst_running() const { return burst_running_; }
+    bool burst_failed() const { return !burst_error_.empty(); }
+    const std::string& burst_error() const { return burst_error_; }
     void reset();
 
 private:
+    platform::MessagePipe burst_pipe_;
+    bool burst_running_ = false;
+    std::chrono::steady_clock::time_point burst_start_time_;
+    std::string burst_error_;
+    bool fail_burst(const std::string& error);
+
     const BenchmarkConfig& config_;
     PtrChaseProcessManager* ptrchase_manager_;
     std::function<std::vector<int>()> numa_resolver_;
-    double ptrchase_accesses_per_burst_;
-    double ptrchase_insts_per_access_;
-    uint64_t ptrchase_burst_iters_;
-    uint64_t ptrchase_insts_per_iter_;
     double tlb_hit_latency_ns_ = 0.0;
     
     std::string expected_tlb1_event_;

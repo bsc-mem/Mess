@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -39,10 +42,12 @@
 #include <set>
 #include <vector>
 #include <cstdlib>
-#include <sys/wait.h>
+#include <cstdio>
+#include "platform/Process.h"
 #include "architecture/BandwidthCounterStrategy.h"
 #include "SystemDetection.h"
 #include <filesystem>
+#include "utils/CpuTopology.h"
 
 /**
  * @file Utils.h
@@ -50,32 +55,21 @@
  */
 
 inline bool run_command_success(const char* cmd) {
-    int ret = std::system(cmd);
-    if (ret == -1) {
-        return false;
-    }
-    return WIFEXITED(ret) && WEXITSTATUS(ret) == 0;
+    return platform::run_command_success(cmd);
 }
 
 inline bool run_command_success(const std::string& cmd) {
-    return run_command_success(cmd.c_str());
+    return platform::run_command_success(cmd);
 }
 
 inline bool pclose_success(FILE* stream) {
-    if (!stream) return false;
-    int ret = pclose(stream);
-    if (ret == -1) return false;
-    return WIFEXITED(ret) && WEXITSTATUS(ret) == 0;
+    return platform::close_pipe_success(stream);
 }
-
-struct CpuTopology {
-    int node;
-    int socket;
-    int core_id;
-};
 
 std::map<int, CpuTopology> get_cpu_topology();
 std::map<int, std::set<int>> get_socket_to_nodes_map(const std::map<int, CpuTopology>& topo);
+
+std::filesystem::path get_executable_path();
 std::filesystem::path get_project_root();
 
 bool numa_node_has_memory(int node);
@@ -113,7 +107,7 @@ std::string replace_template_variables(const std::string& template_content,
                                       const std::map<std::string, std::string>& replacements);
 
 int get_numa_node_of_cpu(int cpu);
-void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0);
+void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr);
 
 /**
  * @brief Per-NUMA-node memory characterization, derived from HMAT/sysfs/daxctl.
@@ -149,7 +143,6 @@ bool numa_nodes_target_cxl_or_pmem(const std::map<int, NumaNodeMemoryInfo>& numa
 struct TLBMeasurement {
     double latency_ns = 0.0;
     int cache_line_size = 0;
-    double nominal_cpu_freq_ghz = 0.0;
 };
 
 TLBMeasurement measure_and_set_tlb_latency(int attempt = 1);

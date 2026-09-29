@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,11 +34,16 @@
  */
 
 #include "arch/arm/ArmAssembler.h"
+#include "arch/arm/ArmISAUtils.h"
 #include <algorithm>
 #include <iomanip>
 #include <set>
 
 namespace {
+
+std::string scalarDataRegister(int reg) {
+    return "x" + std::to_string(arm_isa_utils::scalarDataRegisters[reg % arm_isa_utils::scalarDataRegisters.size()]);
+}
 
 bool isSVEFamily(ISAMode mode) {
     return mode == ISAMode::SVE ||
@@ -83,6 +90,9 @@ std::string emitAddressAdd(const char* base, int offset) {
 }
 
 int resolvedArmBytesPerMemOp(const KernelConfig& config) {
+    if (config.isa_mode == ISAMode::SCALAR) {
+        return 8;
+    }
     if (config.resolved_bytes_per_mem_op > 0) {
         return config.resolved_bytes_per_mem_op;
     }
@@ -271,21 +281,30 @@ std::string emitSveSequentialDynamicStoreBurstIndexed(int reg, const char* op, i
     return oss.str();
 }
 
-int maxArmVectorRegistersForMode(ISAMode mode) {
+int maxArmDataRegistersForMode(ISAMode mode) {
+    if (mode == ISAMode::SCALAR) {
+        return arm_isa_utils::scalarDataRegisters.size();
+    }
     return isNeonPairMode(mode) ? 16 : 32;
 }
 
-int usedArmVectorRegisters(const KernelConfig& config) {
+int usedArmDataRegisters(const KernelConfig& config) {
     if (config.single_registers) {
         return 1;
     }
-    return std::max(1, std::min(config.num_simd_registers, maxArmVectorRegistersForMode(config.isa_mode)));
+    return std::max(1, std::min(config.num_simd_registers, maxArmDataRegistersForMode(config.isa_mode)));
 }
 
 
-std::string armSequentialVectorClobbers(const KernelConfig& config) {
+std::string armSequentialDataClobbers(const KernelConfig& config) {
     std::ostringstream oss;
-    const int used_regs = usedArmVectorRegisters(config);
+    const int used_regs = usedArmDataRegisters(config);
+    if (config.isa_mode == ISAMode::SCALAR) {
+        for (int reg = 0; reg < used_regs; ++reg) {
+            oss << ", \"" << scalarDataRegister(reg) << "\"";
+        }
+        return oss.str();
+    }
     if (isSVEFamily(config.isa_mode)) {
         for (int reg = 0; reg < used_regs; ++reg) {
             oss << ", \"z" << reg << "\"";
@@ -294,12 +313,13 @@ std::string armSequentialVectorClobbers(const KernelConfig& config) {
         return oss.str();
     }
 
+    const char* vreg = config.apple_silicon ? "v" : "q";
     for (int reg = 0; reg < used_regs; ++reg) {
         if (isNeonPairMode(config.isa_mode)) {
             const int qreg = (reg * 2) % 32;
-            oss << ", \"q" << qreg << "\", \"q" << (qreg + 1) << "\"";
+            oss << ", \"" << vreg << qreg << "\", \"" << vreg << (qreg + 1) << "\"";
         } else {
-            oss << ", \"q" << reg << "\"";
+            oss << ", \"" << vreg << reg << "\"";
         }
     }
     return oss.str();
@@ -310,6 +330,18 @@ std::string armSequentialVectorClobbers(const KernelConfig& config) {
 std::string ArmAssembler::generateLoad(int offset, int reg) const {
     std::ostringstream oss;
     AddressingPolicy policy = resolveAddressingPolicy(config_);
+
+    if (config_.isa_mode == ISAMode::SCALAR) {
+        if (policy == AddressingPolicy::POST_INCREMENT) {
+            oss << "        \"ldr " << scalarDataRegister(reg) << ", [x19], #8;\\n\"\n";
+        } else {
+            oss << "        \"lsl x15, x21, #3;\\n\"\n"
+                << emitAddressAdd("x19", offset)
+                << "        \"add x8, x8, x15;\\n\"\n"
+                << "        \"ldr " << scalarDataRegister(reg) << ", [x8];\\n\"\n";
+        }
+        return oss.str();
+    }
 
     if (isSVEFamily(config_.isa_mode)) {
         if (policy == AddressingPolicy::POST_INCREMENT) {
@@ -347,6 +379,18 @@ std::string ArmAssembler::generateLoad(int offset, int reg) const {
 std::string ArmAssembler::generateStore(int offset, int reg) const {
     std::ostringstream oss;
     AddressingPolicy policy = resolveAddressingPolicy(config_);
+
+    if (config_.isa_mode == ISAMode::SCALAR) {
+        if (policy == AddressingPolicy::POST_INCREMENT) {
+            oss << "        \"str " << scalarDataRegister(reg) << ", [x20], #8;\\n\"\n";
+        } else {
+            oss << "        \"lsl x15, x21, #3;\\n\"\n"
+                << emitAddressAdd("x20", offset)
+                << "        \"add x8, x8, x15;\\n\"\n"
+                << "        \"str " << scalarDataRegister(reg) << ", [x8];\\n\"\n";
+        }
+        return oss.str();
+    }
 
     if (isSVEFamily(config_.isa_mode)) {
         std::string op = config_.use_nontemporal_stores ? "stnt1d" : "st1d";
@@ -405,7 +449,8 @@ std::string ArmAssembler::generateLoopControl(int increment, int labelId) const 
     }
 
     oss << "        \"cmp x21, x22;\\n\"\n";
-    oss << "        \"blt ..L_" << labelId << ";\\n\"\n";
+    oss << "        \"blt "
+        << (config_.isa_mode == ISAMode::SCALAR ? "3b" : "..L_" + std::to_string(labelId)) << ";\\n\"\n";
     return oss.str();
 }
 
@@ -460,6 +505,13 @@ std::string ArmAssembler::generateRegisterSetup() const {
 }
 
 std::string ArmAssembler::generateVectorRegisterInit() const {
+    if (config_.isa_mode == ISAMode::SCALAR) {
+        std::ostringstream oss;
+        for (int reg = 0; reg < usedArmDataRegisters(config_); ++reg) {
+            oss << "      \"mov " << scalarDataRegister(reg) << ", #1;\\n\"\n";
+        }
+        return oss.str();
+    }
     if (isSVEFamily(config_.isa_mode)) {
         return "      \"ptrue p0.d;\\n\"\n";
     }
@@ -496,14 +548,16 @@ std::string ArmAssembler::generateAsmEnd() const {
         oss << "      :\n"
             << "      : \"r\" (a_array), \"r\" (*array_size), \"r\" (*pause), \"r\" (b_array), \"r\" (mess_sve_store_burst_count), \"r\" (mess_sve_loop_increment_elements), \"r\" (mess_sve_elements_per_op)\n"
             << "      : \"x4\", \"x8\", \"x9\", \"x10\", \"x15\", \"x19\", \"x20\", \"x21\", \"x22\", \"x26\", \"x27\", \"x28\""
-            << armSequentialVectorClobbers(config_)
+            << armSequentialDataClobbers(config_)
             << ", \"memory\", \"cc\"\n"
             << "    );\n";
     } else {
         oss << "      :\n"
-            << "      : \"r\" (a_array), \"r\" (*array_size), \"r\" (*pause), \"r\" (b_array)\n"
+            << "      : \"r\" (a_array), \"r\" (*array_size), \"r\" ("
+            << (config_.isa_mode == ISAMode::SCALAR ? "(ssize_t)*pause" : "*pause")
+            << "), \"r\" (b_array)\n"
             << "      : \"x4\", \"x8\", \"x9\", \"x10\", \"x15\", \"x19\", \"x20\", \"x21\", \"x22\""
-            << armSequentialVectorClobbers(config_)
+            << armSequentialDataClobbers(config_)
             << ", \"memory\", \"cc\"\n"
             << "    );\n";
     }
@@ -516,7 +570,7 @@ std::string ArmAssembler::getPointerChaseLoopAsm() const {
 }
 
 std::string ArmAssembler::getPointerChaseInstruction() const {
-    return "        \"adds x3, %2, %1; ldr %1, [x3];\"";
+    return "        \"adds x3, %2, %1;\\n ldr %1, [x3];\\n\"";
 }
 
 std::string ArmAssembler::generatePointerChaseBurstLoop() const {
@@ -526,10 +580,10 @@ std::string ArmAssembler::generatePointerChaseBurstLoop() const {
         register uint64_t next asm("x2") = current_offset;
 
         __asm__ __volatile__ (
-            "start_loop_%=:"
+            "start_loop_%=:\n"
             #include "loop.h"
-            "subs %0, %0, #1;"
-            "bne start_loop_%=;"
+            "subs %0, %0, #1;\n"
+            "bne start_loop_%=;\n"
             : "+r" (i), "+r" (next)
             : "r" (start)
             : "x3", "cc", "memory"

@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,14 +34,19 @@
  */
 
 #include "Utils.h"
+#include "platform/BuildPaths.h"
+#include "utils/StringUtils.h"
 #include "utils/SubprocessCapture.h"
+#include "platform/Fs.h"
+#include "platform/Process.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
-#include <sys/wait.h>
+#include <chrono>
+#include <vector>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -93,7 +100,7 @@ TLBMeasurement measure_and_set_tlb_latency(int attempt) {
     TLBMeasurement result;
     result.cache_line_size = get_cache_line_size();
     
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     result.latency_ns = 1.0; 
     return result;
 #endif
@@ -107,13 +114,11 @@ TLBMeasurement measure_and_set_tlb_latency(int attempt) {
     std::filesystem::path root = get_project_root();
     
     std::vector<std::filesystem::path> possible_paths = {
-        root / "build/bin/tlb",
-        root / "tlb",
-        root / "bin/tlb"
+        platform::runtime_directory() / "tlb"
     };
     
     for (const auto& path : possible_paths) {
-        if (access(path.c_str(), X_OK) == 0) {
+        if (platform::is_executable(path)) {
             tlb_binary_path = path.string();
             binary_found = true;
             break;
@@ -123,7 +128,17 @@ TLBMeasurement measure_and_set_tlb_latency(int attempt) {
     if (!binary_found) {
         bool patch_success = false;
         std::string patch_error;
-        std::filesystem::path bench_header_path = root / "tools/lmbench/src/bench.h";
+        const auto tools_src = platform::codegen_directory() / "lmbench";
+        std::error_code copy_error;
+        std::filesystem::create_directories(tools_src, copy_error);
+        if (!copy_error) std::filesystem::copy(root / "tools/lmbench/src", tools_src,
+            std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, copy_error);
+        if (copy_error) {
+            std::cerr << "Cannot prepare lmbench sources: " << copy_error.message() << '\n';
+            result.latency_ns = kDefaultTlbLatencyNs;
+            return result;
+        }
+        std::filesystem::path bench_header_path = tools_src / "bench.h";
         std::ifstream bench_file(bench_header_path);
         if (bench_file.is_open()) {
             std::stringstream buffer;
@@ -175,44 +190,23 @@ TLBMeasurement measure_and_set_tlb_latency(int attempt) {
             return result;
         }
         
-        std::filesystem::path tools_src = root / "tools/lmbench/src";
-        std::filesystem::path build_bin_tlb = root / "build/bin/tlb";
+        std::filesystem::path build_bin_tlb = platform::runtime_directory() / "tlb";
         
-        std::string tlb_compile_cmd = "gcc -O2 -lm -I " + tools_src.string() + " -o " + build_bin_tlb.string() + " " +
-                                      (tools_src / "tlb.c").string() + " " +
-                                      (tools_src / "lib_timing.c").string() + " " +
-                                      (tools_src / "lib_stats.c").string() + " " +
-                                      (tools_src / "lib_mem.c").string() + " " +
-                                      (tools_src / "lib_debug.c").string() + " " +
-                                      (tools_src / "getopt.c").string() + " " +
-                                      (tools_src / "lib_sched.c").string() + " 2>&1";
-        
-        FILE* compile_pipe = popen(tlb_compile_cmd.c_str(), "r");
-        if (compile_pipe) {
-            char compile_buffer[256];
-            std::string compile_output;
-            while (fgets(compile_buffer, sizeof(compile_buffer), compile_pipe)) {
-                compile_output += compile_buffer;
-            }
-            int compile_ret = pclose_success(compile_pipe) ? 0 : -1;
-            
-            if (compile_ret != 0) {
-                std::cerr << "ERROR: Failed to compile TLB measurement tool";
-                if (attempt > 0) std::cerr << " (attempt " << attempt << "/5)";
-                std::cerr << std::endl;
-                if (!compile_output.empty()) {
-                    std::cerr << "Compilation output:" << std::endl;
-                    std::cerr << compile_output << std::endl;
-                }
-                std::cerr << "LMBench could not be compiled. Make sure to have the necessary files under the tools directory.\n"
-                          << "If you don't, try running: \"git submodule update --init --recursive\" to download them." << std::endl;
-                result.latency_ns = kDefaultTlbLatencyNs;
-                return result;
-            }
-        } else {
-            std::cerr << "ERROR: Failed to execute compilation command";
+        const std::vector<std::string> compile_args = {
+            "-O2", "-I", tools_src.string(), "-o", build_bin_tlb.string(),
+            (tools_src / "tlb.c").string(), (tools_src / "lib_timing.c").string(), (tools_src / "lib_stats.c").string(),
+            (tools_src / "lib_mem.c").string(), (tools_src / "lib_debug.c").string(), (tools_src / "getopt.c").string(),
+            (tools_src / "lib_sched.c").string(), "-lm"};
+        platform::RunOptions compile_options;
+        compile_options.working_dir = tools_src.string();
+        compile_options.timeout = std::chrono::minutes(2);
+        const platform::RunResult compile = platform::run(platform::kernel_c_compiler(), compile_args, compile_options);
+        if (compile.spawn_failed || compile.timed_out || compile.exit_status != 0) {
+            std::cerr << "ERROR: Failed to compile TLB measurement tool";
             if (attempt > 0) std::cerr << " (attempt " << attempt << "/5)";
             std::cerr << std::endl;
+            if (!compile.output.empty()) std::cerr << "Compilation output:" << std::endl << compile.output << std::endl;
+            if (!compile.error.empty()) std::cerr << compile.error << std::endl;
             std::cerr << "LMBench could not be compiled. Make sure to have the necessary files under the tools directory.\n"
                       << "If you don't, try running: \"git submodule update --init --recursive\" to download them." << std::endl;
             result.latency_ns = kDefaultTlbLatencyNs;

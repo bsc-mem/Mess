@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -38,6 +40,7 @@
 #include "profiler/ProfilerConfig.h"
 #include "profiler/ProcessBinding.h"
 #include "Utils.h"
+#include "platform/Console.h"
 #include "utils/SubprocessCapture.h"
 
 #include <algorithm>
@@ -120,17 +123,33 @@ bool parse_backend(const std::string& value, ProfilerBackend& backend) {
         backend = ProfilerBackend::VTUNE;
         return true;
     }
+#if defined(_WIN32)
+    if (lower == "imc") {
+        backend = ProfilerBackend::IMC;
+        return true;
+    }
+    if (lower == "uprof") {
+        backend = ProfilerBackend::UPROF;
+        return true;
+    }
+#endif
     return false;
 }
 
 MeasurerType backend_to_measurer(ProfilerBackend backend) {
-    if (backend == ProfilerBackend::LIKWID) {
-        return MeasurerType::LIKWID;
+    switch (backend) {
+        case ProfilerBackend::LIKWID: return MeasurerType::LIKWID;
+        case ProfilerBackend::VTUNE: return MeasurerType::VTUNE;
+        case ProfilerBackend::IMC: return MeasurerType::IMC;
+        case ProfilerBackend::UPROF: return MeasurerType::UPROF;
+        case ProfilerBackend::AUTO:
+#if defined(_WIN32)
+            return MeasurerType::AUTO;
+#else
+            return MeasurerType::PERF;
+#endif
+        default: return MeasurerType::PERF;
     }
-    if (backend == ProfilerBackend::VTUNE) {
-        return MeasurerType::VTUNE;
-    }
-    return MeasurerType::PERF;
 }
 
 std::string backend_label(ProfilerBackend backend) {
@@ -140,6 +159,8 @@ std::string backend_label(ProfilerBackend backend) {
         case ProfilerBackend::PERF_STAT: return "perf-stat";
         case ProfilerBackend::LIKWID: return "likwid";
         case ProfilerBackend::VTUNE: return "vtune";
+        case ProfilerBackend::IMC: return "imc";
+        case ProfilerBackend::UPROF: return "uprof";
     }
     return "unknown";
 }
@@ -149,6 +170,7 @@ std::string counter_type_label(CounterType type) {
         case CounterType::CAS_COUNT: return "CAS_COUNT";
         case CounterType::UPI_FLITS: return "UPI_FLITS";
         case CounterType::NVIDIA_GRACE: return "NVIDIA_GRACE";
+        case CounterType::TOTAL_BYTES: return "TOTAL_BYTES";
         default: return "UNKNOWN";
     }
 }
@@ -322,6 +344,17 @@ bool validate_config(const ProfilerConfig& config, std::string& error) {
         error = "Error: use either --pid <pid> or a command, not both.";
         return false;
     }
+
+#if defined(_WIN32)
+    if (config.target_pid > 0) {
+        error = "Error: --pid attach mode is not available on Windows.";
+        return false;
+    }
+    if (config.profet_mode || !config.profet_counters.empty()) {
+        error = "Error: --profet is not available on Windows.";
+        return false;
+    }
+#endif
 
     if (config.backend == ProfilerBackend::LIKWID && config.target_pid > 0) {
         error = "Error: --backend likwid does not support --pid attach mode.";
@@ -510,6 +543,8 @@ void print_profet_totals(std::ostream& os,
 }
 
 int main(int argc, char* argv[]) {
+    platform::init_console();
+
     if (argc < 2) {
         print_profiler_help(argv[0]);
         return 1;
@@ -595,6 +630,11 @@ int main(int argc, char* argv[]) {
 
     auto& strategy = BandwidthCounterStrategy::instance();
     strategy.set_measurer_type(backend_to_measurer(prof_config.backend));
+#if defined(_WIN32)
+    if (prof_config.backend == ProfilerBackend::AUTO) {
+        strategy.set_windows_auto_measurer(windows_auto_measurer(prof_config.verbosity).type);
+    }
+#endif
     strategy.set_extra_counters(prof_config.profet_counters);
     strategy.set_memory_type(caps.memory_type);
     strategy.initialize(representative_cpu, target_mem_nodes, caps);
@@ -634,7 +674,11 @@ int main(int argc, char* argv[]) {
         if (!prof_config.mem_nodes.empty()) {
             std::cout << " (explicit)\n";
         } else if (binding.is_mem_bound) {
+#if defined(_WIN32)
+            std::cout << " (inherited)\n";
+#else
             std::cout << " (inherited from numactl/membind)\n";
+#endif
         } else {
             std::cout << " (auto-detected)\n";
         }
@@ -754,6 +798,9 @@ int main(int argc, char* argv[]) {
             write_bytes = raw_wr * cache_line_size;
         } else if (selection.type == CounterType::NVIDIA_GRACE) {
             read_bytes = raw_rd * 32;
+            write_bytes = raw_wr;
+        } else if (selection.type == CounterType::TOTAL_BYTES) {
+            read_bytes = raw_rd;
             write_bytes = raw_wr;
         }
 

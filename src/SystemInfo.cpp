@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,13 +35,19 @@
 
 #include "SystemInfo.h"
 #include "Utils.h"
+#include "platform/Sys.h"
 #include <unistd.h>
+#if defined(_WIN32)
+#include "platform/SysInfoBackend.h"
+#else
 #include <sys/utsname.h>
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <cctype>
+#include <regex>
 #include <sstream>
 #include <set>
 
@@ -50,6 +58,7 @@
 #include <sys/mount.h>
 #endif
 
+#if !defined(_WIN32)
 static void strip_cpu_frequency(char* model) {
     if (!model) return;
 
@@ -63,8 +72,9 @@ static void strip_cpu_frequency(char* model) {
         }
     }
 }
+#endif // !_WIN32
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 static std::string run_command_for_output(const char* cmd) {
     FILE* pipe = popen(cmd, "r");
     if (!pipe) return "";
@@ -78,28 +88,6 @@ static std::string run_command_for_output(const char* cmd) {
     if (!pclose_success(pipe)) return "";
     
     return result;
-}
-
-static bool has_nvidia_scf_pmu() {
-#if defined(__linux__)
-    for (int i = 0; i < 64; ++i) {
-        const std::string pmu_path =
-            "/sys/bus/event_source/devices/nvidia_scf_pmu_" + std::to_string(i);
-        if (access((pmu_path + "/type").c_str(), F_OK) == 0 ||
-            access(pmu_path.c_str(), F_OK) == 0) {
-            return true;
-        }
-    }
-#endif
-    return false;
-}
-
-static bool looks_like_grace_core(const std::string& model) {
-    std::string upper = model;
-    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return upper.find("NEOVERSE-V2") != std::string::npos ||
-           upper.find("NEOVERSE V2") != std::string::npos ||
-           upper.find("GRACE") != std::string::npos;
 }
 
 static int safe_stoi(const std::string& s, int fallback_val = 0) {
@@ -194,7 +182,7 @@ static int detect_cores_fallback(int* physical_cores, int* logical_cores, int* s
         }
     }
     
-    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    long nprocs = platform::online_cpu_count();
     if (nprocs > 0) {
         if (logical_cores) *logical_cores = static_cast<int>(nprocs);
         if (physical_cores) *physical_cores = static_cast<int>(nprocs);
@@ -206,14 +194,39 @@ static int detect_cores_fallback(int* physical_cores, int* logical_cores, int* s
     return 0;
 }
 
-static bool parse_memory_speed_from_output(const std::string& output, char* freq, int* channels) {
+static std::string parse_memory_type_line(const std::string& line) {
+    size_t pos = line.find("Type:");
+    if (pos == std::string::npos) return "";
+    if (line.find("Type Detail") != std::string::npos) return "";
+    if (line.find("Correction") != std::string::npos) return "";
+
+    std::string val = line.substr(pos + 5);
+    size_t a = val.find_first_not_of(" \t");
+    if (a == std::string::npos) return "";
+    size_t b = val.find_last_not_of(" \t\r\n");
+    val = val.substr(a, b - a + 1);
+
+    if (val.rfind("LPDDR", 0) == 0 || val.rfind("DDR", 0) == 0 ||
+        val.rfind("HBM", 0) == 0) {
+        return val;
+    }
+    return "";
+}
+
+static bool parse_memory_speed_from_output(const std::string& output, char* tech, char* freq) {
     int speed = 0;
-    int channel_count = 0;
-    
+
     std::istringstream iss(output);
     std::string line;
-    
+
     while (std::getline(iss, line)) {
+        if (tech && !tech[0]) {
+            std::string t = parse_memory_type_line(line);
+            if (!t.empty()) {
+                snprintf(tech, 32, "%s", t.c_str());
+            }
+        }
+
         size_t pos = line.find("Configured Memory Speed:");
         if (pos == std::string::npos) {
             pos = line.find("Configured Clock Speed:");
@@ -224,18 +237,17 @@ static bool parse_memory_speed_from_output(const std::string& output, char* freq
                 continue;
             }
         }
-        
+
         if (pos != std::string::npos) {
             size_t num_start = line.find_first_of("0123456789", pos);
             if (num_start != std::string::npos) {
                 int val = std::stoi(line.substr(num_start));
                 if (val > speed && val > 100) {
                     speed = val;
-                    channel_count++;
                 }
             }
         }
-        
+
         if (line.find("clock:") != std::string::npos && line.find("MHz") != std::string::npos) {
             size_t num_start = line.find("clock:") + 6;
             num_start = line.find_first_of("0123456789", num_start);
@@ -244,42 +256,51 @@ static bool parse_memory_speed_from_output(const std::string& output, char* freq
                 int mts = val * 2;
                 if (mts > speed && mts > 100) {
                     speed = mts;
-                    channel_count++;
                 }
             }
         }
     }
-    
-    if (speed > 0) {
-        if (freq && !freq[0]) {
-            snprintf(freq, 32, "%d MT/s", speed);
-        }
-        if (channels && channel_count > 0) {
-            *channels = channel_count;
-        }
-        return true;
+
+    if (speed > 0 && freq && !freq[0]) {
+        snprintf(freq, 32, "%d MT/s", speed);
     }
-    return false;
+    return (speed > 0) || (tech && tech[0]);
 }
 
-static bool try_command_with_sudo_fallback(const char* cmd, const char* sudo_cmd, 
-                                           char* freq, int* channels,
-                                           bool (*parser)(const std::string&, char*, int*)) {
+static bool try_command_with_sudo_fallback(const char* cmd, const char* sudo_cmd,
+                                           char* tech, char* freq,
+                                           bool (*parser)(const std::string&, char*, char*)) {
     std::string output = run_command_for_output(cmd);
-    if (!output.empty() && parser(output, freq, channels)) {
+    if (!output.empty() && parser(output, tech, freq)) {
         return true;
     }
-    
+
     output = run_command_for_output(sudo_cmd);
-    if (!output.empty() && parser(output, freq, channels)) {
+    if (!output.empty() && parser(output, tech, freq)) {
         return true;
     }
-    
+
     return false;
 }
 
-static bool parse_decode_dimms_output(const std::string& output, char* freq, int* channels) {
-    (void)channels;
+static bool try_command_with_sudo_fallback_raw(const char* cmd, const char* sudo_cmd, std::string& out) {
+    std::string output = run_command_for_output(cmd);
+    if (!output.empty()) {
+        out = output;
+        return true;
+    }
+
+    output = run_command_for_output(sudo_cmd);
+    if (!output.empty()) {
+        out = output;
+        return true;
+    }
+
+    return false;
+}
+
+static bool parse_decode_dimms_output(const std::string& output, char* tech, char* freq) {
+    (void)tech;
     std::istringstream iss(output);
     std::string line;
     while (std::getline(iss, line)) {
@@ -298,28 +319,47 @@ static bool parse_decode_dimms_output(const std::string& output, char* freq, int
     return false;
 }
 
-static bool try_detect_memory_freq(char* freq, int* channels) {
-    if (try_command_with_sudo_fallback(
-            "dmidecode -t memory 2>/dev/null",
-            "sudo -n dmidecode -t memory 2>/dev/null",
-            freq, channels, parse_memory_speed_from_output)) {
+static bool try_detect_memory_freq_fast(char* tech, char* freq){
+    std::string tech_str;
+    std::string freq_str;
+
+    if (try_command_with_sudo_fallback_raw(
+        "dmidecode -t memory | grep Speed | awk 'NR == 1 {printf $2}' 2>/dev/null",
+        "sudo dmidecode -t memory | grep Speed | awk 'NR == 1 {printf $2}' 2>/dev/null",
+        freq_str) && 
+        try_command_with_sudo_fallback_raw(
+        "dmidecode -t memory | grep Type | awk 'NR == 2 {printf $2}' 2>/dev/null",
+        "sudo dmidecode -t memory | grep Type | awk 'NR == 2 {printf $2}' 2>/dev/null",
+        tech_str)) {
+        
+        if (!tech_str.empty()){
+            snprintf(tech, 32, "%s", tech_str.c_str());
+        }
+        if(!freq_str.empty()){
+            snprintf(freq, 32, "%s MT/s", freq_str.c_str());
+        }
+
         return true;
     }
-    
+    return false;
+}
+
+static bool try_detect_memory_freq_slow(char* tech, char* freq) {
+
     if (try_command_with_sudo_fallback(
             "lshw -C memory 2>/dev/null",
             "sudo -n lshw -C memory 2>/dev/null",
-            freq, channels, parse_memory_speed_from_output)) {
+            tech, freq, parse_memory_speed_from_output)) {
         return true;
     }
-    
+
     std::string output = run_command_for_output("decode-dimms 2>/dev/null");
-    if (!output.empty() && parse_decode_dimms_output(output, freq, channels)) {
+    if (!output.empty() && parse_decode_dimms_output(output, tech, freq)) {
         return true;
     }
-    
+
     output = run_command_for_output("hwinfo --memory 2>/dev/null");
-    if (!output.empty() && parse_memory_speed_from_output(output, freq, channels)) {
+    if (!output.empty() && parse_memory_speed_from_output(output, tech, freq)) {
         return true;
     }
     
@@ -347,9 +387,8 @@ static bool try_detect_memory_freq(char* freq, int* channels) {
     
     return false;
 }
-#endif
+#endif // !__APPLE__ && !_WIN32
 
-#ifndef __APPLE__
 bool cpu_has_onpackage_hbm(const std::string& cpu_model) {
     std::string upper = cpu_model;
     for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -359,11 +398,27 @@ bool cpu_has_onpackage_hbm(const std::string& cpu_model) {
     return intel_xeon_max || fujitsu_a64fx;
 }
 
+bool cpu_is_consumer(const std::string& cpu_model) {
+    std::string model = cpu_model;
+    for (auto& c : model) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    static const char* consumer_markers[] = {
+        "CORE(TM) I", "CORE I", "CORE ULTRA", "CORE(TM) ULTRA",
+        "CELERON", "PENTIUM", "ATOM", "RYZEN", "ATHLON"
+    };
+    for (const char* marker : consumer_markers) {
+        if (model.find(marker) != std::string::npos) return true;
+    }
+    return false;
+}
+
+#ifndef __APPLE__
 static void infer_memory_info_from_cpu(const char* cpu_model, char* tech, char* freq, int* channels) {
     if (!cpu_model) return;
-    
+
     std::string model = cpu_model;
     for (auto & c: model) c = toupper(c);
+
+    if (cpu_is_consumer(model)) return;
 
     if (model.find("PLATINUM") != std::string::npos || model.find("GOLD") != std::string::npos || model.find("SILVER") != std::string::npos || model.find("BRONZE") != std::string::npos) {
         if (model.find("84") != std::string::npos || model.find("64") != std::string::npos || 
@@ -401,13 +456,59 @@ static void infer_memory_info_from_cpu(const char* cpu_model, char* tech, char* 
     
     // AMD EPYC
     if (model.find("EPYC") != std::string::npos) {
-        if (model.find("9") != std::string::npos && model.find("4") != std::string::npos) {
+        const std::regex epyc_9xx5(R"(\b9\d\d5\w*\b)"); // Turin
+        const std::regex epyc_9xx4(R"(\b9\d\d4\w*\b)"); // Genoa/Bergamo
+        const std::regex epyc_8xx5(R"(\b8\d\d5\w*\b)"); // Sorano
+        const std::regex epyc_8xx4(R"(\b8\d\d4\w*\b)"); // Siena
+        const std::regex epyc_4xx5(R"(\b4\d\d5\w*\b)"); // Grado
+        const std::regex epyc_4xx4(R"(\b4\d\d4\w*\b)"); // Raphael
+        const std::regex epyc_7xx1(R"(\b7\d\d1\w*\b)"); // Naples
+        const std::regex epyc_7xx2(R"(\b7\d\d2\w*\b)"); // Rome
+        const std::regex epyc_7xx3(R"(\b7\d\d3\w*\b)"); // Milan
+        if (std::regex_search(model, epyc_9xx5)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR5");
+             if (freq && !freq[0]) strcpy(freq, "6400 MT/s");
+             if (channels) *channels = 12;
+             return;
+        }
+        if (std::regex_search(model, epyc_9xx4)) {
              if (tech && !tech[0]) strcpy(tech, "DDR5");
              if (freq && !freq[0]) strcpy(freq, "4800 MT/s");
              if (channels) *channels = 12;
              return;
         }
-        if (model.find("7") != std::string::npos) {
+        if (std::regex_search(model, epyc_8xx5)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR5");
+             if (freq && !freq[0]) strcpy(freq, "6400 MT/s");
+             if (channels) *channels = 6;
+             return;
+        }
+        if (std::regex_search(model, epyc_8xx4)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR5");
+             if (freq && !freq[0]) strcpy(freq, "4800 MT/s");
+             if (channels) *channels = 6;
+             return;
+        }
+        if (std::regex_search(model, epyc_4xx5)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR5");
+             if (freq && !freq[0]) strcpy(freq, "5600 MT/s");
+             if (channels) *channels = 2;
+             return;
+        }
+        if (std::regex_search(model, epyc_4xx4)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR5");
+             if (freq && !freq[0]) strcpy(freq, "5200 MT/s");
+             if (channels) *channels = 2;
+             return;
+        }
+        if (std::regex_search(model, epyc_7xx1)) {
+             if (tech && !tech[0]) strcpy(tech, "DDR4");
+             if (freq && !freq[0]) strcpy(freq, "2666 MT/s");
+             if (channels) *channels = 8;
+             return;
+        }
+        if (std::regex_search(model, epyc_7xx2) || model.find("7H12") != std::string::npos ||
+            std::regex_search(model, epyc_7xx3)) {
              if (tech && !tech[0]) strcpy(tech, "DDR4");
              if (freq && !freq[0]) strcpy(freq, "3200 MT/s");
              if (channels) *channels = 8;
@@ -432,8 +533,8 @@ static void infer_memory_info_from_cpu(const char* cpu_model, char* tech, char* 
         return;
     }
 
-    // Intel Emerald Rapids (85xx)
-    if (model.find("85") != std::string::npos) {
+    // Intel Emerald Rapids (Xeon 85xx)
+    if (model.find("XEON") != std::string::npos && model.find("85") != std::string::npos) {
         if (tech && !tech[0]) strcpy(tech, "DDR5");
         if (freq && !freq[0]) strcpy(freq, "5600 MT/s");
         if (channels) *channels = 8;
@@ -447,7 +548,6 @@ static void infer_memory_info_from_cpu(const char* cpu_model, char* tech, char* 
         if (channels) *channels = 16;
         return;
     }
-
     if (model.find("XEON") != std::string::npos) {
         size_t xeon_pos = model.find("XEON");
         std::string after_xeon = model.substr(xeon_pos + 4);
@@ -479,6 +579,7 @@ int system_info_detect(system_info *out) {
 
     std::memset(out, 0, sizeof(system_info));
 
+#if !defined(_WIN32)
     struct utsname uname_info;
     if (uname(&uname_info) == 0) {
         std::snprintf(out->os_name, sizeof(out->os_name), "%.*s", (int)sizeof(out->os_name)-1, uname_info.sysname);
@@ -486,8 +587,40 @@ int system_info_detect(system_info *out) {
         std::snprintf(out->os_version, sizeof(out->os_version), "%.*s", (int)sizeof(out->os_version)-1, uname_info.version);
         std::snprintf(out->arch, sizeof(out->arch), "%.*s", (int)sizeof(out->arch)-1, uname_info.machine);
     }
+#endif
 
-#ifdef __APPLE__
+#if defined(_WIN32)
+    if (platform::detect_system_info(out) != 0) {
+        return -1;
+    }
+
+    int inferred_channels = 0;
+    infer_memory_info_from_cpu(out->cpu_model, out->mem_technology, out->mem_frequency,
+                               &inferred_channels);
+    if (inferred_channels > 0) {
+        for (int i = 0; i < out->socket_count && i < SI_MAX_SOCKETS; i++) {
+            out->sockets[i].mem_channels = inferred_channels;
+        }
+    }
+
+    if (!out->mem_technology[0]) {
+        std::snprintf(out->mem_technology, sizeof(out->mem_technology), "Unknown");
+    }
+    if (!out->mem_frequency[0]) {
+        std::snprintf(out->mem_frequency, sizeof(out->mem_frequency), "Unknown");
+    }
+
+    if (std::strcmp(out->mem_technology, "Unknown") != 0) {
+        for (int i = 0; i < out->numa_node_count; i++) {
+            if (std::strcmp(out->numa_nodes[i].memory_type, "UNKNOWN") == 0) {
+                std::snprintf(out->numa_nodes[i].memory_type,
+                              sizeof(out->numa_nodes[i].memory_type), "%s",
+                              out->mem_technology);
+            }
+        }
+    }
+
+#elif defined(__APPLE__)
     size_t len;
     
     len = sizeof(out->cpu_model);
@@ -507,14 +640,53 @@ int system_info_detect(system_info *out) {
     
     out->total_physical_cores = physical_cores;
     out->total_logical_cores = logical_cores;
-    
+
+    out->socket_count = 1;
+    out->sockets[0].id = 0;
+    out->sockets[0].core_count = physical_cores;
+    out->sockets[0].thread_count = logical_cores;
+
+    int nperflevels = 0;
+    len = sizeof(nperflevels);
+    if (sysctlbyname("hw.nperflevels", &nperflevels, &len, NULL, 0) == 0 && nperflevels > 1) {
+        int pcores = 0, ecores = 0;
+        len = sizeof(pcores);
+        sysctlbyname("hw.perflevel0.physicalcpu", &pcores, &len, NULL, 0);
+        len = sizeof(ecores);
+        sysctlbyname("hw.perflevel1.physicalcpu", &ecores, &len, NULL, 0);
+        out->performance_cores = pcores;
+        out->efficiency_cores = ecores;
+    } else {
+        out->performance_cores = physical_cores;
+        out->efficiency_cores = 0;
+    }
+
     uint64_t mem_bytes = 0;
     len = sizeof(mem_bytes);
     sysctlbyname("hw.memsize", &mem_bytes, &len, NULL, 0);
     out->total_mem_bytes = mem_bytes;
-    
-    std::snprintf(out->mem_technology, sizeof(out->mem_technology), "LPDDR5");
-    
+
+    out->mem_technology[0] = '\0';
+    FILE* mem_pipe = popen("system_profiler SPMemoryDataType 2>/dev/null", "r");
+    if (mem_pipe) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), mem_pipe)) {
+            char* type_key = std::strstr(line, "Type:");
+            if (!type_key) continue;
+            type_key += 5;
+            while (*type_key == ' ' || *type_key == '\t') ++type_key;
+            char type[64] = "";
+            if (std::sscanf(type_key, "%63s", type) == 1 && type[0]) {
+                std::snprintf(out->mem_technology, sizeof(out->mem_technology), "%s", type);
+            }
+            break;
+        }
+        pclose_success(mem_pipe);
+    }
+    if (!out->mem_technology[0]) {
+        std::snprintf(out->mem_technology, sizeof(out->mem_technology), "LPDDR5");
+    }
+
 #else
     FILE *cpuinfo = std::fopen("/proc/cpuinfo", "r");
     if (cpuinfo) {
@@ -599,7 +771,7 @@ int system_info_detect(system_info *out) {
         }
 
         if (cores_per_socket <= 0) {
-            long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+            long nprocs = platform::online_cpu_count();
             if (nprocs > 0) {
                 cores_per_socket = static_cast<int>(nprocs);
                 if (siblings <= 0) siblings = static_cast<int>(nprocs);
@@ -647,79 +819,32 @@ int system_info_detect(system_info *out) {
              }
         }
 
-        if (has_nvidia_scf_pmu() && looks_like_grace_core(model)) {
-            std::snprintf(vendor, sizeof(vendor), "NVIDIA");
-            std::snprintf(model, sizeof(model), "Grace (Neoverse-V2)");
-        }
-
         std::snprintf(out->cpu_vendor, sizeof(out->cpu_vendor), "%s", vendor);
         std::snprintf(out->cpu_model, sizeof(out->cpu_model), "%s", model);
         
         int inferred_channels = 0;
 
-        // Fast path first: infer from known CPU families and only run expensive probes when needed.
-        infer_memory_info_from_cpu(out->cpu_model, out->mem_technology, out->mem_frequency, &inferred_channels);
-
-        bool force_slow_memory_probe = false;
-        if (const char* env = std::getenv("MESS_SLOW_MEM_PROBE")) {
-            force_slow_memory_probe = (std::strcmp(env, "0") != 0);
+        if(geteuid() == 0){
+            try_detect_memory_freq_fast(out->mem_technology, out->mem_frequency); // (Only if sudo) Try fast memory frequency and type grep using dmidecode
+        }
+        
+        if (!out->mem_frequency[0]) {
+            // Second faster path: infer from known CPU families and only run expensive probes when needed.
+            infer_memory_info_from_cpu(out->cpu_model, out->mem_technology, out->mem_frequency, &inferred_channels);
+            out->cpu_inferred = true;
         }
 
-        if (!out->mem_frequency[0] || force_slow_memory_probe) {
-            int detected_channels = inferred_channels;
-            if (try_detect_memory_freq(out->mem_frequency, &detected_channels) && detected_channels > 0) {
-                inferred_channels = detected_channels;
-            }
+        if (!out->mem_frequency[0]) {
+            try_detect_memory_freq_slow(out->mem_technology, out->mem_frequency); // Last try: slower paths.
         }
 
         if (!out->mem_technology[0]) {
             std::snprintf(out->mem_technology, sizeof(out->mem_technology), "Unknown");
         }
-        
+
         if (!out->mem_frequency[0]) {
             std::snprintf(out->mem_frequency, sizeof(out->mem_frequency), "Unknown");
         }
-
-        int detected_base_mhz = 0, detected_max_mhz = 0, detected_cur_mhz = 0;
-        {
-            auto read_khz = [](const char *path) -> int {
-                FILE *f = std::fopen(path, "r");
-                if (!f) return 0;
-                int khz = 0;
-                std::fscanf(f, "%d", &khz);
-                std::fclose(f);
-                return khz / 1000;
-            };
-            
-            // Read frequencies from all CPUs to find maximum values across system
-            for (int cpu = 0; cpu < out->total_logical_cores; cpu++) {
-                char path[256];
-                std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
-                int cpu_max = read_khz(path);
-                if (cpu_max > detected_max_mhz) detected_max_mhz = cpu_max;
-                
-                std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/base_frequency", cpu);
-                int cpu_base = read_khz(path);
-                if (cpu_base > detected_base_mhz) detected_base_mhz = cpu_base;
-                
-                std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
-                int cpu_cur = read_khz(path);
-                if (cpu_cur > detected_cur_mhz) detected_cur_mhz = cpu_cur;
-            }
-            
-            // Fallback to cpu0 if no frequencies were detected
-            if (detected_max_mhz == 0) {
-                detected_max_mhz = read_khz("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq");
-                detected_base_mhz = read_khz("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency");
-                detected_cur_mhz = read_khz("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
-            }
-            
-        }
-
-        // Store at system level (maximum values across all sockets)
-        out->cpu_base_mhz = detected_base_mhz;
-        out->cpu_max_mhz = detected_max_mhz;
-        out->cpu_cur_mhz = detected_cur_mhz;
 
         out->socket_count = socket_count;
         for (int i = 0; i < socket_count && i < SI_MAX_SOCKETS; i++) {
@@ -746,9 +871,9 @@ int system_info_detect(system_info *out) {
     }
 #endif
 
-    out->page_size = sysconf(_SC_PAGESIZE);
+    out->page_size = platform::page_size();
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
     const auto numa_memory_info =
         detect_numa_memory_info(out->cpu_model, cpu_has_onpackage_hbm(out->cpu_model));
     std::set<std::string> detected_types;

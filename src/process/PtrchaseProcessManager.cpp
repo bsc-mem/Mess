@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -31,8 +33,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "platform/BuildPaths.h"
 #include "ProcessManager.h"
 #include "Utils.h"
+#include "utils/StringUtils.h"
 
 #include <cerrno>
 #include <chrono>
@@ -47,52 +51,21 @@
 #include <string>
 #include <system_error>
 #include <thread>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
 #include <cstring>
+#include <fcntl.h>     // the ready-flag probe below deliberately uses open/read
+#include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/wait.h>  // WIFSIGNALED/strsignal, in the POSIX-only debug block
+#endif
 
-namespace {
-
-bool IsProcessRunning(pid_t pid) {
-    if (pid <= 0) return false;
-    
-    int status;
-    int result = waitpid(pid, &status, WNOHANG);
-    if (result == pid) {
-        return false;
-    }
-    
-    if (result == 0) {
-        return true;
-    }
-    
-    return (::kill(pid, 0) == 0);
-}
-
-bool WaitForProcessExit(pid_t pid, std::chrono::milliseconds timeout) {
-    if (pid <= 0) return true;
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (true) {
-        if (::kill(pid, 0) == -1 && errno == ESRCH) {
-            return true;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-}
-
-}
+#include "platform/Fs.h"
+#include "platform/Ipc.h"
+#include "platform/Process.h"
 
 PtrChaseProcessManager::PtrChaseProcessManager(const BenchmarkConfig& config,
                                                const system_info& sys_info)
     : config_(config),
-      ptr_chase_pid_(0),
-      ptrchase_start_sem_(nullptr),
-      ptrchase_done_sem_(nullptr) {
+      ptr_chase_pid_(0) {
     (void)sys_info;
     ptrchase_perf_fds_.fd_cycles = -1;
     ptrchase_perf_fds_.fd_insts = -1;
@@ -119,10 +92,12 @@ void PtrChaseProcessManager::generate_unique_names() {
         } else {
             unique_id_ = std::string("pid_") + std::to_string(getpid());
         }
-        
-        setenv("MESS_UNIQUE_ID", unique_id_.c_str(), 1);
+
+        platform::set_env("MESS_UNIQUE_ID", unique_id_.c_str());
     }
-    
+
+    // The contract with the generated ptr_chase.c, which builds the same names from
+    // MESS_UNIQUE_ID.
     start_sem_name_ = "/mess_pc_start_" + unique_id_;
     done_sem_name_ = "/mess_pc_done_" + unique_id_;
     ready_flag_path_ = "/tmp/ptr_chase_ready_" + unique_id_ + ".flag";
@@ -154,114 +129,86 @@ bool PtrChaseProcessManager::launch_process() {
         mem_node_str = std::to_string(auto_mem_node);
     }
 
-    if (ptrchase_start_sem_) {
-        sem_close(ptrchase_start_sem_);
-        ptrchase_start_sem_ = nullptr;
-    }
-    if (ptrchase_done_sem_) {
-        sem_close(ptrchase_done_sem_);
-        ptrchase_done_sem_ = nullptr;
-    }
+    ptrchase_start_sem_.close();
+    ptrchase_done_sem_.close();
 
-    std::remove(ready_flag_path_.c_str());
-    std::remove(pipe_path_.c_str());
+    std::remove(platform::local_path(ready_flag_path_).c_str());
+    platform::MessagePipe::destroy_endpoint(pipe_path_);
 
-    sem_unlink(start_sem_name_.c_str());
-    sem_unlink(done_sem_name_.c_str());
+    platform::Semaphore::unlink(start_sem_name_);
+    platform::Semaphore::unlink(done_sem_name_);
 
-    if (mkfifo(pipe_path_.c_str(), 0666) != 0 && errno != EEXIST) {
+    if (!platform::MessagePipe::create_endpoint(pipe_path_)) {
         std::cerr << "ERROR: Failed to create pipe " << pipe_path_ << ": " << std::strerror(errno) << std::endl;
         return false;
     }
 
-    std::string log_path = "/tmp/ptr_chase_" + unique_id_ + ".log";
-    std::string cmd_prefix;
-    std::string ptr_chase_bin;
-    std::string working_dir;
+    std::string log_path = platform::local_path("/tmp/ptr_chase_" + unique_id_ + ".log");
+    // Kernels and arrays belong to this controller's configuration.
+    const std::string ptr_chase_exe = platform::exe_name("ptr_chase");
+    const auto binary_path = platform::runtime_directory() / ptr_chase_exe;
+    if (!platform::is_executable(binary_path)) {
+        std::cerr << "ERROR: " << binary_path << " not found or not executable. Run generate_code first.\n";
+        return false;
+    }
+    const std::string working_dir = binary_path.parent_path().string();
+    const std::string cmd_prefix = "cd " + string_utils::shell_quote(working_dir) + " && ";
+    const std::string ptr_chase_bin = "./" + binary_path.filename().string();
 
-    std::filesystem::path root = get_project_root();
+#if defined(_WIN32)
+    if (!config_.memory_bind_nodes.empty()) {
+        std::cerr << "ERROR: Explicit NUMA memory binding is unsupported on Windows.\n";
+        return false;
+    }
+    // Spawned suspended, pinned, then resumed, so the pin precedes first touch.
+    (void)cache;
+    const std::string win_log_path = platform::local_path(log_path);
 
-    // Search for ptr_chase binary in multiple locations
-    std::vector<std::filesystem::path> binary_search_paths = {
-        root / "build" / "bin" / "ptr_chase",
-        root / "bin" / "ptr_chase",
-        root / "ptr_chase",
-        std::filesystem::current_path() / "ptr_chase",
-        std::filesystem::path("./ptr_chase")
-    };
-
-    std::filesystem::path binary_path;
-    for (const auto& p : binary_search_paths) {
-        if (std::filesystem::exists(p)) {
-            binary_path = p;
-            break;
-        }
+    ptr_chase_group_.terminate_all();
+    ptr_chase_group_ = platform::ProcessGroup();
+    if (!ptr_chase_group_.valid()) {
+        std::cerr << "ERROR: Could not create the ptr_chase job object" << std::endl;
+        return false;
     }
 
-    // Search for array.dat in multiple locations
-    std::vector<std::filesystem::path> array_search_paths = {
-        root / "build" / "bin" / "array.dat",
-        root / "build" / "array.dat",
-        root / "bin" / "array.dat",
-        root / "array.dat",
-        std::filesystem::current_path() / "array.dat"
-    };
+    platform::SpawnOptions pc_opts;
+    pc_opts.working_dir = working_dir;
+    pc_opts.log_path    = win_log_path;
+    pc_opts.pin.cpu     = ptr_chase_cpu;
 
-    std::filesystem::path array_dat_path;
-    for (const auto& p : array_search_paths) {
-        if (std::filesystem::exists(p)) {
-            array_dat_path = p;
-            break;
-        }
+    ptr_chase_pid_ = ptr_chase_group_.spawn(binary_path.string(), {}, pc_opts);
+    if (ptr_chase_pid_ <= 0) {
+        std::cerr << "ERROR: Failed to launch persistent ptr_chase: " << ptr_chase_group_.error() << std::endl;
+        return false;
     }
-
-    if (!binary_path.empty()) {
-        ptr_chase_bin = binary_path.string();
-        
-        if (!array_dat_path.empty()) {
-            // Use the directory containing array.dat as working directory
-            working_dir = array_dat_path.parent_path().string();
-            cmd_prefix = "cd " + working_dir + " && ";
-            
-            // Use relative path to binary if it's in or below the working directory
-            std::filesystem::path rel_binary = std::filesystem::relative(binary_path, array_dat_path.parent_path());
-            if (!rel_binary.empty() && rel_binary.string().compare(0, 2, "..") != 0) {
-                ptr_chase_bin = "./" + rel_binary.string();
-            }
-        } else {
-            // No array.dat found - use binary directory as working dir
-            working_dir = binary_path.parent_path().string();
-            cmd_prefix = "cd " + working_dir + " && ";
-            ptr_chase_bin = "./" + binary_path.filename().string();
-        }
-    } else {
-        ptr_chase_bin = "ptr_chase";
-        working_dir = std::filesystem::current_path().string();
-    }
-
+#else
     bool have_taskset = cache.have_taskset;
     bool have_numactl = cache.have_numactl;
 
     std::string binding_cmd;
+    const std::string quoted_bin = string_utils::shell_quote(ptr_chase_bin);
     if (have_numactl && have_taskset) {
-        binding_cmd = "numactl --membind=" + mem_node_str + " taskset -c " + ptr_chase_cpu_str + " " + ptr_chase_bin;
+        binding_cmd = "numactl --membind=" + mem_node_str + " taskset -c " + ptr_chase_cpu_str + " " + quoted_bin;
     } else if (have_numactl) {
-        binding_cmd = "numactl --membind=" + mem_node_str + " --physcpubind=" + ptr_chase_cpu_str + " " + ptr_chase_bin;
+        binding_cmd = "numactl --membind=" + mem_node_str + " --physcpubind=" + ptr_chase_cpu_str + " " + quoted_bin;
     } else if (have_taskset) {
-        binding_cmd = "taskset -c " + ptr_chase_cpu_str + " " + ptr_chase_bin;
+        binding_cmd = "taskset -c " + ptr_chase_cpu_str + " " + quoted_bin;
         if (config_.verbosity >= 2) {
             std::cerr << "  [NOTICE] numactl not found, using taskset only (no memory binding)" << std::endl;
         }
     } else {
-        binding_cmd = ptr_chase_bin;
+        binding_cmd = quoted_bin;
+#ifdef __APPLE__
+        binding_cmd = "/usr/sbin/taskpolicy -t 0 " + binding_cmd; // Run on high throughput mode
+#endif
         if (config_.verbosity >= 1) {
             std::cerr << "  [WARNING] Neither numactl nor taskset found. ptr_chase will run without CPU/memory binding." << std::endl;
         }
     }
     
-    std::string ptr_chase_cmd = "{ " + cmd_prefix + binding_cmd + " >> " + log_path + " 2>&1 & echo $!; } 2>/dev/null";
+    std::string ptr_chase_cmd = "{ " + cmd_prefix + binding_cmd + " >> " + string_utils::shell_quote(log_path) + " 2>&1 & echo $!; } 2>/dev/null";
 
-    FILE* ptr_pipe = popen(ptr_chase_cmd.c_str(), "r");
+    FILE* ptr_pipe = platform::open_pipe(ptr_chase_cmd.c_str(), "r");
     if (!ptr_pipe) {
         std::cerr << "ERROR: Failed to launch persistent ptr_chase" << std::endl;
         return false;
@@ -277,10 +224,13 @@ bool PtrChaseProcessManager::launch_process() {
         std::cerr << "ERROR: Failed to get ptr_chase PID" << std::endl;
         return false;
     }
+#endif  // _WIN32
 
     if (config_.verbosity >= 3) {
         std::cout << "PointerChase settings:" << std::endl;
         std::cout << "    Launched ptr_chase process (PID: " << ptr_chase_pid_ << ")" << std::endl;
+        // Log the core type because hybrid cores have different idle latencies.
+        std::cout << "    CPU: " << ptr_chase_cpu << " (memory node " << auto_mem_node << ")" << std::endl;
         std::cout << "    Session ID: " << unique_id_ << std::endl;
         std::cout << "    Pipe: " << pipe_path_ << std::endl;
         std::cout << "    Log: " << log_path << std::endl;
@@ -301,7 +251,7 @@ bool PtrChaseProcessManager::launch_process() {
  */
 bool PtrChaseProcessManager::ensure_running() {
   
-    if (IsProcessRunning(ptr_chase_pid_)) {
+    if (platform::process_running(ptr_chase_pid_)) {
         return true;
     }
 
@@ -315,8 +265,8 @@ bool PtrChaseProcessManager::ensure_running() {
     if (!wait_for_ready(10)) {
         std::cerr << "ERROR: ptr_chase did not signal ready within timeout" << std::endl;
         if (ptr_chase_pid_ > 0) {
-            kill(ptr_chase_pid_, SIGKILL);
-            waitpid(ptr_chase_pid_, nullptr, WNOHANG);
+            platform::signal_process(ptr_chase_pid_, platform::Stop::Force);
+            platform::reap_process(ptr_chase_pid_);
             ptr_chase_pid_ = 0;
         }
         return false;
@@ -334,7 +284,7 @@ bool PtrChaseProcessManager::ensure_running() {
 
 bool PtrChaseProcessManager::wait_for_ready(int timeout_seconds) {
     auto start_time = std::chrono::steady_clock::now();
-    const std::string& ready_flag = ready_flag_path_;
+    const std::string ready_flag = platform::local_path(ready_flag_path_);
 
     // Give the child process a moment to start and create the file
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -364,7 +314,7 @@ bool PtrChaseProcessManager::wait_for_ready(int timeout_seconds) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
         if (elapsed.count() >= timeout_seconds) {
             if (config_.verbosity >= 1) {
-                std::string log_path = "/tmp/ptr_chase_" + unique_id_ + ".log";
+                std::string log_path = platform::local_path("/tmp/ptr_chase_" + unique_id_ + ".log");
                 std::ifstream log_file(log_path);
                 if (log_file.is_open()) {
                     std::string line;
@@ -377,21 +327,24 @@ bool PtrChaseProcessManager::wait_for_ready(int timeout_seconds) {
             return false;
         }
 
-        if (!IsProcessRunning(ptr_chase_pid_)) {
+        if (!platform::process_running(ptr_chase_pid_)) {
             if (config_.verbosity >= 1) {
                 std::cerr << "  [DEBUG] ptr_chase process (" << ptr_chase_pid_ << ") died unexpectedly" << std::endl;
-                
+
+                // Windows has neither WIFSIGNALED nor strsignal.
+#if !defined(_WIN32)
                 int status;
-                if (waitpid(ptr_chase_pid_, &status, WNOHANG) == ptr_chase_pid_) {
+                if (waitpid(static_cast<pid_t>(ptr_chase_pid_), &status, WNOHANG) == static_cast<pid_t>(ptr_chase_pid_)) {
                     if (WIFSIGNALED(status)) {
-                        std::cerr << "  [DEBUG] ptr_chase killed by signal " << WTERMSIG(status) 
+                        std::cerr << "  [DEBUG] ptr_chase killed by signal " << WTERMSIG(status)
                                   << " (" << strsignal(WTERMSIG(status)) << ")" << std::endl;
                     } else if (WIFEXITED(status)) {
                         std::cerr << "  [DEBUG] ptr_chase exited with code " << WEXITSTATUS(status) << std::endl;
                     }
                 }
+#endif
 
-                std::string log_path = "/tmp/ptr_chase_" + unique_id_ + ".log";
+                std::string log_path = platform::local_path("/tmp/ptr_chase_" + unique_id_ + ".log");
                 std::cerr << "  [DEBUG] Checking log file: " << log_path << std::endl;
                 std::ifstream log_file(log_path);
                 if (log_file.is_open()) {
@@ -427,35 +380,29 @@ bool PtrChaseProcessManager::wait_for_ready(int timeout_seconds) {
 void PtrChaseProcessManager::cleanup() {
     
     if (ptr_chase_pid_ > 0) {
-        kill(ptr_chase_pid_, SIGTERM);
-        bool exited = WaitForProcessExit(ptr_chase_pid_, std::chrono::seconds(3));
+        platform::signal_process(ptr_chase_pid_, platform::Stop::Graceful);
+        bool exited = platform::wait_for_process_exit(ptr_chase_pid_, std::chrono::seconds(3));
         if (!exited) {
-            kill(ptr_chase_pid_, SIGKILL);
-            WaitForProcessExit(ptr_chase_pid_, std::chrono::seconds(1));
+            platform::signal_process(ptr_chase_pid_, platform::Stop::Force);
+            platform::wait_for_process_exit(ptr_chase_pid_, std::chrono::seconds(1));
         }
         ptr_chase_pid_ = 0;
     }
 
+#if defined(_WIN32)
+    ptr_chase_group_.terminate_all();
+#endif
+
     cleanup_perf_counters();
 
-    if (ptrchase_start_sem_) {
-        sem_close(ptrchase_start_sem_);
-        ptrchase_start_sem_ = nullptr;
-    }
-    if (ptrchase_done_sem_) {
-        sem_close(ptrchase_done_sem_);
-        ptrchase_done_sem_ = nullptr;
-    }
+    ptrchase_start_sem_.close();
+    ptrchase_done_sem_.close();
 
-    if (!start_sem_name_.empty()) {
-        sem_unlink(start_sem_name_.c_str());
-    }
-    if (!done_sem_name_.empty()) {
-        sem_unlink(done_sem_name_.c_str());
-    }
+    platform::Semaphore::unlink(start_sem_name_);
+    platform::Semaphore::unlink(done_sem_name_);
 
-    std::remove(ready_flag_path_.c_str());
-    std::remove(pipe_path_.c_str());
+    std::remove(platform::local_path(ready_flag_path_).c_str());
+    platform::MessagePipe::destroy_endpoint(pipe_path_);
 }
 
 
@@ -464,31 +411,25 @@ void PtrChaseProcessManager::cleanup_perf_counters() {
 }
 
 bool PtrChaseProcessManager::ensure_semaphores() {
-    if (ptrchase_start_sem_ && ptrchase_done_sem_) {
+    if (ptrchase_start_sem_.valid() && ptrchase_done_sem_.valid()) {
         return true;
     }
 
     const int max_attempts = 50;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        if (!ptrchase_start_sem_) {
-            ptrchase_start_sem_ = sem_open(start_sem_name_.c_str(), O_CREAT, 0666, 0);
-            if (ptrchase_start_sem_ == SEM_FAILED) {
-                ptrchase_start_sem_ = nullptr;
-            }
+        if (!ptrchase_start_sem_.valid()) {
+            ptrchase_start_sem_ = platform::Semaphore::create_or_open(start_sem_name_, 0);
         }
-        if (!ptrchase_done_sem_) {
-            ptrchase_done_sem_ = sem_open(done_sem_name_.c_str(), O_CREAT, 0666, 0);
-            if (ptrchase_done_sem_ == SEM_FAILED) {
-                ptrchase_done_sem_ = nullptr;
-            }
+        if (!ptrchase_done_sem_.valid()) {
+            ptrchase_done_sem_ = platform::Semaphore::create_or_open(done_sem_name_, 0);
         }
-        if (ptrchase_start_sem_ && ptrchase_done_sem_) {
+        if (ptrchase_start_sem_.valid() && ptrchase_done_sem_.valid()) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    if (!ptrchase_start_sem_ || !ptrchase_done_sem_) {
+    if (!ptrchase_start_sem_.valid() || !ptrchase_done_sem_.valid()) {
         std::cerr << "ERROR: Unable to open ptr_chase semaphores" << std::endl;
         return false;
     }
@@ -500,31 +441,24 @@ bool PtrChaseProcessManager::ensure_semaphores() {
 }
 
 void PtrChaseProcessManager::drain_start_sem() {
-    if (!ptrchase_start_sem_) {
-        return;
-    }
-    while (sem_trywait(ptrchase_start_sem_) == 0) {
-    }
+    ptrchase_start_sem_.drain();
 }
 
 void PtrChaseProcessManager::drain_done_sem() {
-    if (!ptrchase_done_sem_) {
-        return;
-    }
-    while (sem_trywait(ptrchase_done_sem_) == 0) {
-    }
+    ptrchase_done_sem_.drain();
 }
 
 bool PtrChaseProcessManager::wait_for_done(int timeout_ms) {
-    if (!ptrchase_done_sem_) {
+    if (!ptrchase_done_sem_.valid()) {
         return false;
     }
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        if (sem_trywait(ptrchase_done_sem_) == 0) {
+        const platform::WaitResult r = ptrchase_done_sem_.try_wait();
+        if (r == platform::WaitResult::Acquired) {
             return true;
         }
-        if (errno != EAGAIN && errno != EINTR) {
+        if (r == platform::WaitResult::Failed) {
             return false;
         }
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

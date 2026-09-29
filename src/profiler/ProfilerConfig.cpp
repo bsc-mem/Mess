@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -111,6 +113,8 @@ std::string get_counter_unit_description(CounterType type, int cache_line_size) 
             return "UPI_FLITS (flit counts, scaled by architecture factor)";
         case CounterType::NVIDIA_GRACE:
             return "NVIDIA_GRACE (read: 32-byte beats, write: bytes)";
+        case CounterType::TOTAL_BYTES:
+            return "TOTAL_BYTES (read/write: raw byte counters)";
         default:
             return "UNKNOWN";
     }
@@ -137,36 +141,65 @@ void print_profiler_help(const char* prog_name) {
               << "  -o, --output <file>     Output file. Default: stdout.\n"
               << "\n"
               << "Targeting Options:\n"
-              << "  -a, --system-wide       System-wide profiling (all CPUs/sockets).\n"
-              << "  -p, --pid <pid>         Profile existing process by PID.\n"
+              << "  -a, --system-wide       System-wide profiling (all CPUs/sockets).\n";
+#if defined(_WIN32)
+    std::cout << "  -p, --pid <pid>         Not available on Windows.\n";
+#else
+    std::cout << "  -p, --pid <pid>         Profile existing process by PID.\n";
+#endif
+    std::cout
               << "  -C, --cpu <list>        Profile only specified CPUs (e.g., 0-7,16-23).\n"
-              << "  -N, --nodes <list>      Monitor memory traffic to specified NUMA nodes.\n"
-              << "  --no-inherit            Don't inherit binding from parent (numactl/taskset).\n"
+              << "  -N, --nodes <list>      Monitor memory traffic to specified NUMA nodes.\n";
+#if defined(_WIN32)
+    std::cout << "  --no-inherit            Don't inherit binding from the parent process.\n";
+#else
+    std::cout << "  --no-inherit            Don't inherit binding from parent (numactl/taskset).\n";
+#endif
+    std::cout
               << "\n"
               << "Output Options:\n"
               << "  -v, --verbose           Verbose output (show counter details).\n"
               << "  --csv                   CSV output (default).\n"
               << "  --human                 Human-readable output.\n"
               << "\n"
-              << "Backend Options:\n"
-              << "  --backend <name>        Select backend: auto, perf-event, perf-stat, likwid, vtune.\n"
-              << "                          Default: auto (uses perf_event_open, falls back to perf stat).\n"
+              << "Backend Options:\n";
+#if defined(_WIN32)
+    std::cout << "  --backend <name>        Select backend: auto, imc, uprof, vtune.\n"
+              << "                          Default: auto.\n";
+#else
+    std::cout << "  --backend <name>        Select backend: auto, perf-event, perf-stat, likwid, vtune.\n"
+              << "                          Default: auto (uses perf_event_open, falls back to perf stat).\n";
+#endif
+    std::cout
               << "\n"
               << "Other Options:\n"
-              << "  --dry, --dry-run        Dry run: show detected counters and exit.\n"
-              << "  --profet                Add profet counters (cycles,instructions,longest-lat-cache-miss alias auto-detected).\n"
+              << "  --dry, --dry-run        Dry run: show detected counters and exit.\n";
+#if defined(_WIN32)
+    std::cout << "  --profet                Not available on Windows.\n";
+#else
+    std::cout << "  --profet                Add profet counters (cycles,instructions,longest-lat-cache-miss alias auto-detected).\n";
+#endif
+    std::cout
               << "  -h, --help              Show this help.\n"
               << "\n"
-              << "Examples:\n"
+              << "Examples:\n";
+#if defined(_WIN32)
+    std::cout << "  " << prog_name << " -s 100ms app.exe\n"
+              << "  " << prog_name << " -s 50ms -o bw.csv app.exe\n"
+              << "  " << prog_name << " -C 0-7 -N 0 -s 100ms app.exe\n";
+#else
+    std::cout
               << "  " << prog_name << " -s 100ms ./my_app             # Profile with 100ms sampling\n"
               << "  " << prog_name << " -s 50ms -o bw.csv ./my_app    # Save to file\n"
               << "  " << prog_name << " -a -s 1s sleep 10             # System-wide, 1s intervals\n"
               << "  " << prog_name << " -p 12345 -s 100ms             # Attach to running process\n"
               << "  numactl -m 0 -C 0-7 " << prog_name << " -s 100ms ./app  # Inherits numactl binding\n"
-              << "  " << prog_name << " -C 0-7 -N 0 -s 100ms ./app    # Explicit CPU/node binding\n"
-              << "\n"
+              << "  " << prog_name << " -C 0-7 -N 0 -s 100ms ./app    # Explicit CPU/node binding\n";
+#endif
+    std::cout << "\n"
               << "Counter Units:\n"
               << "  CAS_COUNT:    Raw values = cache line accesses (typically 64B each)\n"
               << "  UPI_FLITS:    Raw values = flit counts (cross-socket traffic)\n"
-              << "  NVIDIA_GRACE: Read = 32-byte beats (cmem_rd_data*32), Write = bytes (cmem_wr_total_bytes)\n";
+              << "  NVIDIA_GRACE: Read = 32-byte beats (cmem_rd_data*32), Write = bytes (cmem_wr_total_bytes)\n"
+              << "  TOTAL_BYTES:  Raw values = bytes\n";
 }

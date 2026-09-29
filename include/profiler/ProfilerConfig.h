@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -50,7 +52,9 @@ enum class ProfilerBackend {
     PERF_EVENT,
     PERF_STAT,
     LIKWID,
-    VTUNE
+    VTUNE,
+    IMC,
+    UPROF
 };
 
 /**

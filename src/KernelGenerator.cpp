@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -240,6 +242,8 @@ KernelGenerator::KernelGenerator(const KernelConfig& config, const CPUCapabiliti
         kernel_config_.resolved_cache_line_bytes = std::max(0, resolvedStoreLineBytes(resolveStoreLinePolicy(kernel_config_.store_line_policy), capabilities_));
     }
 
+    kernel_config_.apple_silicon = capabilities_.isAppleSilicon();
+
     assembler_ = architecture_->createAssembler(kernel_config_);
 }
 
@@ -300,7 +304,9 @@ std::string KernelGenerator::generate_multiseq_function(int ratio) {
 
     oss << asm_gen->generateAsmStart();
     oss << asm_gen->generateVectorRegisterInit();
-    oss << "      \"..L_" << ratio << ":\\n\"\n";
+    oss << "      \""
+        << ((capabilities_.arch == CPUArchitecture::ARM64 && kernel_config_.isa_mode == ISAMode::SCALAR)
+            ? "3" : "..L_" + std::to_string(ratio)) << ":\\n\"\n";
 
     std::shared_ptr<ISA> isa = resolveISAForMode(architecture_.get(), kernel_config_.isa_mode, capabilities_);
     int bytes_per_op = kernel_config_.resolved_bytes_per_mem_op;

@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -33,15 +35,18 @@
 
 #include "arch/arm/ArmArchitecture.h"
 #include "arch/arm/ArmAssembler.h"
+#include "arch/arm/ArmISAUtils.h"
 #include "arch/arm/counters/A64FXCounters.h"
 #include "arch/arm/counters/Graviton3Counters.h"
 #include "arch/arm/counters/NvidiaGraceCounters.h"
+#include "arch/arm/counters/AppleSiliconCounters.h"
 #include "arch/arm/ArmCounters.h"
 #include "architecture/ArchitectureRegistry.h"
+#include "SystemDetection.h"
+#include "utils/StringUtils.h"
 #include <algorithm>
 #include <string>
 #include <cctype>
-#include <unistd.h>
 
 static ArchitectureRegistrar<ArmArchitecture> arm_registrar;
 
@@ -73,30 +78,23 @@ std::unique_ptr<KernelAssembler> ArmArchitecture::createAssembler(const KernelCo
 }
 
 std::unique_ptr<BandwidthCounterStrategy> ArmArchitecture::createCounterStrategy(const CPUCapabilities& caps) const {
-    auto toLower = [](const std::string& str) {
-        std::string result = str;
-        std::transform(result.begin(), result.end(), result.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        return result;
-    };
+    if (caps.isAppleSilicon()) {
+        return std::make_unique<AppleSiliconCounters>();
+    }
 
-    auto modelContains = [&](const std::string& token) {
-        return toLower(caps.model_name).find(toLower(token)) != std::string::npos;
-    };
-
-    if (modelContains("a64fx")) {
+    if (string_utils::contains_ci(caps.model_name,"a64fx")) {
         return std::make_unique<A64FXCounters>();
-    } else if (modelContains("graviton3") || modelContains("graviton4")) {
+    } else if (string_utils::contains_ci(caps.model_name,"graviton3") || string_utils::contains_ci(caps.model_name,"graviton4")) {
         return std::make_unique<Graviton3Counters>();
-    } else if (modelContains("grace")) {
+    } else if (string_utils::contains_ci(caps.model_name,"grace")) {
         return std::make_unique<NvidiaGraceCounters>(caps);
     }
 
-    if (modelContains("fujitsu")) {
+    if (string_utils::contains_ci(caps.model_name,"fujitsu")) {
         return std::make_unique<A64FXCounters>();
-    } else if (modelContains("graviton") || modelContains("neoverse")) {
+    } else if (string_utils::contains_ci(caps.model_name,"graviton") || string_utils::contains_ci(caps.model_name,"neoverse")) {
         return std::make_unique<Graviton3Counters>();
-    } else if (modelContains("nvidia")) {
+    } else if (string_utils::contains_ci(caps.model_name,"nvidia")) {
         return std::make_unique<NvidiaGraceCounters>(caps);
     }
 
@@ -105,6 +103,7 @@ std::unique_ptr<BandwidthCounterStrategy> ArmArchitecture::createCounterStrategy
 
 std::vector<std::shared_ptr<ISA>> ArmArchitecture::getSupportedISAs() const {
     return {
+        makeArmISA(ISAMode::SCALAR, "SCALAR", 64, arm_isa_utils::scalarDataRegisters.size()),
         makeArmISA(ISAMode::NEON_NATIVE, "NEON_NATIVE", 128, 32),
         makeArmISA(ISAMode::NEON_PAIR, "NEON_PAIR", 256, 16),
         makeArmISA(ISAMode::SVE, "SVE", 512, 32),

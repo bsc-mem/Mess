@@ -2,6 +2,9 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
+ *          javier.beiro     [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -55,11 +58,17 @@ enum class CPUArchitecture {
     UNKNOWN
 };
 
+enum class GPUArchitecture {
+    NVIDIA,
+    NONE
+};
+
 /** @brief CPU vendors recognized by Mess. */
 enum class CPUVendor {
     INTEL,
     AMD,
     ARM,
+    APPLE,
     IBM,
     SIFIVE,
     UNKNOWN
@@ -108,6 +117,12 @@ struct CPUCapabilities {
 
     bool isA64FX() const { return model_name.find("A64FX") != std::string::npos; }
 
+    bool isAppleSilicon() const {
+        return arch == CPUArchitecture::ARM64 &&
+               (vendor == CPUVendor::APPLE ||
+                model_name.find("Apple") != std::string::npos);
+    }
+
     bool hasOnPackageHBM() const;
 
     // Runtime vector lengths (when detectable).
@@ -126,6 +141,7 @@ struct CPUCapabilities {
     int memory_channels;
     std::string memory_type;
     std::string memory_frequency;
+    bool cpu_inferred;
     int bus_width;
 
     double upi_freq;
@@ -136,6 +152,32 @@ struct CPUCapabilities {
 
     double nvlink_bw_gb_s = 0.0;
 };
+
+struct GPUInfo {
+    std::string name;
+    size_t memory_bytes = 0;
+    double max_mem_clock_mhz = 0.0;
+    int bus_width_bits = 0;
+    std::string compute_capability;
+};
+
+struct GPUCapabilities {
+    bool has_gpu = false;
+    GPUArchitecture gpu_arch = GPUArchitecture::NONE;
+    int num_gpus = 0;
+    std::vector<GPUInfo> gpus;
+};
+
+struct NvidiaPlatformInfo {
+    std::string model;
+    std::string compatible;
+
+    bool has_nvidia_scf_pmu = false;
+
+};
+
+const NvidiaPlatformInfo& get_nvidia_platform_info();
+bool has_nvidia_scf_pmu();
 
 /**
  * @brief Detects hardware capabilities and exposes them in Mess's normalized format.
@@ -153,11 +195,14 @@ class SystemDetector {
 private:
     system_info sys_info_;
     CPUCapabilities capabilities_;
+    NvidiaPlatformInfo nvidia_platform_;
+    GPUCapabilities gpu_capabilities_;
 
     bool detect_x86_capabilities();
     bool detect_arm_capabilities();
     bool detect_powerpc_capabilities();
     bool detect_riscv_capabilities();
+    bool detect_gpu_capabilities();
 
 public:
     SystemDetector();
@@ -166,6 +211,8 @@ public:
     bool detect();
     const system_info& get_system_info() const { return sys_info_; }
     const CPUCapabilities& get_capabilities() const { return capabilities_; }
+    const NvidiaPlatformInfo& get_nvidia_platform_info() const { return nvidia_platform_; }
+    const GPUCapabilities& get_gpu_capabilities() const { return gpu_capabilities_; }
 
     void print(std::ostream& os, int verbosity) const;
 };

@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -65,7 +67,7 @@ public:
 
     bool is_available() const override;
 
-    bool start_async(const std::vector<int>& cores, const std::vector<pid_t>& pids) override;
+    bool start_async(const std::vector<int>& cores, const std::vector<platform::ProcessId>& pids) override;
 
     InstructionSamplerStats stop_and_process(double cpu_freq_ghz) override;
 
@@ -81,15 +83,15 @@ private:
     void sampling_thread_func();
 
     bool parse_perf_script_data(const std::string &perf_data_path,
-                                const std::vector<pid_t> &pids,
+                                const std::vector<platform::ProcessId> &pids,
                                 std::vector<uint64_t> &ram_latencies);
 
     bool parse_perf_report_data(const std::string &perf_data_path,
-                                const std::vector<pid_t> &pids,
+                                const std::vector<platform::ProcessId> &pids,
                                 std::vector<uint64_t> &ram_latencies);
 
     void collect_samples(const std::string &perf_data_path,
-                         const std::vector<pid_t> &pids,
+                         const std::vector<platform::ProcessId> &pids,
                          std::vector<uint64_t> &ram_latencies);
 
     std::atomic<bool> is_running_{false};

@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -37,6 +39,7 @@
 #include "SystemDetection.h"
 #include "Utils.h"
 #include "utils/SubprocessCapture.h"
+#include "measurement/BandwidthSampleAggregation.h"
 #include "measurement/BandwidthStabilizer.h"
 #include <iostream>
 #include <fstream>
@@ -60,10 +63,6 @@ std::string LikwidBandwidthMeasurer::find_likwid_binary() const {
         return cached_likwid_binary_;
     }
 
-    if (const char* env_p = std::getenv("LIKWID_PERFCTR_PATH")) {
-        cached_likwid_binary_ = std::string(env_p);
-        return cached_likwid_binary_;
-    }
     if (run_command_success("which likwid-perfctr > /dev/null 2>&1")) {
         cached_likwid_binary_ = "likwid-perfctr";
         return cached_likwid_binary_;
@@ -768,7 +767,6 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
         if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
             return false;
         }
-        traffic_gen_manager_->wait_for_traffic_gen_ready(120);
         return true;
     };
 
@@ -784,7 +782,6 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     
     double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
         caps_, expected_cores, socket_cores, is_remote);
-    if (theoretical_peak_gb_s <= 0) theoretical_peak_gb_s = 300.0;
     TrafficGenHealthChecker health_checker;
     health_checker.is_pid_alive = [this](int pid) -> bool {
         return traffic_gen_manager_->is_traffic_gen_running(pid);
@@ -835,6 +832,7 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     BandwidthStabilizer stabilizer(
         theoretical_peak_gb_s, pause, health_checker,
         window_size, 0.05, config_.verbosity);
+    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
     
     int total_samples = 0;
     int max_samples = static_cast<int>(200 * sampling_interval_ms_);
@@ -1015,15 +1013,10 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     kill_and_pclose();
 
     if (success) {
-        long long aggregate_cas_rd = 0;
-        long long aggregate_cas_wr = 0;
         const auto& samples = stabilizer.get_samples();
-        for (const auto& sample : samples) {
-            aggregate_cas_rd += sample.cas_rd;
-            aggregate_cas_wr += sample.cas_wr;
-        }
+        const auto totals = measurement::aggregate_cas_samples(samples);
         
-        if (type == CounterType::UPI_FLITS && (aggregate_cas_rd + aggregate_cas_wr) == 0) {
+        if (type == CounterType::UPI_FLITS && (totals.read + totals.write) == 0) {
             std::cerr << "\n\033[1;31mERROR: Zero bandwidth detected on UPI counters!\033[0m" << '\n';
             std::cerr << "       The selected UPI counters are reporting 0 traffic." << '\n';
             std::cerr << "       This usually means either:" << '\n';
@@ -1034,8 +1027,8 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
             return false;
         }
 
-        last_cas_rd = aggregate_cas_rd;
-        last_cas_wr = aggregate_cas_wr;
+        last_cas_rd = totals.read;
+        last_cas_wr = totals.write;
         last_elapsed = samples.size() * (sampling_interval_ms_ / 1000.0);
         
         samples_taken = total_samples;

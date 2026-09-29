@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,6 +34,7 @@
  */
 
 #include "Measurement.h"
+#include "measurement/WorkerReadiness.h"
 #include "architecture/ArchitectureRegistry.h"
 #include "architecture/BandwidthCounterStrategy.h"
 #include "Utils.h"
@@ -44,7 +47,12 @@ BandwidthMeasurer::BandwidthMeasurer(const BenchmarkConfig& config, const system
       traffic_gen_manager_(traffic_gen_manager),
       numa_resolver_(std::move(numa_resolver)),
       mode_(mode),
-      sampling_interval_ms_(50.0) {
+      #ifdef __APPLE__ 
+      sampling_interval_ms_(1000.0)
+      #else
+      sampling_interval_ms_(50.0)
+      #endif
+      {
     if (sys_info_.socket_count > 0 && sys_info_.sockets[0].cache_count > 0) {
         cached_cache_line_size_ = sys_info_.sockets[0].caches[0].line_size_bytes;
     }
@@ -58,6 +66,10 @@ double BandwidthMeasurer::calculate_bandwidth_gbps(long long cas_rd, long long c
         double bytes_rd = static_cast<double>(cas_rd) * 32.0;
         double bytes_wr = static_cast<double>(cas_wr);
         return (bytes_rd + bytes_wr) / (elapsed_s * 1e9);
+    }
+
+    if (type == CounterType::TOTAL_BYTES) {
+        return static_cast<double>(cas_rd + cas_wr) / (elapsed_s * 1e9);
     }
 
     return (cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
@@ -79,17 +91,25 @@ void BandwidthMeasurer::ensure_scaling_factor_cached() const {
 
 int BandwidthMeasurer::get_traffic_gen_cores() const {
     int cores = get_default_traffic_gen_cores(sys_info_);
-    if (config_.traffic_gen_cores > 0 && config_.traffic_gen_cores <= sys_info_.sockets[0].core_count - 1) {
+    int max_cores = sys_info_.sockets[0].core_count - 1;
+
+
+    if (config_.traffic_gen_cores > 0 && config_.traffic_gen_cores <= max_cores) {
         cores = config_.traffic_gen_cores;
     }
     return cores;
 }
 
 bool BandwidthMeasurer::relaunch_traffic_gen(int ratio, int pause, int traffic_gen_cores) {
-    if (!traffic_gen_manager_) {
+    if (!traffic_gen_manager_ || !storage_) {
         return false;
     }
     std::vector<int> traffic_gen_mem_nodes = numa_resolver_ ? numa_resolver_() : std::vector<int>{0};
     std::string traffic_gen_log_file = storage_->traffic_gen_log_file_path(ratio, pause);
-    return traffic_gen_manager_->relaunch_traffic_gen(ratio, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, mode_);
+    if (!traffic_gen_manager_->relaunch_traffic_gen(ratio, pause, traffic_gen_cores,
+                                                  traffic_gen_mem_nodes, traffic_gen_log_file, mode_)) {
+        traffic_gen_manager_->kill_all_traffic_gen();
+        return false;
+    }
+    return measurement::wait_for_ready_workers(*traffic_gen_manager_);
 }

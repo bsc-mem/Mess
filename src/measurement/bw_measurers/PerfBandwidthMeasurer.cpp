@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,12 +34,16 @@
  */
 
 #include "measurement/bw_measurers/PerfBandwidthMeasurer.h"
+#include "platform/Console.h"   // platform::glyph
+#include "measurement/BandwidthSampleAggregation.h"
 #include "measurement/BandwidthStabilizer.h"
+#include "measurement/PerfStatCsv.h"
 #include "architecture/ArchitectureRegistry.h"
 #include "architecture/BandwidthCounterStrategy.h"
 #include "SystemDetection.h"
 #include "Utils.h"
 #include "utils/SubprocessCapture.h"
+#include "utils/StringUtils.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -57,22 +63,6 @@
 #include <sys/wait.h>
 
 namespace {
-std::string trim_copy(const std::string& value) {
-    const size_t begin = value.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) {
-        return "";
-    }
-    const size_t end = value.find_last_not_of(" \t\r\n");
-    return value.substr(begin, end - begin + 1);
-}
-
-std::string to_lower_ascii(std::string value) {
-    for (char& ch : value) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
-    return value;
-}
-
 std::string make_membind_arg(const std::vector<int>& mem_nodes) {
     if (mem_nodes.empty()) {
         return "0";
@@ -91,277 +81,10 @@ int get_perf_bind_cpu() {
     return cache.initialized ? cache.ptr_chase_cpu : find_ptr_chase_cpu().first;
 }
 
-bool parse_long_long_token(const std::string& token, long long& value) {
-    const std::string trimmed = trim_copy(token);
-    if (trimmed.empty()) {
-        return false;
-    }
-
-    try {
-        size_t consumed = 0;
-        value = std::stoll(trimmed, &consumed, 10);
-        return consumed == trimmed.size();
-    } catch (...) {
-        return false;
-    }
-}
-
-bool parse_double_token(const std::string& token, double& value) {
-    const std::string trimmed = trim_copy(token);
-    if (trimmed.empty()) {
-        return false;
-    }
-
-    try {
-        size_t consumed = 0;
-        value = std::stod(trimmed, &consumed);
-        return consumed == trimmed.size();
-    } catch (...) {
-        return false;
-    }
-}
-
-bool token_looks_like_event_name(const std::string& token) {
-    const std::string trimmed = trim_copy(token);
-    if (trimmed.empty()) {
-        return false;
-    }
-
-    // Accept canonical PMU-like names and raw encodings (e.g. r17 / r1a2).
-    bool has_name_separator = false;
-    for (unsigned char ch : trimmed) {
-        if (ch == '/' || ch == '_' || ch == '.' || ch == ':' || ch == '-') {
-            has_name_separator = true;
-            break;
-        }
-    }
-    if (has_name_separator) {
-        return true;
-    }
-
-    if ((trimmed.size() >= 2) && (trimmed[0] == 'r' || trimmed[0] == 'R')) {
-        for (size_t i = 1; i < trimmed.size(); ++i) {
-            if (!std::isxdigit(static_cast<unsigned char>(trimmed[i]))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    return trimmed == "cycles" || trimmed == "instructions";
-}
-
-bool token_looks_like_scope_name(const std::string& token) {
-    const std::string trimmed = trim_copy(token);
-    if (trimmed.empty()) {
-        return false;
-    }
-
-    if (trimmed.size() >= 2 && (trimmed[0] == 'S' || trimmed[0] == 's')) {
-        for (size_t i = 1; i < trimmed.size(); ++i) {
-            if (!std::isdigit(static_cast<unsigned char>(trimmed[i]))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    if (trimmed.size() >= 4 &&
-        (trimmed.rfind("CPU", 0) == 0 || trimmed.rfind("cpu", 0) == 0)) {
-        for (size_t i = 3; i < trimmed.size(); ++i) {
-            if (!std::isdigit(static_cast<unsigned char>(trimmed[i]))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    return false;
-}
-
-bool token_looks_like_metric_unit(const std::string& token) {
-    const std::string trimmed = trim_copy(token);
-    if (trimmed.empty()) {
-        return false;
-    }
-
-    const std::string unit = to_lower_ascii(trimmed);
-    return unit == "b" || unit == "kb" || unit == "mb" || unit == "gb" ||
-           unit == "tb" || unit == "kib" || unit == "mib" || unit == "gib" ||
-           unit == "tib" || unit == "%" || unit == "hz" || unit == "khz" ||
-           unit == "mhz" || unit == "ghz";
-}
-
-struct PerfCsvRow {
-    double timestamp = 0.0;
-    std::string scope;
-    long long value = 0;
-    double metric_value = 0.0;
-    std::string metric_unit;
-    bool has_metric_value = false;
-    std::string event_name;
-    bool has_timestamp = false;
-};
-
-double metric_unit_to_bytes_multiplier(const std::string& unit_raw) {
-    std::string unit = to_lower_ascii(trim_copy(unit_raw));
-    if (unit.empty()) return 0.0;
-
-    const size_t slash = unit.find('/');
-    if (slash != std::string::npos) {
-        unit = unit.substr(0, slash);
-    }
-
-    if (unit == "b") return 1.0;
-    if (unit == "kb") return 1e3;
-    if (unit == "mb") return 1e6;
-    if (unit == "gb") return 1e9;
-    if (unit == "tb") return 1e12;
-    if (unit == "kib") return 1024.0;
-    if (unit == "mib") return 1024.0 * 1024.0;
-    if (unit == "gib") return 1024.0 * 1024.0 * 1024.0;
-    if (unit == "tib") return 1024.0 * 1024.0 * 1024.0 * 1024.0;
-    return 0.0;
-}
-
-long long normalize_perf_row_value(const PerfCsvRow& row, int cache_line_size) {
-    if (!row.has_metric_value) {
-        return row.value;
-    }
-
-    const double bytes_multiplier = metric_unit_to_bytes_multiplier(row.metric_unit);
-    if (bytes_multiplier > 0.0) {
-        const double bytes = row.metric_value * bytes_multiplier;
-        if (cache_line_size > 0) {
-            return static_cast<long long>(std::llround(bytes / static_cast<double>(cache_line_size)));
-        }
-        return static_cast<long long>(std::llround(bytes));
-    }
-
-    return static_cast<long long>(std::llround(row.metric_value));
-}
-
-bool parse_perf_stat_csv_row(const std::string& line, bool expect_timestamp, PerfCsvRow& row) {
-    std::vector<std::string> fields;
-    std::stringstream ss(line);
-    std::string field;
-    while (std::getline(ss, field, ',')) {
-        fields.push_back(trim_copy(field));
-    }
-
-    if (fields.empty()) {
-        return false;
-    }
-
-    row = PerfCsvRow{};
-
-    size_t index = 0;
-    if (expect_timestamp) {
-        if (!parse_double_token(fields[index], row.timestamp)) {
-            return false;
-        }
-        row.has_timestamp = true;
-        ++index;
-    }
-    long long parsed_value = 0;
-
-    auto assign_raw = [&](size_t scope_index, size_t value_index, size_t event_index) -> bool {
-        if (value_index >= fields.size() || event_index >= fields.size()) {
-            return false;
-        }
-        if (!parse_long_long_token(fields[value_index], parsed_value)) {
-            return false;
-        }
-        if (!token_looks_like_event_name(fields[event_index])) {
-            return false;
-        }
-        row.scope = (scope_index < fields.size()) ? fields[scope_index] : "";
-        row.value = parsed_value;
-        row.has_metric_value = false;
-        row.metric_value = 0.0;
-        row.metric_unit.clear();
-        row.event_name = fields[event_index];
-        return true;
-    };
-
-    auto assign_metric = [&](size_t scope_index, size_t metric_value_index, size_t unit_index, size_t event_index) -> bool {
-        if (metric_value_index >= fields.size() || event_index >= fields.size()) {
-            return false;
-        }
-        if (unit_index < fields.size() && !fields[unit_index].empty() &&
-            !token_looks_like_metric_unit(fields[unit_index])) {
-            return false;
-        }
-        if (!token_looks_like_event_name(fields[event_index])) {
-            return false;
-        }
-        double metric_value = 0.0;
-        if (!parse_double_token(fields[metric_value_index], metric_value)) {
-            return false;
-        }
-        row.scope = (scope_index < fields.size()) ? fields[scope_index] : "";
-        row.value = static_cast<long long>(std::llround(metric_value));
-        row.metric_value = metric_value;
-        row.metric_unit = (unit_index < fields.size()) ? fields[unit_index] : "";
-        row.has_metric_value = true;
-        row.event_name = fields[event_index];
-        return true;
-    };
-
-    const bool has_scope = (index < fields.size()) && token_looks_like_scope_name(fields[index]);
-
-    // Most specific first: metric-output rows with explicit raw/runtime fields after event.
-    // Example A:
-    //   time,S0,1,1491.27,MiB,uncore_imc_0/cas_count_read/,51018789,...
-    if (has_scope && assign_metric(index, index + 2, index + 3, index + 4)) {
-        // Ambiguous shape guard: if the parsed "event" token is actually a unit token,
-        // retry with the 7-column scoped metric layout below.
-        if (token_looks_like_metric_unit(row.event_name)) {
-            row = PerfCsvRow{};
-        } else {
-            return true;
-        }
-    }
-    // Example B:
-    //   time,S0,1,1491.27,MiB,uncore_imc_0/cas_count_read/,51018789,...
-    if (has_scope && assign_metric(index, index + 3, index + 4, index + 5)) {
-        return true;
-    }
-    // Example C:
-    //   time,S0,1491.27,MiB,uncore_imc_0/cas_count_read/,51018789,...
-    if (has_scope && assign_metric(index, index + 1, index + 2, index + 3)) {
-        return true;
-    }
-
-    // Old raw-count CSV rows without unit/metric column.
-    // Example:
-    //   time,S0,1,51018789,,uncore_imc_0/cas_count_read/,...
-    if (has_scope && assign_raw(index, index + 2, index + 4)) {
-        return true;
-    }
-    // Example:
-    //   time,S0,51018789,,uncore_imc_0/cas_count_read/,...
-    if (has_scope && assign_raw(index, index + 1, index + 3)) {
-        return true;
-    }
-
-    // PID/system-wide non-scoped rows.
-    // Example:
-    //   time,1491.27,MiB,uncore_imc/cas_count_read/,51018789,...
-    if (!has_scope && assign_metric(fields.size(), index, index + 1, index + 2)) {
-        return true;
-    }
-    // Example:
-    //   time,51018789,,uncore_imc/cas_count_read/,...
-    if (!has_scope && assign_raw(fields.size(), index, index + 2)) {
-        return true;
-    }
-
-    return false;
-}
-
 bool use_per_socket_aggregation(const BandwidthCounterSelection& selection) {
-    if (selection.type != CounterType::CAS_COUNT && selection.type != CounterType::NVIDIA_GRACE) {
+    if (selection.type != CounterType::CAS_COUNT &&
+        selection.type != CounterType::NVIDIA_GRACE &&
+        selection.type != CounterType::TOTAL_BYTES) {
         return true;
     }
     return !selection.cas.uses_read_subtract_formula;
@@ -390,9 +113,9 @@ std::pair<std::string, std::string> detect_unc_m_aggregate_events() {
         if (token.empty()) {
             continue;
         }
-        if (to_lower_ascii(token) == "unc_m_cas_count.rd") {
+        if (string_utils::to_lower(token) == "unc_m_cas_count.rd") {
             cached.first = "unc_m_cas_count.rd";
-        } else if (to_lower_ascii(token) == "unc_m_cas_count.wr") {
+        } else if (string_utils::to_lower(token) == "unc_m_cas_count.wr") {
             cached.second = "unc_m_cas_count.wr";
         }
     }
@@ -404,6 +127,11 @@ std::string build_preferred_perf_events(const BandwidthCounterSelection& selecti
     std::string events = selection.get_all_events_string();
 
     if (selection.type != CounterType::CAS_COUNT || selection.cas.uses_read_subtract_formula) {
+        return events;
+    }
+
+    if (events.find("uncore_type_14_") != std::string::npos ||
+        events.find("uncore_hbm_") != std::string::npos) {
         return events;
     }
 
@@ -426,7 +154,7 @@ bool use_pid_attach_mode(const BandwidthCounterSelection& selection) {
     return selection.cas.uses_read_subtract_formula;
 }
 
-std::string join_pid_list(const std::vector<pid_t>& pids) {
+std::string join_pid_list(const std::vector<platform::ProcessId>& pids) {
     std::string joined;
     for (size_t i = 0; i < pids.size(); ++i) {
         if (i > 0) {
@@ -457,7 +185,7 @@ std::string build_perf_scope_args(const BandwidthCounterSelection& selection,
         return "";
     }
 
-    const std::vector<pid_t> worker_pids = traffic_gen_manager->traffic_gen_worker_pids();
+    const std::vector<platform::ProcessId> worker_pids = traffic_gen_manager->traffic_gen_worker_pids();
     if (worker_pids.empty()) {
         return "";
     }
@@ -528,7 +256,7 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
 
     ensure_a64fx_pmu_available();
 
-    std::string cmd = std::string("cd ") + storage_->bandwidth_dir() + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
+    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
     if (!attach_mode) {
         (void)perf_bind_cpu;
         (void)membind_arg;
@@ -570,6 +298,7 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
     std::map<std::string, long long> sum_extra;
     long long sum_rd = 0, sum_wr = 0, sum_combined = 0;
     double last_timestamp = -1.0;
+    double previous_interval_end = 0.0;
     double accumulated_time = 0.0;
     int samples_read = 0;
     int total_samples_seen = 0;
@@ -582,20 +311,21 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
             continue;
         }
 
-        PerfCsvRow row;
-        if (parse_perf_stat_csv_row(buffer, true, row)) {
+        perf_stat_csv::Row row;
+        if (perf_stat_csv::parse_row(buffer, true, row)) {
             if (row.scope == "S1") {
                 continue;
             }
             double timestamp = row.timestamp;
-            long long value = normalize_perf_row_value(row, cache_line_size);
+            long long value = perf_stat_csv::normalize_row_value(row, cache_line_size);
             const std::string& event_name = row.event_name;
 
             if (last_timestamp >= 0 && timestamp != last_timestamp) {
                 long long effective_rd = 0;
                 long long effective_wr = 0;
                 apply_bandwidth_formula(selection, current_sample_rd, current_sample_wr, current_extra, effective_rd, effective_wr);
-                double duration = timestamp - last_timestamp;
+                double duration = last_timestamp - previous_interval_end;
+                previous_interval_end = last_timestamp;
                 if (duration < 0.000001) duration = interval / 1000.0;
 
                 total_samples_seen++;
@@ -705,7 +435,6 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
         if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
             return false;
         }
-        traffic_gen_manager_->wait_for_traffic_gen_ready(120);
         return true;
     };
 
@@ -730,16 +459,20 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
     double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
         caps_, expected_cores, socket_cores, is_remote);
 
-    if (theoretical_peak_gb_s <= 0) {
-        theoretical_peak_gb_s = 300.0;
-    }
-
     if (verbose3) {
         double full_peak = TheoreticalPeakCalculator::calculate_from_capabilities(caps_, is_remote);
-        std::cout << "      [Stabilizer] Theoretical peak: " << std::fixed << std::setprecision(1) 
-                  << full_peak << " GB/s, Achievable (" << expected_cores << " cores): "
-                  << theoretical_peak_gb_s << " GB/s, Noise floor: " 
-                  << TheoreticalPeakCalculator::get_noise_floor(theoretical_peak_gb_s) << " GB/s" << '\n';
+        auto fmt_gb = [](double v) -> std::string {
+            if (v <= 0.0) return std::string("unknown");
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << v << " GB/s";
+            return oss.str();
+        };
+        std::cout << "      [Stabilizer] Theoretical peak: " << fmt_gb(full_peak)
+                  << ", Achievable (" << expected_cores << " cores): " << fmt_gb(theoretical_peak_gb_s)
+                  << ", Noise floor: "
+                  << std::fixed << std::setprecision(2)
+                  << TheoreticalPeakCalculator::get_noise_floor(theoretical_peak_gb_s)
+                  << " GB/s" << '\n';
     }
     TrafficGenHealthChecker health_checker;
     health_checker.is_pid_alive = [this](int pid) -> bool {
@@ -763,6 +496,9 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
             double bytes_rd = static_cast<double>(cas_rd) * 32.0;
             double bytes_wr = static_cast<double>(cas_wr);
             return (bytes_rd + bytes_wr) / (elapsed_s * 1e9);
+        }
+        if (counter_selection_.type == CounterType::TOTAL_BYTES) {
+            return static_cast<double>(cas_rd + cas_wr) / (elapsed_s * 1e9);
         }
         if (counter_selection_.type == CounterType::UPI_FLITS) {
             return static_cast<double>(cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
@@ -791,7 +527,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
 
     ensure_a64fx_pmu_available();
 
-    std::string cmd = std::string("cd ") + storage_->bandwidth_dir() + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
+    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
     if (!attach_mode) {
         (void)perf_bind_cpu;
         (void)membind_arg;
@@ -833,6 +569,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
     BandwidthStabilizer stabilizer(
         theoretical_peak_gb_s, pause, health_checker,
         fast_resume ? 5 : 7, 0.05, config_.verbosity);
+    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
     
     int total_samples = 0;
     const int OVERALL_TIMEOUT_SECONDS = 60;
@@ -846,6 +583,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
     std::map<std::string, long long> aggregated_extra;
     std::map<std::string, long long> final_extra;
     double last_timestamp = -1.0;
+    double previous_interval_end = 0.0;
 
     long long final_cas_rd = 0, final_cas_wr = 0;
     double final_elapsed = sampling_interval_ms_ / 1000.0;
@@ -944,8 +682,8 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
             continue;
         }
 
-        PerfCsvRow row;
-        const bool parsed = parse_perf_stat_csv_row(buffer, true, row);
+        perf_stat_csv::Row row;
+        const bool parsed = perf_stat_csv::parse_row(buffer, true, row);
         
         if (verbose4) {
             std::cout << "      [PERF RAW] parsed=" << parsed << " line: " << buffer;
@@ -960,14 +698,15 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
                 continue;
             }
             double timestamp = row.timestamp;
-            long long value = normalize_perf_row_value(row, std::max(1, cached_cache_line_size_));
+            long long value = perf_stat_csv::normalize_row_value(row, std::max(1, cached_cache_line_size_));
             const std::string& event_name = row.event_name;
 
             if (last_timestamp >= 0 && timestamp != last_timestamp) {
                 long long effective_rd = 0;
                 long long effective_wr = 0;
                 apply_bandwidth_formula(selection, sample_cas_rd, sample_cas_wr, sample_extra, effective_rd, effective_wr);
-                double duration = timestamp - last_timestamp;
+                double duration = last_timestamp - previous_interval_end;
+                previous_interval_end = last_timestamp;
                 double target_duration = sampling_interval_ms_ / 1000.0;
                 double normalization_factor = 1.0;
                 
@@ -1010,7 +749,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
 
                     if (total_samples > max_samples) {
                         if (config_.verbosity >= 1) {
-                            std::cout << "\n    ⚠ WARNING: BW did not stabilize after " << OVERALL_TIMEOUT_SECONDS << "s" << '\n';
+                            std::cout << "\n    " << platform::glyph::kWarning << " WARNING: BW did not stabilize after " << OVERALL_TIMEOUT_SECONDS << "s" << '\n';
                             std::cout << "    Killing TrafficGen and triggering retry..." << '\n';
                         }
                         kill_and_pclose();
@@ -1059,6 +798,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
                         std::string counter_label = "CAS";
                         if (selection.type == CounterType::UPI_FLITS) counter_label = "UPI";
                         else if (selection.type == CounterType::NVIDIA_GRACE) counter_label = "GRACE";
+                        else if (selection.type == CounterType::TOTAL_BYTES) counter_label = "BYTES";
                         else if (selection.cas.uses_read_subtract_formula) counter_label = "A64FX";
                         
                         bool has_distinct_rw = selection.cas.has_read_write;
@@ -1110,15 +850,10 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
     kill_and_pclose();
 
     if (success) {
-        long long aggregate_cas_rd = 0;
-        long long aggregate_cas_wr = 0;
         const auto& samples = stabilizer.get_samples();
-        for (const auto& sample : samples) {
-            aggregate_cas_rd += sample.cas_rd;
-            aggregate_cas_wr += sample.cas_wr;
-        }
-        last_cas_rd = aggregate_cas_rd;
-        last_cas_wr = aggregate_cas_wr;
+        const auto totals = measurement::aggregate_cas_samples(samples);
+        last_cas_rd = totals.read;
+        last_cas_wr = totals.write;
         last_elapsed = samples.size() * (sampling_interval_ms_ / 1000.0);
 
         if (verbose3) {
@@ -1223,17 +958,17 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
             continue;
         }
 
-        PerfCsvRow row;
+        perf_stat_csv::Row row;
 
         if (!summary_mode) {
-            if (!parse_perf_stat_csv_row(buffer, true, row)) {
+            if (!perf_stat_csv::parse_row(buffer, true, row)) {
                 continue;
             }
             if (row.scope == "S1") {
                 continue;
             }
         } else {
-            if (!parse_perf_stat_csv_row(buffer, false, row)) {
+            if (!perf_stat_csv::parse_row(buffer, false, row)) {
                 continue;
             }
             if (row.scope == "S1") {
@@ -1260,7 +995,7 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
         }
 
         EventClassification ec = EventClassification::classify(row.event_name, selection);
-        const long long row_value = normalize_perf_row_value(row, std::max(1, cached_cache_line_size_));
+        const long long row_value = perf_stat_csv::normalize_row_value(row, std::max(1, cached_cache_line_size_));
 
         if (ec.is_extra) {
             EventClassification::accumulate_extra(current_extra, ec.extra_key, row_value);

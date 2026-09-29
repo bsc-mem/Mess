@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,9 +34,12 @@
  */
 
 #include "measurement/bw_measurers/PcmBandwidthMeasurer.h"
+#include "platform/Console.h"   // platform::glyph
+#include "measurement/BandwidthSampleAggregation.h"
 #include "measurement/BandwidthStabilizer.h"
 #include "measurement/TheoreticalPeakCalculator.h"
 #include "Utils.h"
+#include "utils/StringUtils.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -50,33 +55,10 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 
 namespace {
-
-std::string trim_copy(const std::string& value) {
-    const size_t first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-        return "";
-    }
-    const size_t last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
-
-std::string shell_quote(const std::string& value) {
-    std::string quoted;
-    quoted.reserve(value.size() + 2);
-    quoted.push_back('\'');
-    for (char c : value) {
-        if (c == '\'') {
-            quoted += "'\\''";
-        } else {
-            quoted.push_back(c);
-        }
-    }
-    quoted.push_back('\'');
-    return quoted;
-}
 
 struct PcmCxlSample {
     double read_mbps = 0.0;
@@ -150,8 +132,29 @@ bool parse_pcm_cxl_samples(FILE* pipe,
 
     char buffer[16384];
     int sample_count = 0;
+    const int fd = fileno(pipe);
+    if (fd < 0) {
+        return false;
+    }
 
-    while (fgets(buffer, sizeof(buffer), pipe)) {
+    while (max_samples == 0 || samples_out.size() < max_samples) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+
+        struct timeval tv;
+        tv.tv_sec = 6;
+        tv.tv_usec = 0;
+
+        int ready = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+        if (ready <= 0) {
+            return sample_count > 0;
+        }
+
+        if (!fgets(buffer, sizeof(buffer), pipe)) {
+            break;
+        }
+
         std::string line(buffer);
         if (line.empty()) {
             continue;
@@ -254,22 +257,11 @@ std::string find_executable_in_path(const std::string& binary) {
     return "";
 }
 
-} // namespace
+}
 
 std::string PcmBandwidthMeasurer::find_pcm_binary() const {
     if (!cached_pcm_binary_.empty()) {
         return cached_pcm_binary_;
-    }
-
-    if (const char* env_p = std::getenv("PCM_PATH")) {
-        std::filesystem::path configured(env_p);
-        if (std::filesystem::is_directory(configured)) {
-            configured /= "pcm-memory";
-        }
-        if (access(configured.c_str(), X_OK) == 0) {
-            cached_pcm_binary_ = configured.string();
-            return cached_pcm_binary_;
-        }
     }
 
     const std::string in_path = find_executable_in_path("pcm-memory");
@@ -304,7 +296,7 @@ bool PcmBandwidthMeasurer::sample_bandwidth(long long& cas_rd,
     if (pcm_binary.empty()) {
         if (config_.verbosity >= 2) {
             std::cerr << "PCM sampling failed: pcm-memory not found. "
-                      << "Set PCM_PATH or ensure pcm-memory is in PATH." << std::endl;
+                      << "Ensure pcm-memory is in PATH." << std::endl;
         }
         return false;
     }
@@ -314,9 +306,9 @@ bool PcmBandwidthMeasurer::sample_bandwidth(long long& cas_rd,
     const double timeout_s = std::max(5.0, requested_window_s + 3.0);
 
     std::ostringstream cmd;
-    cmd << "cd " << shell_quote(storage_->bandwidth_dir())
+    cmd << "cd " << string_utils::shell_quote(storage_->bandwidth_dir())
         << " && stdbuf -oL -eL timeout -k 1s " << std::fixed << std::setprecision(2) << timeout_s << "s "
-        << shell_quote(pcm_binary)
+        << string_utils::shell_quote(pcm_binary)
         << " -csv " << std::fixed << std::setprecision(1) << pcm_interval_s << " 2>/dev/null";
 
     FILE* pipe = popen(cmd.str().c_str(), "r");
@@ -327,7 +319,7 @@ bool PcmBandwidthMeasurer::sample_bandwidth(long long& cas_rd,
     std::vector<PcmCxlSample> raw_samples;
     PcmCsvColumnMap col_map;
     bool header_found = false;
-    const bool parsed = parse_pcm_cxl_samples(pipe, config_.verbosity, raw_samples, 0, col_map, header_found);
+    const bool parsed = parse_pcm_cxl_samples(pipe, config_.verbosity, raw_samples, 2, col_map, header_found);
     pclose(pipe);
 
     if (!parsed || raw_samples.empty()) {
@@ -382,7 +374,6 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
         if (!relaunch_traffic_gen(ratio_pct, pause, get_traffic_gen_cores())) {
             return false;
         }
-        traffic_gen_manager_->wait_for_traffic_gen_ready(120);
         return true;
     };
 
@@ -426,6 +417,7 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
     BandwidthStabilizer stabilizer(
         theoretical_peak_gb_s, pause, health_checker,
         stabilization_window, 0.05, config_.verbosity);
+    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
 
     const int max_samples = 20;
     int sample_failures = 0;
@@ -434,13 +426,13 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
     int successful_sample_count = 0;
     const int line_size = std::max(1, cached_cache_line_size_);
     const double pcm_interval_s = 1.0;
-    const double stream_timeout_s = std::max(120.0, (max_samples * pcm_interval_s) + 30.0);
+    const double stream_timeout_s = std::max(30.0, (max_samples * pcm_interval_s) + 10.0);
 
     const std::string pcm_binary = find_pcm_binary();
     if (pcm_binary.empty()) {
         if (config_.verbosity >= 2) {
             std::cerr << "PCM sampling failed: pcm-memory not found. "
-                      << "Set PCM_PATH or ensure pcm-memory is in PATH." << std::endl;
+                      << "Ensure pcm-memory is in PATH." << std::endl;
         }
         return false;
     }
@@ -456,12 +448,12 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
     auto open_pcm_stream = [&]() -> bool {
         close_pcm_stream();
         std::ostringstream cmd;
-        cmd << "cd " << shell_quote(storage_->bandwidth_dir())
+        cmd << "cd " << string_utils::shell_quote(storage_->bandwidth_dir())
             << " && stdbuf -oL -eL timeout -k 1s " << std::fixed << std::setprecision(2)
-            << stream_timeout_s << "s " << shell_quote(pcm_binary)
+            << stream_timeout_s << "s " << string_utils::shell_quote(pcm_binary)
             << " -csv " << std::fixed << std::setprecision(1) << pcm_interval_s << " 2>/dev/null";
 
-        pcm_pipe = popen(cmd.str().c_str(), "r");
+        pcm_pipe = popen(cmd.str().c_str(), "re");
         return pcm_pipe != nullptr;
     };
 
@@ -602,7 +594,9 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
                               << " | CV: " << (cv * 100.0) << "%"
                               << " | " << (in_active_mode ? "ACTIVE" : "SILENT")
                               << " | RD%: " << (read_ratio * 100.0) << "%"
-                              << (stabilizer.is_stable() ? " STABLE" : " ✗ unstable");
+                              << (stabilizer.is_stable()
+                                      ? std::string(" STABLE")
+                                      : std::string(" ") + platform::glyph::kFail + " unstable");
                 }
 
                 std::cout << '\n';
@@ -623,20 +617,15 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
 
     close_pcm_stream();
 
-    long long aggregate_cas_rd = 0;
-    long long aggregate_cas_wr = 0;
-    for (const auto& sample : stabilizer.get_samples()) {
-        aggregate_cas_rd += sample.cas_rd;
-        aggregate_cas_wr += sample.cas_wr;
-    }
-
-    last_cas_rd = aggregate_cas_rd;
-    last_cas_wr = aggregate_cas_wr;
+    const auto& samples = stabilizer.get_samples();
+    const auto totals = measurement::aggregate_cas_samples(samples);
+    last_cas_rd = totals.read;
+    last_cas_wr = totals.write;
     const double average_sample_elapsed =
         (successful_sample_count > 0)
             ? (successful_sample_elapsed_sum / static_cast<double>(successful_sample_count))
             : std::max(1.0, sampling_interval_ms_ / 1000.0);
-    last_elapsed = stabilizer.get_samples().size() * average_sample_elapsed;
+    last_elapsed = samples.size() * average_sample_elapsed;
 
     if (!recent_window_samples.empty()) {
         double read_sum_mbps = 0.0;
@@ -659,7 +648,7 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
 bool PcmBandwidthMeasurer::monitor_command(const std::string& command,
                                            MonitorCallback callback,
                                            bool summary_mode) {
-    std::string trimmed = trim_copy(command);
+    std::string trimmed = string_utils::trim(command);
     if (trimmed.empty()) {
         std::cerr << "Error: No command specified for PCM monitoring." << std::endl;
         return false;
@@ -670,7 +659,7 @@ bool PcmBandwidthMeasurer::monitor_command(const std::string& command,
     }
 
     if (find_pcm_binary().empty()) {
-        std::cerr << "Error: pcm-memory not found. Set PCM_PATH or install Intel PCM." << std::endl;
+        std::cerr << "Error: pcm-memory not found. Install Intel PCM and ensure pcm-memory is in PATH." << std::endl;
         return false;
     }
 

@@ -1,6 +1,9 @@
 # Copyright (c) 2026, Barcelona Supercomputing Center
 # Contact: mess             [at] bsc [dot] es
 #          victor.xirau     [at] bsc [dot] es
+#          mariana.carmin   [at] bsc [dot] es
+#          pau.diazcuesta   [at] bsc [dot] es
+#          javier.beiro     [at] bsc [dot] es
 #          petar.radojkovic [at] bsc [dot] es
 # All rights reserved.
 #
@@ -28,7 +31,49 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-# Mess 2.0 Makefile
+# Mess Makefile
+UNAME_S := $(shell uname -s)
+ifeq ($(filter $(UNAME_S),Linux Darwin),)
+CMAKE ?= cmake
+BUILD_TYPE ?= release
+JOBS ?= 4
+ifeq ($(filter $(BUILD_TYPE),release debug),)
+$(error BUILD_TYPE must be release or debug)
+endif
+CONFIG = Release
+BIN_DIR = $(CURDIR)/build/bin
+ifeq ($(BUILD_TYPE),debug)
+CONFIG = Debug
+BIN_DIR = $(CURDIR)/build/debug/bin
+endif
+CMAKE_BUILD_DIR = $(CURDIR)/build/cmake/make-$(BUILD_TYPE)
+CMAKE_ARGS ?=
+# Only explicit compiler overrides are forwarded; Make's built-in CC/CXX are not.
+ifneq ($(filter command line environment environment override,$(origin CC)),)
+CMAKE_COMPILER_ARGS += -DCMAKE_C_COMPILER="$(CC)"
+endif
+ifneq ($(filter command line environment environment override,$(origin CXX)),)
+CMAKE_COMPILER_ARGS += -DCMAKE_CXX_COMPILER="$(CXX)"
+endif
+.DEFAULT_GOAL := all
+.PHONY: all binaries parallel debug configure test install clean distclean
+configure:
+	$(CMAKE) -S . -B "$(CMAKE_BUILD_DIR)" -DCMAKE_BUILD_TYPE=$(CONFIG) -DMESS_RUNTIME_OUTPUT_DIRECTORY="$(BIN_DIR)" $(CMAKE_COMPILER_ARGS) $(CMAKE_ARGS)
+all binaries parallel: configure
+	+$(CMAKE) --build "$(CMAKE_BUILD_DIR)" --config $(CONFIG) --parallel $(JOBS)
+debug:
+	+$(MAKE) BUILD_TYPE=debug all
+test: all
+	"$(BIN_DIR)/mess" --help
+install: all
+	"$(BIN_DIR)/generate_code" $(DEBUG_FLAGS)
+# Clean only this configuration's CMake products. Keep measurements and kernels.
+clean:
+	if test -f "$(CMAKE_BUILD_DIR)/CMakeCache.txt"; then $(CMAKE) --build "$(CMAKE_BUILD_DIR)" --config $(CONFIG) --target clean; fi
+distclean: clean
+	$(CMAKE) -E rm -rf "$(CMAKE_BUILD_DIR)"
+
+else
 
 CXX = g++
 CC = gcc
@@ -61,13 +106,43 @@ else
 CXXSTD = -std=c++11
 endif
 
-CXXFLAGS = $(CXXSTD) -Wall -Wextra -Wunused $(OPTFLAGS) -pthread -I. -I./include -I./src -I./src/libraries -I./include/arch
+BUILD_TYPE ?= release
+ifeq ($(filter $(BUILD_TYPE),release debug),)
+$(error BUILD_TYPE must be release or debug)
+endif
+BUILD_OPTFLAGS = $(OPTFLAGS)
+ifeq ($(BUILD_TYPE),debug)
+BUILD_OPTFLAGS = -g -O0
+endif
+
+CXXFLAGS = $(CXXSTD) -Wall -Wextra -Wunused $(BUILD_OPTFLAGS) -pthread -I. -I./include -I./src -I./src/libraries -I./include/arch
 CFLAGS = $(OPTFLAGS) -I. -I./include -I./src -I./src/libraries -I./include/arch
 LDFLAGS = -pthread -lm
 LDFLAGS += $(shell [ $(GCC_VERSION) -lt 9 ] 2>/dev/null && echo "-lstdc++fs" || true)
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    CXXFLAGS += -fblocks
+    LDFLAGS += -framework CoreFoundation -framework IOKit
+endif
 BUILD_DIR = build
+# Preserve release paths used by launchers and installation scripts.
 BIN_DIR = $(BUILD_DIR)/bin
-LIB_DIR = $(BUILD_DIR)/lib
+ifeq ($(BUILD_TYPE),debug)
+BIN_DIR = $(BUILD_DIR)/debug/bin
+endif
+OBJ_DIR = $(BUILD_DIR)/obj/$(BUILD_TYPE)
+.DEFAULT_GOAL := all
+
+PLATFORM_SRCS = src/platform/posix/Process.cpp \
+                src/platform/posix/Fs.cpp \
+                src/platform/posix/Ipc.cpp \
+                src/platform/posix/Run.cpp \
+                src/platform/posix/Sys.cpp \
+                src/platform/posix/Console.cpp
+
+PERF_COUNTER_SRCS = src/measurement/bw_measurers/PerfBandwidthMeasurer.cpp \
+                    src/measurement/PerfStatCsv.cpp
 
 SRCS = Mess.cpp \
        src/SystemDetection.cpp \
@@ -75,14 +150,20 @@ SRCS = Mess.cpp \
        src/CliParser.cpp \
        src/KernelGenerator.cpp \
        src/measurement/MeasurementStorage.cpp \
+       src/measurement/TrafficGenArrayCalibrator.cpp \
        src/measurement/LatencyMeasurer.cpp \
+       src/measurement/BurstCompletion.cpp \
        src/measurement/OutlierDetector.cpp \
        src/measurement/MeasurementUtils.cpp \
+       src/measurement/ResultFormatter.cpp \
        src/measurement/BandwidthMeasurerFactory.cpp \
-       src/measurement/bw_measurers/PerfBandwidthMeasurer.cpp \
+       $(PERF_COUNTER_SRCS) \
        src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp \
        src/measurement/bw_measurers/VtuneBandwidthMeasurer.cpp \
+       src/measurement/VtuneCounterParser.cpp \
+       src/measurement/VtuneCollection.cpp \
        src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp \
+       src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp \
        src/process/TrafficGenProcessManager.cpp \
        src/process/PtrchaseProcessManager.cpp \
        src/utils/ProgressTracker.cpp \
@@ -90,71 +171,25 @@ SRCS = Mess.cpp \
        src/utils/CpuTopology.cpp \
        src/utils/SubprocessCapture.cpp \
        src/utils/TerminalCursor.cpp \
+       src/gpu/GpuBenchmarkExecutor.cpp \
+       src/gpu/GpuKernelGenerator.cpp \
+       src/gpu/GpuMeasurement.cpp \
+       src/gpu/GpuWorker.cpp \
        src/BenchmarkExecutor.cpp \
        src/ResultsProcessor.cpp \
        src/TlbUtils.cpp \
        src/Utils.cpp \
        src/PtrchasePerfHelper.cpp \
+       src/measurement/AdaptiveSweep.cpp \
        src/CurveTracer.cpp
 SRCS += src/measurement/instruction_samplers/IntelPebsSampler.cpp \
         src/measurement/instruction_samplers/ArmSpeSampler.cpp \
         src/measurement/InstructionSamplerFactory.cpp
 
-HEADERS = include/BenchmarkConfig.h \
-          include/BenchmarkExecutor.h \
-          include/CliParser.h \
-          include/Codegen.h \
-          include/Measurement.h \
-          include/ProcessManager.h \
-          include/ResultsProcessor.h \
-          include/SystemDetection.h \
-          include/Utils.h \
-          include/CurveTracer.h
-
-LIBS = src/SystemInfo.o
-
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-OBJS = $(SRCS:.cpp=.o) GenerateCode.o
-
-TARGETS = $(BIN_DIR)/mess $(BIN_DIR)/generate_code $(BIN_DIR)/mess-profiler
-
-all:
-	@echo "Detected GCC version: $(GCC_VERSION).$(GCC_MINOR)"
-	@echo "Using C++ standard: $(CXXSTD)"
-	@if [ $(GCC_VERSION) -lt 8 ]; then \
-		echo ""; \
-		printf "\033[0;33mWARNING: GCC $(GCC_VERSION).$(GCC_MINOR) does not fully support C++17!\033[0m\n"; \
-		echo "This code requires C++17 features. Please use a newer compiler:"; \
-		echo ""; \
-		if command -v module >/dev/null 2>&1; then \
-			echo "Available compiler modules:"; \
-			module avail gcc 2>/dev/null | grep -E "gcc/(1[0-9]|[2-9][0-9])" | head -10 || echo "  Run 'module avail gcc' to see available compilers"; \
-		else \
-			echo "To check available compilers, try:"; \
-			echo "  which gcc g++"; \
-			echo "  ls /usr/bin/gcc* /usr/bin/g++* 2>/dev/null"; \
-		fi; \
-		echo ""; \
-		printf "\033[0;31mRequired: GCC 8.0 or later for C++17 support\033[0m\n"; \
-		echo ""; \
-		echo "Continuing with $(CXXSTD), but compilation may fail..."; \
-		echo ""; \
-	fi
-	$(MAKE) -j$(JOBS) $(TARGETS)
-	@echo "Build completed successfully!"
-	@echo "Cleaning up all object files..."
-	@rm -f $(SRCS:.cpp=.o) $(LIBS) GenerateCode.o
-
-parallel: 
-	$(MAKE) -j$(JOBS) all
-
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
-
 ARCH_SRCS = src/arch/ArchitectureRegistry.cpp \
             src/arch/BandwidthCounterStrategy.cpp \
+            src/measurement/PointerChaseTiming.cpp \
+            src/measurement/CpuFrequencyProbe.cpp \
             src/arch/x86/X86Architecture.cpp \
             src/arch/x86/X86Assembler.cpp \
             src/arch/x86/X86Counters.cpp \
@@ -164,6 +199,7 @@ ARCH_SRCS = src/arch/ArchitectureRegistry.cpp \
             src/arch/x86/counters/IntelGraniteRapidsCounters.cpp \
             src/arch/x86/counters/AmdZenCounters.cpp \
             src/arch/x86/counters/AmdZen4Counters.cpp \
+            src/arch/x86/counters/AmdZen5Counters.cpp \
             src/arch/arm/ArmArchitecture.cpp \
             src/arch/arm/ArmISAUtils.cpp \
             src/arch/arm/ArmAssembler.cpp \
@@ -171,6 +207,7 @@ ARCH_SRCS = src/arch/ArchitectureRegistry.cpp \
             src/arch/arm/counters/A64FXCounters.cpp \
             src/arch/arm/counters/Graviton3Counters.cpp \
             src/arch/arm/counters/NvidiaGraceCounters.cpp \
+            src/arch/arm/counters/AppleSiliconCounters.cpp \
             src/arch/powerpc/PowerPCArchitecture.cpp \
             src/arch/powerpc/PowerPCAssembler.cpp \
             src/arch/powerpc/PowerPCCounters.cpp \
@@ -179,96 +216,84 @@ ARCH_SRCS = src/arch/ArchitectureRegistry.cpp \
             src/arch/riscv/RiscvCounters.cpp \
             src/arch/riscv/counters/SiFiveCounters.cpp
        
-ARCH_OBJS = $(ARCH_SRCS:.cpp=.o)
-
-$(LIB_DIR):
-	mkdir -p $(LIB_DIR)
-
-
-$(BIN_DIR)/mess: $(SRCS:.cpp=.o) $(ARCH_OBJS) $(LIBS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -o $@ $(SRCS:.cpp=.o) $(ARCH_OBJS) $(LIBS) $(LDFLAGS)
-
-
-$(BIN_DIR)/generate_code: src/SystemDetection.o src/KernelGenerator.o GenerateCode.o src/TlbUtils.o src/PtrchasePerfHelper.o src/Utils.o src/utils/PmuSysfs.o src/utils/CpuTopology.o src/utils/SubprocessCapture.o $(ARCH_OBJS) $(LIBS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -o $@ src/SystemDetection.o src/KernelGenerator.o GenerateCode.o src/TlbUtils.o src/PtrchasePerfHelper.o src/Utils.o src/utils/PmuSysfs.o src/utils/CpuTopology.o src/utils/SubprocessCapture.o $(ARCH_OBJS) $(LIBS) $(LDFLAGS)
-
-
-MESS_PROFILER_OBJS = src/SystemDetection.o \
-                     src/BenchmarkConfig.o \
-                     src/measurement/MeasurementUtils.o \
-                     src/measurement/BandwidthMeasurerFactory.o \
-                     src/measurement/bw_measurers/PerfBandwidthMeasurer.o \
-                     src/measurement/bw_measurers/LikwidBandwidthMeasurer.o \
-                     src/measurement/bw_measurers/VtuneBandwidthMeasurer.o \
-                     src/measurement/bw_measurers/PcmBandwidthMeasurer.o \
-                     src/measurement/MeasurementStorage.o \
-                     src/process/TrafficGenProcessManager.o \
-                     src/profiler/ProcessBinding.o \
-                     src/profiler/ProfilerConfig.o \
-                     src/utils/PmuSysfs.o \
-                     src/utils/CpuTopology.o \
-                     src/utils/SubprocessCapture.o \
-                     src/Utils.o
-
-$(BIN_DIR)/mess-profiler: MessProfiler.cpp $(MESS_PROFILER_OBJS) $(ARCH_OBJS) $(LIBS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -o $@ MessProfiler.cpp $(MESS_PROFILER_OBJS) $(ARCH_OBJS) $(LIBS) $(LDFLAGS)
+PROFILER_SRCS = src/SystemDetection.cpp \
+                     src/BenchmarkConfig.cpp \
+                     src/measurement/MeasurementUtils.cpp \
+                     src/measurement/BandwidthMeasurerFactory.cpp \
+                     $(PERF_COUNTER_SRCS) \
+                     src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp \
+                     src/measurement/bw_measurers/VtuneBandwidthMeasurer.cpp \
+                     src/measurement/VtuneCounterParser.cpp \
+                     src/measurement/VtuneCollection.cpp \
+                     src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp \
+                     src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp \
+                     src/measurement/MeasurementStorage.cpp \
+                     src/process/TrafficGenProcessManager.cpp \
+                     src/profiler/ProcessBinding.cpp \
+                     src/profiler/ProfilerConfig.cpp \
+                     src/utils/PmuSysfs.cpp \
+                     src/utils/CpuTopology.cpp \
+                     src/utils/SubprocessCapture.cpp \
+                     src/Utils.cpp
 
 
-Mess.o: Mess.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c Mess.cpp -o $@
+MESS_OBJS = $(addprefix $(OBJ_DIR)/,$(SRCS:.cpp=.o) $(ARCH_SRCS:.cpp=.o) $(PLATFORM_SRCS:.cpp=.o) src/SystemInfo.o)
+GENERATOR_SRCS = GenerateCode.cpp src/SystemDetection.cpp src/KernelGenerator.cpp \
+                 src/TlbUtils.cpp src/PtrchasePerfHelper.cpp src/Utils.cpp \
+                 src/measurement/TrafficGenArrayCalibrator.cpp src/utils/PmuSysfs.cpp \
+                 src/utils/CpuTopology.cpp src/utils/SubprocessCapture.cpp
+GENERATOR_OBJS = $(addprefix $(OBJ_DIR)/,$(GENERATOR_SRCS:.cpp=.o) $(ARCH_SRCS:.cpp=.o) $(PLATFORM_SRCS:.cpp=.o) src/SystemInfo.o)
+PROFILER_OBJS = $(addprefix $(OBJ_DIR)/,MessProfiler.o $(PROFILER_SRCS:.cpp=.o) $(ARCH_SRCS:.cpp=.o) $(PLATFORM_SRCS:.cpp=.o) src/SystemInfo.o)
+ALL_OBJS = $(sort $(MESS_OBJS) $(GENERATOR_OBJS) $(PROFILER_OBJS))
+TARGETS = $(BIN_DIR)/mess $(BIN_DIR)/generate_code $(BIN_DIR)/mess-profiler
 
-GenerateCode.o: GenerateCode.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c GenerateCode.cpp -o $@
+all:
+	$(MAKE) -j$(JOBS) binaries
 
+binaries: $(TARGETS)
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+parallel: all
 
+debug:
+	$(MAKE) BUILD_TYPE=debug all
+
+$(BIN_DIR):
+	mkdir -p $@
+
+$(OBJ_DIR)/%.o: %.cpp Makefile
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ_DIR)/src/measurement/CpuFrequencyProbe.o $(OBJ_DIR)/src/measurement/PointerChaseTiming.o $(OBJ_DIR)/src/gpu/GpuMeasurement.o: CXXFLAGS += -fno-fast-math
+
+$(BIN_DIR)/mess: $(MESS_OBJS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BIN_DIR)/generate_code: $(GENERATOR_OBJS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BIN_DIR)/mess-profiler: $(PROFILER_OBJS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+install:
+	@echo "Running code generation..."
+	@./$(BIN_DIR)/generate_code $(DEBUG_FLAGS)
+
+.PHONY: all binaries parallel debug install clean distclean
 
 clean:
-	rm -f $(OBJS) $(ARCH_OBJS) $(LIBS) $(TARGETS)
+	rm -f $(ALL_OBJS) $(TARGETS)
 	rm -rf $(BUILD_DIR)/
 	rm -rf src/traffic_gen/build
 	rm -rf src/traffic_gen/src/nop.c
 	rm -rf src/traffic_gen/src/nop_*.c
 	rm -rf src/traffic_gen/src/generated_*.c
 	rm -rf src/traffic_gen/src/utils_*.c
-	rm -f *.o src/arch/*.o src/arch/*/*.o src/profiler/*.o
+	find . -type f -name '*.o' -delete
 	rm -rf build/*
 
 
 distclean: clean
 	rm -f *.log *.csv *.json
 
-
-install:
-	@echo "Running code generation..."
-	@./$(BIN_DIR)/generate_code $(DEBUG_FLAGS)
-
-
-test: $(TARGETS)
-	$(BIN_DIR)/mess --help
-
-debug: CXXFLAGS = $(CXXSTD) -Wall -Wextra -g -O0 -pthread
-debug: $(TARGETS)
-
-# Dependencies
-Mess.o: include/SystemDetection.h include/BenchmarkConfig.h include/CliParser.h include/Codegen.h include/BenchmarkExecutor.h include/ResultsProcessor.h include/Utils.h
-
-GenerateCode.o: include/SystemDetection.h include/Codegen.h include/Utils.h
-
-src/SystemDetection.o: include/SystemDetection.h
-
-src/BenchmarkConfig.o: include/BenchmarkConfig.h
-
-src/CliParser.o: include/CliParser.h include/BenchmarkConfig.h
-
-src/KernelGenerator.o: include/Codegen.h include/SystemDetection.h
-
-src/CurveTracer.o: include/CurveTracer.h
-
-src/BenchmarkExecutor.o: include/BenchmarkExecutor.h include/BenchmarkConfig.h include/Codegen.h include/CurveTracer.h include/Measurement.h include/ProcessManager.h include/Utils.h
-
-src/ResultsProcessor.o: include/ResultsProcessor.h include/BenchmarkConfig.h include/BenchmarkExecutor.h
-
-.PHONY: all clean distclean install test debug
+endif

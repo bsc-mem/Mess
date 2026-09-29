@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,11 +34,13 @@
  */
 
 #include "utils/CpuTopology.h"
+#include "utils/FileUtils.h"
 
 #include <cctype>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <utility>
 
 #if defined(__linux__)
@@ -46,11 +50,36 @@
 
 namespace cpu_topology {
 
+std::vector<int> select_workers_on_socket(const std::map<int, CpuTopology>& topology,
+                                         const std::vector<int>& allowed,
+                                         int requested_count, int reserved_cpu) {
+    std::vector<int> selected;
+    if (requested_count <= 0 || allowed.empty()) return selected;
+    auto anchor = topology.find(reserved_cpu);
+    if (anchor == topology.end()) anchor = topology.find(allowed.front());
+    if (anchor == topology.end()) return selected;
+    const int socket = anchor->second.socket;
+    std::set<std::pair<int, int>> used_cores;
+    auto reserved = topology.find(reserved_cpu);
+    if (reserved != topology.end()) {
+        used_cores.emplace(reserved->second.socket, reserved->second.core_id);
+    }
+    for (int cpu : allowed) {
+        if (static_cast<int>(selected.size()) >= requested_count) break;
+        auto it = topology.find(cpu);
+        if (cpu == reserved_cpu || it == topology.end() || it->second.socket != socket) continue;
+        if (used_cores.emplace(it->second.socket, it->second.core_id).second) selected.push_back(cpu);
+    }
+    return selected;
+}
+
+
 namespace {
 
 constexpr const char* kCpuRoot  = "/sys/devices/system/cpu";
 constexpr const char* kNodeRoot = "/sys/devices/system/node";
 
+#if defined(__linux__)
 void trim(std::string& s) {
     const size_t first = s.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) { s.clear(); return; }
@@ -69,6 +98,38 @@ int parse_first_cpu_in_list(const std::string& cpulist) {
     }
 }
 
+int parse_indexed_name(const std::string& name, const char* prefix) {
+    const size_t prefix_len = std::strlen(prefix);
+    if (name.rfind(prefix, 0) != 0 || name.size() <= prefix_len) {
+        return -1;
+    }
+    for (size_t i = prefix_len; i < name.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+            return -1;
+        }
+    }
+    try {
+        return std::stoi(name.substr(prefix_len));
+    } catch (...) {
+        return -1;
+    }
+}
+
+std::set<int> scan_nodes() {
+    std::set<int> nodes;
+#if defined(__linux__)
+    file_utils::for_each_dir_entry(kNodeRoot, [&](const std::string& name) {
+        const int node = parse_indexed_name(name, "node");
+        if (node >= 0) {
+            nodes.insert(node);
+        }
+    });
+#endif
+    if (nodes.empty()) nodes.insert(0);
+    return nodes;
+}
+#endif
+
 }
 
 std::string cpu_path(int cpu) {
@@ -82,26 +143,27 @@ std::string node_path(int node) {
 int numa_node_of(int cpu) {
 #if defined(__linux__)
     static std::map<int, int> cache;
-    auto it = cache.find(cpu);
-    if (it != cache.end()) return it->second;
-
-    DIR* dir = opendir(cpu_path(cpu).c_str());
-    if (!dir) return -1;
+    static std::mutex cache_mutex;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(cpu);
+        if (it != cache.end()) return it->second;
+    }
 
     int node = -1;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (std::strncmp(entry->d_name, "node", 4) == 0 &&
-            std::isdigit(static_cast<unsigned char>(entry->d_name[4]))) {
-            try {
-                node = std::stoi(&entry->d_name[4]);
-            } catch (...) {}
-            break;
+    file_utils::for_each_dir_entry(cpu_path(cpu), [&](const std::string& name) {
+        if (node >= 0) return;
+        if (name.rfind("node", 0) != 0 || name.size() <= 4) return;
+        const int parsed = parse_indexed_name(name, "node");
+        if (parsed >= 0) {
+            node = parsed;
         }
-    }
-    closedir(dir);
+    });
 
-    if (node != -1) cache[cpu] = node;
+    if (node != -1) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[cpu] = node;
+    }
     return node;
 #else
     (void)cpu;
@@ -110,19 +172,40 @@ int numa_node_of(int cpu) {
 }
 
 int physical_package_id(int cpu) {
-    std::ifstream f(cpu_path(cpu) + "/topology/physical_package_id");
+#if defined(__linux__)
+    static std::map<int, int> cache;
+    static std::mutex cache_mutex;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(cpu);
+        if (it != cache.end()) return it->second;
+    }
+
     int pkg = -1;
-    if (f >> pkg) return pkg;
+    file_utils::read_int_file(cpu_path(cpu) + "/topology/physical_package_id", pkg);
+
+    if (pkg >= 0) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[cpu] = pkg;
+    }
+    return pkg;
+#else
+    (void)cpu;
     return -1;
+#endif
 }
 
 int distance(int src_node, int dst_node) {
     if (src_node == dst_node) return 10;
 
     static std::map<std::pair<int, int>, int> cache;
+    static std::mutex cache_mutex;
     const auto key = std::make_pair(src_node, dst_node);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
 
     std::ifstream f(node_path(src_node) + "/distance");
     if (!f.is_open()) return -1;
@@ -138,29 +221,48 @@ int distance(int src_node, int dst_node) {
         ++idx;
     }
 
-    if (result != -1) cache[key] = result;
+    if (result != -1) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[key] = result;
+    }
     return result;
 }
 
 int socket_of_node(int node) {
-    std::ifstream f(node_path(node) + "/cpulist");
-    if (!f) return -1;
+#if defined(__linux__)
+    static std::map<int, int> cache;
+    static std::mutex cache_mutex;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(node);
+        if (it != cache.end()) return it->second;
+    }
 
     std::string cpulist;
-    if (!std::getline(f, cpulist)) return -1;
+    if (!file_utils::read_string_file(node_path(node) + "/cpulist", cpulist)) return -1;
     trim(cpulist);
 
     const int first_cpu = parse_first_cpu_in_list(cpulist);
     if (first_cpu < 0) return -1;
-    return physical_package_id(first_cpu);
+    const int socket = physical_package_id(first_cpu);
+    if (socket >= 0) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[node] = socket;
+    }
+    return socket;
+#else
+    (void)node;
+    return -1;
+#endif
 }
 
 std::set<int> list_nodes(int max_index) {
     std::set<int> nodes;
 #if defined(__linux__)
-    for (int i = 0; i < max_index; ++i) {
-        if (access(node_path(i).c_str(), F_OK) == 0) {
-            nodes.insert(i);
+    static std::set<int> cached_nodes = scan_nodes();
+    for (int node : cached_nodes) {
+        if (node < max_index) {
+            nodes.insert(node);
         }
     }
 #else
@@ -185,17 +287,22 @@ std::set<int> nodes_for_cpus(const std::set<int>& cpus) {
 
 bool is_remote(int cpu, int mem_node) {
 #if defined(__linux__)
-    const std::string cpu_dir = cpu_path(cpu);
-
-    const std::string direct = cpu_dir + "/node" + std::to_string(mem_node);
-    if (access(direct.c_str(), F_OK) == 0) return false;
-
-    for (int n = 0; n < 64; ++n) {
-        const std::string link = cpu_dir + "/node" + std::to_string(n);
-        if (access(link.c_str(), F_OK) == 0) {
-            return n != mem_node;
-        }
+    static std::map<std::pair<int, int>, bool> cache;
+    static std::mutex cache_mutex;
+    const auto key = std::make_pair(cpu, mem_node);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
     }
+
+    const int cpu_node = numa_node_of(cpu);
+    const bool remote = (cpu_node >= 0) ? (cpu_node != mem_node) : false;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[key] = remote;
+    }
+    return remote;
 #else
     (void)cpu;
     (void)mem_node;

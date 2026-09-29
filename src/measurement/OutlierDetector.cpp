@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -32,6 +34,7 @@
  */
 
 #include "Measurement.h"
+#include "SystemDetection.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,14 +47,18 @@ OutlierDetector::OutlierDetector(const BenchmarkConfig& config)
 
 namespace {
 
+
 double bw_threshold_pct(double median_mbps) {
+
     if (median_mbps >= 20000.0) return  5.0;  // >= 20 GB/s
     if (median_mbps >=  8000.0) return  8.0;  //  8-20 GB/s
     if (median_mbps >=  2000.0) return 12.0;  //  2- 8 GB/s
     return 18.0;                              // <  2 GB/s
 }
 
-double lat_threshold_pct(double /*median_ns*/) { return 5.0; }
+double lat_threshold_pct(double /*median_ns*/) {
+    return 5.0;
+}
 
 constexpr double BW_ABS_FLOOR_MBPS = 200.0;
 constexpr double LAT_ABS_FLOOR_NS  = 2.0;

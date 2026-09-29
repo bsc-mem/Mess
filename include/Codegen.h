@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -37,6 +39,7 @@
 #include "KernelTypes.h"
 #include "SystemDetection.h"
 #include "SystemInfo.h"
+#include "platform/Fs.h"
 
 #include <string>
 #include <vector>
@@ -48,10 +51,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <map>
-#include <libgen.h>
 #include <stdexcept>
-#include <limits.h>
-#include <unistd.h>
 
 /**
  * @file Codegen.h
@@ -139,14 +139,12 @@ public:
     static std::string Read(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            char exe_path[PATH_MAX];
-            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-            if (len != -1) {
-                exe_path[len] = '\0';
-                std::string exe_dir = std::string(dirname(exe_path));
-                std::string template_path = exe_dir + "/../templates/" +
-                                            filename.substr(filename.find_last_of('/') + 1);
-                file.open(template_path);
+            const std::filesystem::path exe_path = platform::executable_path();
+            if (!exe_path.empty()) {
+                const std::filesystem::path exe_dir = exe_path.parent_path();
+                const std::filesystem::path leaf =
+                    std::filesystem::path(filename).filename();
+                file.open((exe_dir / ".." / "templates" / leaf).string());
             }
             if (!file.is_open()) {
                 throw std::runtime_error("Cannot open template file: " + filename);

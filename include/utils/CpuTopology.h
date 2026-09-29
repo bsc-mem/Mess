@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -34,10 +36,26 @@
 #ifndef UTILS_CPU_TOPOLOGY_H
 #define UTILS_CPU_TOPOLOGY_H
 
+#include <map>
+#include <vector>
 #include <set>
 #include <string>
 
+struct CpuTopology {
+    int node;
+    int socket;
+    int core_id;
+};
+
 namespace cpu_topology {
+
+// One worker per physical core on the reserved CPU's socket (or the first
+// allowed CPU's socket), restricted to the allocation and excluding the reserved
+// physical core. Socket IDs need not be zero-based or contiguous.
+std::vector<int> select_workers_on_socket(const std::map<int, CpuTopology>& topology,
+                                         const std::vector<int>& allowed,
+                                         int requested_count, int reserved_cpu);
+
 
 std::string cpu_path(int cpu);
 

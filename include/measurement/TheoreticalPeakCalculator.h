@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -34,6 +36,7 @@
 #pragma once
 
 #include "SystemDetection.h"
+#include <cctype>
 #include <string>
 #include <cstdlib>
 #include <dirent.h>
@@ -225,6 +228,11 @@ public:
         return upi_peak_gb_s * scale_factor;
     }
 
+
+    static double sustained_efficiency_factor(const CPUCapabilities&) {
+        return 1.0;
+    }
+
     static double calculate_achievable_peak(
         const CPUCapabilities& caps,
         int cores_used,
@@ -234,10 +242,12 @@ public:
         double theoretical_peak = calculate_from_capabilities(caps, is_remote_memory);
         if (is_remote_memory) {
             double local_peak = calculate_from_capabilities(caps, false);
-            return scale_upi_for_core_count(theoretical_peak, local_peak, cores_used, 
+            return scale_upi_for_core_count(theoretical_peak, local_peak, cores_used,
                                             caps.memory_channels, total_socket_cores);
         }
-        return scale_for_core_count(theoretical_peak, cores_used, caps.memory_channels, total_socket_cores);
+        double scaled = scale_for_core_count(theoretical_peak, cores_used,
+                                             caps.memory_channels, total_socket_cores);
+        return scaled * sustained_efficiency_factor(caps);
     }
 
     static double get_noise_floor(double achievable_peak_gb_s) {

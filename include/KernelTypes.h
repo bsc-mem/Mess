@@ -2,6 +2,8 @@
  * Copyright (c) 2026, Barcelona Supercomputing Center
  * Contact: mess             [at] bsc [dot] es
  *          victor.xirau     [at] bsc [dot] es
+ *          mariana.carmin   [at] bsc [dot] es
+ *          pau.diazcuesta   [at] bsc [dot] es
  *          petar.radojkovic [at] bsc [dot] es
  * All rights reserved.
  *
@@ -34,6 +36,7 @@
 #ifndef KERNEL_TYPES_H
 #define KERNEL_TYPES_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -135,6 +138,8 @@ struct KernelConfigMultiSeq {
     // Internal generator-resolved value. 0 means "use ISA default width".
     int resolved_bytes_per_mem_op = 0;
     int resolved_cache_line_bytes = 0;
+
+    bool apple_silicon = false;
 };
 
 
