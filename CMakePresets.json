@@ -97,5 +97,17 @@
       "configurePreset": "windows-mingw-debug",
       "configuration": "Debug"
     }
-  ]
+  ],
+  "vendor": {
+    "bsc.es/mess/copyright": {
+      "notice": "Copyright (c) 2026, Barcelona Supercomputing Center",
+      "contacts": [
+        "Contact: mess             [at] bsc [dot] es",
+        "victor.xirau     [at] bsc [dot] es",
+        "mariana.carmin   [at] bsc [dot] es",
+        "pau.diazcuesta   [at] bsc [dot] es",
+        "petar.radojkovic [at] bsc [dot] es"
+      ]
+    }
+  }
 }
