@@ -37,6 +37,7 @@
 #ifndef MESS_GPU_RANGE_PROFILER_CUH
 #define MESS_GPU_RANGE_PROFILER_CUH
 
+#include "profiler.cuh"
 #include <cuda.h>
 #include <cupti_profiler_host.h>
 #include <cupti_profiler_target.h>
@@ -47,24 +48,12 @@
 #include <string>
 #include <vector>
 
-inline void checkCupti(CUptiResult status, const char* call) {
-    if (status == CUPTI_SUCCESS) return;
-    const char* message = nullptr;
-    cuptiGetResultString(status, &message);
-    std::string error = std::string(call) + ": " + (message ? message : "unknown CUPTI error");
-    if (status == CUPTI_ERROR_INSUFFICIENT_PRIVILEGES)
-        error += " (GPU performance counters are restricted to administrators; see NVreg_RestrictProfilingToAdminUsers)";
-    throw std::runtime_error(error);
-}
-
-#define CUPTI_CHECK(call) checkCupti((call), #call)
-
-class RangeProfiler {
+class RangeProfiler : public Profiler {
     static constexpr size_t kMaxRanges = 4;
 
 public:
     RangeProfiler(CUcontext context, int device, const std::vector<std::string>& metrics)
-        : names_(metrics) {
+        : Profiler(metrics) {
         for (const auto& name : names_) metrics_.push_back(name.c_str());
 
         CUpti_Profiler_Initialize_Params initialize{CUpti_Profiler_Initialize_Params_STRUCT_SIZE};
@@ -129,7 +118,7 @@ public:
         counterData_.resize(data.counterDataSize);
     }
 
-    ~RangeProfiler() {
+    ~RangeProfiler() override {
         if (target_) {
             CUpti_RangeProfiler_Disable_Params disable{CUpti_RangeProfiler_Disable_Params_STRUCT_SIZE};
             disable.pRangeProfilerObject = target_;
@@ -149,11 +138,9 @@ public:
     RangeProfiler(const RangeProfiler&) = delete;
     RangeProfiler& operator=(const RangeProfiler&) = delete;
 
-    size_t passes() const { return passes_; }
-    const std::vector<std::string>& metrics() const { return names_; }
+    size_t passes() const override { return passes_; }
 
-    template <class Run>
-    std::vector<double> measure(Run run) {
+    std::vector<double> measure(const std::function<void(size_t)>& run) override {
         CUpti_RangeProfiler_CounterDataImage_Initialize_Params reset{
             CUpti_RangeProfiler_CounterDataImage_Initialize_Params_STRUCT_SIZE};
         reset.pRangeProfilerObject = target_;
@@ -222,7 +209,6 @@ public:
     }
 
 private:
-    std::vector<std::string> names_;
     std::vector<const char*> metrics_;
     std::vector<uint8_t> config_;
     std::vector<uint8_t> counterData_;

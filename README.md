@@ -213,7 +213,24 @@ Core requirements:
 
 To run the NVIDIA GPU benchmark with `--gpu`, install the NVIDIA driver, CUDA
 Toolkit 12.6 or newer (including `nvcc` and CUPTI). Mess compiles the GPU
-kernels at runtime and reads DRAM counters in-process through CUPTI.
+kernels at runtime and reads DRAM counters in-process through CUPTI. GPUs before
+Volta (including Pascal GTX 10-series) use the legacy CUPTI Event/Metric APIs;
+Volta and newer use the CUPTI range profiler. For pre-Volta GPUs, use CUDA 12.6–12.9,
+since CUDA 13 removes the legacy APIs. Extra counters on these GPUs use legacy
+metric or event names, such as `dram_read_bytes` or `dram_read_transactions`;
+list them with `nvprof --query-metrics` or `nvprof --query-events`.
+
+GPU performance counters require administrator access unless the NVIDIA driver
+is configured with `NVreg_RestrictProfilingToAdminUsers=0`.
+
+GPU workload definition 2 uses line-coalesced, dependent Sequential loads. Set
+`--gpu-seq=sector:independent` to select sector accesses with independent loads;
+append `:full` to a sector policy to write all 32 bytes per thread. Workload
+version, access granularity, load dependency and store width are saved in
+`plotter.txt`, so curves made with different policies can be identified. Use a
+fresh `--folder` when changing policies or comparing with older GPU results;
+Mess rejects relabelling an existing dataset with a different workload.
+
 
 Ensure perf access:
 

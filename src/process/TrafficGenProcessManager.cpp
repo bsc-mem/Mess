@@ -67,37 +67,6 @@
 
 namespace {
 
-bool collect_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& cores) {
-    cores.clear();
-
-    if (!explicit_cores.empty()) {
-        const auto& cache = SystemToolsCache::instance();
-        const int reserved_cpu = cache.initialized ? cache.ptr_chase_cpu : -1;
-        cores.reserve(explicit_cores.size());
-        for (const auto& c : explicit_cores) {
-            int cid = -1;
-            string_utils::parse_int_strict(c, cid);
-            if (cid == reserved_cpu && explicit_cores.size() > 1) continue;
-            cores.push_back(c);
-        }
-        return !cores.empty();
-    }
-
-    if (traffic_gen_cores <= 0) {
-        return false;
-    }
-
-    const auto& cache = SystemToolsCache::instance();
-    const int reserved_cpu = cache.initialized ? cache.ptr_chase_cpu : find_ptr_chase_cpu().first;
-    const std::vector<int> selected_cpus = select_worker_cpus(traffic_gen_cores, reserved_cpu);
-    cores.reserve(selected_cpus.size());
-    for (int cpu : selected_cpus) {
-        cores.push_back(std::to_string(cpu));
-    }
-
-    return static_cast<int>(cores.size()) == traffic_gen_cores;
-}
-
 std::vector<std::string> read_last_lines(const std::string& path, std::size_t max_lines) {
     std::ifstream log_file(path);
     if (!log_file.is_open()) {
@@ -116,27 +85,13 @@ std::vector<std::string> read_last_lines(const std::string& path, std::size_t ma
     return std::vector<std::string>(tail.begin(), tail.end());
 }
 
-#if USE_MPI_SPAWN
-std::string join_core_list(const std::vector<std::string>& cores, const std::string& sep) {
-    std::string out;
-    for (size_t i = 0; i < cores.size(); ++i) {
-        if (i > 0) {
-            out += sep;
-        }
-        out += cores[i];
-    }
-    return out;
-}
-#endif
-
-
 // Not platform::process_exists(): this one also answers true on EPERM.
 bool process_exists(platform::ProcessId pid) {
     if (pid <= 0) {
         return false;
     }
 #if !defined(_WIN32)
-    if (::kill(static_cast<pid_t>(pid), 0) == 0) {
+    if (::kill(static_cast<platform::ProcessId>(pid), 0) == 0) {
         return true;
     }
     return errno == EPERM;
@@ -145,78 +100,31 @@ bool process_exists(platform::ProcessId pid) {
 #endif
 }
 
-// Returns true if the process exists but is a zombie (dead, waiting to be reaped).
-bool process_is_zombie(platform::ProcessId pid) {
+char proc_state(platform::ProcessId pid) {
     if (pid <= 0) {
-        return false;
+        return 0;
     }
 #ifdef __linux__
     std::ifstream status_file("/proc/" + std::to_string(pid) + "/status");
-    if (!status_file.is_open()) {
-        return false;
-    }
     std::string line;
     while (std::getline(status_file, line)) {
         if (line.rfind("State:", 0) == 0) {
-            return line.find('Z') != std::string::npos;
+            const size_t pos = line.find_first_not_of(" \t", 6);
+            return pos == std::string::npos ? 0 : line[pos];
         }
     }
 #endif
-    return false;
-}
-
-bool process_is_disk_sleep(platform::ProcessId pid) {
-    if (pid <= 0) {
-        return false;
-    }
-#ifdef __linux__
-    std::ifstream status_file("/proc/" + std::to_string(pid) + "/status");
-    if (!status_file.is_open()) {
-        return false;
-    }
-    std::string line;
-    while (std::getline(status_file, line)) {
-        if (line.rfind("State:", 0) == 0) {
-            return line.find('D') != std::string::npos;
-        }
-    }
-#endif
-    return false;
+    return 0;
 }
 
 bool process_alive_and_running(platform::ProcessId pid) {
-    return process_exists(pid) && !process_is_zombie(pid);
+    return process_exists(pid) && proc_state(pid) != 'Z';
 }
 
 #ifdef __linux__
-bool is_numeric_pid_dirname(const std::string& name) {
-    if (name.empty()) {
-        return false;
-    }
-    return std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c); });
-}
-
 bool is_traffic_gen_name(const std::string& text) {
     if (text.find("traffic_gen_multiseq.x") != std::string::npos) {
         return true;
-    }
-    return false;
-}
-
-bool pid_owned_by_current_user(const std::filesystem::path& proc_dir) {
-    std::ifstream status_file(proc_dir / "status");
-    if (!status_file.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(status_file, line)) {
-        if (line.rfind("Uid:", 0) == 0) {
-            std::istringstream iss(line.substr(4));
-            uid_t real_uid = 0;
-            iss >> real_uid;
-            return real_uid == getuid();
-        }
     }
     return false;
 }
@@ -264,9 +172,11 @@ bool is_traffic_gen_pid(platform::ProcessId pid) {
     std::replace(cmd.begin(), cmd.end(), '\0', ' ');
     return is_traffic_gen_name(cmd);
 }
+#endif
 
 std::vector<platform::ProcessId> collect_descendant_traffic_gen_pids(const std::vector<platform::ProcessId>& roots) {
     std::vector<platform::ProcessId> descendants;
+    if (roots.empty()) return descendants;
 
 #ifdef __linux__
     std::map<platform::ProcessId, platform::ProcessId> parent_map;
@@ -280,13 +190,13 @@ std::vector<platform::ProcessId> collect_descendant_traffic_gen_pids(const std::
         }
 
         const std::string pid_str = entry.path().filename().string();
-        if (!is_numeric_pid_dirname(pid_str)) {
+        if (!string_utils::is_digits(pid_str)) {
             continue;
         }
 
         platform::ProcessId pid = 0;
         try {
-            pid = static_cast<pid_t>(std::stol(pid_str));
+            pid = static_cast<platform::ProcessId>(std::stol(pid_str));
         } catch (...) {
             continue;
         }
@@ -313,99 +223,11 @@ std::vector<platform::ProcessId> collect_descendant_traffic_gen_pids(const std::
             parent = it->second;
         }
     }
-#else
-    (void)roots;
 #endif
 
     std::sort(descendants.begin(), descendants.end());
     descendants.erase(std::unique(descendants.begin(), descendants.end()), descendants.end());
     return descendants;
-}
-#endif
-
-#ifndef __linux__
-[[maybe_unused]] std::vector<platform::ProcessId> collect_descendant_traffic_gen_pids(const std::vector<platform::ProcessId>& roots) {
-    (void)roots;
-    return {};
-}
-#endif
-
-std::vector<platform::ProcessId> list_traffic_gen_pids() {
-    std::vector<platform::ProcessId> pids;
-
-#ifdef __linux__
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec) || ec) {
-            continue;
-        }
-
-        std::string pid_str = entry.path().filename().string();
-        if (!is_numeric_pid_dirname(pid_str)) {
-            continue;
-        }
-        if (!pid_owned_by_current_user(entry.path())) {
-            continue;
-        }
-
-        platform::ProcessId pid = static_cast<pid_t>(std::stoi(pid_str));
-        bool match = false;
-
-        {
-            std::ifstream comm_file(entry.path() / "comm");
-            std::string comm;
-            if (comm_file.is_open() && std::getline(comm_file, comm)) {
-                if (comm.rfind("traffic_gen_", 0) == 0) {
-                    match = true;
-                }
-            }
-        }
-
-        if (!match) {
-            std::ifstream cmd_file(entry.path() / "cmdline", std::ios::binary);
-            if (cmd_file.is_open()) {
-                std::string cmd((std::istreambuf_iterator<char>(cmd_file)),
-                                 std::istreambuf_iterator<char>());
-                std::replace(cmd.begin(), cmd.end(), '\0', ' ');
-                if (is_traffic_gen_name(cmd)) {
-                    match = true;
-                }
-            }
-        }
-
-        if (match) {
-            pids.push_back(pid);
-        }
-    }
-#elif !defined(_WIN32)
-    const char* cmds[] = {
-        "pgrep -f '[t]raffic_gen_.*\\.x'",
-        "pgrep '^traffic_gen_'"
-    };
-    for (const char* cmd : cmds) {
-        FILE* pipe = popen(cmd, "r");
-        if (!pipe) {
-            continue;
-        }
-        char buffer[64];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            int parsed_pid = -1;
-            if (string_utils::parse_int_strict(string_utils::trim(buffer), parsed_pid) && parsed_pid > 0) {
-                pids.push_back(static_cast<platform::ProcessId>(parsed_pid));
-            }
-        }
-        pclose(pipe);
-    }
-#else
-    // The Job Object owns all Windows workers.
-#endif
-
-    std::sort(pids.begin(), pids.end());
-    pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-    return pids;
 }
 
 void signal_process_tree(platform::ProcessId pid, platform::Stop stop) {
@@ -414,8 +236,8 @@ void signal_process_tree(platform::ProcessId pid, platform::Stop stop) {
     }
 #if !defined(_WIN32)
     const int sig = (stop == platform::Stop::Force) ? SIGKILL : SIGTERM;
-    ::kill(-static_cast<pid_t>(pid), sig);
-    ::kill(static_cast<pid_t>(pid), sig);
+    ::kill(-static_cast<platform::ProcessId>(pid), sig);
+    ::kill(static_cast<platform::ProcessId>(pid), sig);
 #else
     // A Windows pid does not name a killable group, so this reaches only the named process.
     platform::signal_process(pid, stop);
@@ -447,7 +269,8 @@ bool stop_process_tree(platform::ProcessId pid, std::chrono::milliseconds term_t
     return wait_for_exit(pid, std::chrono::milliseconds(500));
 }
 
-[[maybe_unused]] std::string format_core_ranges(std::vector<int>& cores) {
+#if !defined(_WIN32)
+std::string format_core_ranges(std::vector<int>& cores) {
     if (cores.empty()) return "";
     std::sort(cores.begin(), cores.end());
     std::stringstream ss;
@@ -474,12 +297,32 @@ bool stop_process_tree(platform::ProcessId pid, std::chrono::milliseconds term_t
     flush_range(range_start, range_end);
     return ss.str();
 }
+#endif
+
+std::string traffic_gen_binary(ExecutionMode mode) {
+    switch (mode) {
+    case ExecutionMode::MULTISEQUENTIAL:
+        return platform::exe_name("traffic_gen_multiseq.x");
+    }
+    return "";
+}
+
+#if !defined(_WIN32)
+std::string worker_executable(const std::string& bin_file) {
+    const std::filesystem::path binary_path = platform::runtime_directory() / bin_file;
+    if (std::filesystem::exists(binary_path)) {
+        return string_utils::shell_quote(binary_path.string());
+    }
+    return "./" + bin_file;
+}
+#endif
+
 
 }
 
 TrafficGenProcessManager::TrafficGenProcessManager(const BenchmarkConfig& config, const system_info& sys_info)
     : config_(config), sys_info_(sys_info),
-      current_traffic_gen_pid_(0), active_traffic_gen_pid_(0),
+      active_traffic_gen_pid_(0),
       persistent_traffic_gen_valid_(false), persistent_ratio_pct_(0), persistent_pause_(0),
       persistent_mode_(ExecutionMode::MULTISEQUENTIAL), persistent_traffic_gen_cores_(0),
       persistent_traffic_gen_array_elements_(0),
@@ -557,7 +400,39 @@ uint64_t TrafficGenProcessManager::active_traffic_gen_array_elements() const {
     return active_array_elements;
 }
 
+bool TrafficGenProcessManager::prepare_ready_fifo(int expected_workers) {
+    if (expected_workers < 1) {
+        std::cerr << "ERROR: Cannot prepare TrafficGen readiness for an empty worker set" << std::endl;
+        return false;
+    }
+
+    if (ready_fifo_path_.empty()) {
+        std::cerr << "ERROR: TrafficGen ready FIFO path is empty" << std::endl;
+        return false;
+    }
+
+    platform::MessagePipe::destroy_endpoint(ready_fifo_path_);
+
+    if (!platform::MessagePipe::create_endpoint(ready_fifo_path_)) {
+        std::cerr << "ERROR: Failed to create ready FIFO " << ready_fifo_path_  << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+
+    expected_ready_count_ = expected_workers;
+    return true;
+}
+
 bool TrafficGenProcessManager::wait_for_traffic_gen_ready(int timeout_seconds) {
+    return wait_for_traffic_gen_ready(timeout_seconds, nullptr);
+}
+
+bool TrafficGenProcessManager::wait_for_traffic_gen_ready(
+    int timeout_seconds,
+    std::function<bool()> cancellation_requested) {
+    if (cancellation_requested && cancellation_requested()) {
+        return false;
+    }
+
     int num_workers = expected_ready_count_;
     if (ready_fifo_path_.empty() || num_workers <= 0) {
         return false;
@@ -577,6 +452,14 @@ bool TrafficGenProcessManager::wait_for_traffic_gen_ready(int timeout_seconds) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
 
     while (total_read < num_workers) {
+        if (cancellation_requested && cancellation_requested()) {
+            return false;
+        }
+
+        if (!is_traffic_gen_running(active_traffic_gen_pid_)) {
+            print_recent_traffic_gen_log_excerpt();
+            return false;
+        }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now());
         if (remaining.count() <= 0) {
@@ -588,7 +471,7 @@ bool TrafficGenProcessManager::wait_for_traffic_gen_ready(int timeout_seconds) {
             return false;
         }
 
-        const auto slice = std::chrono::milliseconds(std::min((long)remaining.count(), 5000L));
+        const auto slice = std::chrono::milliseconds(std::min((long)remaining.count(), cancellation_requested ? 50L : 5000L));
         const std::size_t want = static_cast<std::size_t>(
             std::min(num_workers - total_read, (int)sizeof(buf)));
 
@@ -624,7 +507,7 @@ bool TrafficGenProcessManager::wait_for_traffic_gen_ready(int timeout_seconds) {
         std::cout << "    All " << num_workers << " TrafficGen workers ready (init complete)" << std::endl;
     }
 
-    return true;
+    return is_traffic_gen_running(active_traffic_gen_pid_);
 }
 
 bool TrafficGenProcessManager::prepare_traffic_gen(double ratio_pct,
@@ -638,7 +521,7 @@ bool TrafficGenProcessManager::prepare_traffic_gen(double ratio_pct,
     prep = {};
     last_traffic_gen_log_file_ = traffic_gen_log_file;
 
-    const uint64_t active_array_elements = active_traffic_gen_array_elements();
+    uint64_t active_array_elements = active_traffic_gen_array_elements();
 
     if ((config_.persistent_traffic_gen || reuse_existing) && persistent_traffic_gen_valid_) {
         bool config_match = (
@@ -654,7 +537,6 @@ bool TrafficGenProcessManager::prepare_traffic_gen(double ratio_pct,
             if (active_traffic_gen_pid_ > 0 && is_traffic_gen_running(active_traffic_gen_pid_)) {
                 prep.reused_existing = true;
                 prep.pid = active_traffic_gen_pid_;
-                current_traffic_gen_pid_ = active_traffic_gen_pid_;
 
                 if (config_.verbosity >= 2) {
                     std::cout << "  Reusing TrafficGen process (PID: " << prep.pid << ")..." << std::endl;
@@ -674,37 +556,25 @@ bool TrafficGenProcessManager::prepare_traffic_gen(double ratio_pct,
         }
     }
 
+    // Owned children must be reaped before the legacy MPI/orphan cleanup scans.
+    // Otherwise a killed direct child remains a zombie until the next group reset.
+    if (!traffic_gen_group_.members().empty()) {
+        traffic_gen_group_.terminate_all();
+        active_traffic_gen_pid_ = 0;
+    }
     if (!cleanup_zombie_traffic_gen()) {
         std::cerr << "ERROR: Failed to clean up existing TrafficGen processes" << std::endl;
         return false;
     }
 
     platform::ProcessId traffic_gen_pid = 0;
-    bool launched = false;
-
-    bool force_process_launch = !config_.traffic_gen_explicit_cores.empty();
-
-#if USE_MPI_SPAWN == 0
-    force_process_launch = true;
-#endif
-
-    if (force_process_launch) {
-        if (mode == ExecutionMode::MULTISEQUENTIAL) {
-            launched = launch_traffic_gen_multiseq(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                                         traffic_gen_log_file, traffic_gen_pid);
-        }
-    } else {
-#if USE_MPI_SPAWN
-        launched = launch_traffic_gen_mpi(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                                     traffic_gen_log_file, traffic_gen_pid);
-#endif
-    }
+    const bool launched = launch_for_mode(mode, ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
 
     if (!launched) {
+        kill_all_traffic_gen();
         return false;
     }
 
-    current_traffic_gen_pid_ = traffic_gen_pid;
     active_traffic_gen_pid_ = traffic_gen_pid;
     prep.pid = traffic_gen_pid;
     prep.reused_existing = false;
@@ -727,142 +597,100 @@ bool TrafficGenProcessManager::relaunch_traffic_gen(double ratio_pct,
                                            const std::string& traffic_gen_log_file,
                                            ExecutionMode mode) {
     platform::ProcessId traffic_gen_pid = 0;
-    bool force_process_launch = !config_.traffic_gen_explicit_cores.empty();
-#if USE_MPI_SPAWN == 0
-    force_process_launch = true;
-#endif
 
-    if (force_process_launch) {
-        bool ret = false;
-        if (mode == ExecutionMode::MULTISEQUENTIAL) {
-            ret = launch_traffic_gen_multiseq(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                               traffic_gen_log_file, traffic_gen_pid);
-        }
-        if (!ret) return false;
-    } else {
-#if USE_MPI_SPAWN
-        if (!launch_traffic_gen_mpi(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                               traffic_gen_log_file, traffic_gen_pid)) {
-            return false;
-        }
-#endif
+
+    if (!launch_for_mode(mode, ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid)) {
+        return false;
     }
-    current_traffic_gen_pid_ = traffic_gen_pid;
+
     active_traffic_gen_pid_ = traffic_gen_pid;
     return true;
 }
 
 bool TrafficGenProcessManager::is_traffic_gen_running(platform::ProcessId pid) const {
-    if (pid <= 0) {
-        return false;
-    }
-#if defined(_WIN32)
-    // The public PID identifies a batch. Every worker must still be alive.
+    if (pid <= 0) return false;
     const auto members = traffic_gen_group_.members();
-    return !members.empty() &&
-           std::find(members.begin(), members.end(), pid) != members.end() &&
-           traffic_gen_group_.alive() == static_cast<int>(members.size());
-#else
+    if (!members.empty()) {
+        return std::find(members.begin(), members.end(), pid) != members.end() &&
+               traffic_gen_group_.alive() == static_cast<int>(members.size());
+    }
+    // MPI launchers are owned by the MPI backend, not the local process group.
     return platform::process_exists(pid);
-#endif
 }
 
 void TrafficGenProcessManager::terminate_traffic_gen(platform::ProcessId pid) {
-    if (pid <= 0) {
+    if (pid <= 0) return;
+    const auto members = traffic_gen_group_.members();
+    if (std::find(members.begin(), members.end(), pid) != members.end()) {
+        traffic_gen_group_.terminate_all();
+        active_traffic_gen_pid_ = 0;
+        persistent_traffic_gen_valid_ = false;
         return;
     }
-#if defined(_WIN32)
-    // Callers mean the whole batch, so the job is closed rather than the pid signalled.
-    traffic_gen_group_.terminate_all();
-#endif
     stop_process_tree(pid, std::chrono::milliseconds(500));
-    if (pid == current_traffic_gen_pid_) {
-        current_traffic_gen_pid_ = 0;
-    }
-    if (pid == active_traffic_gen_pid_) {
-        active_traffic_gen_pid_ = 0;
-    }
+    if (pid == active_traffic_gen_pid_) active_traffic_gen_pid_ = 0;
+    persistent_traffic_gen_valid_ = false;
 }
 
 void TrafficGenProcessManager::kill_all_traffic_gen() {
-    if (current_traffic_gen_pid_ > 0) {
-        terminate_traffic_gen(current_traffic_gen_pid_);
-    }
-    if (active_traffic_gen_pid_ > 0) {
+    const auto members = traffic_gen_group_.members();
+    if (!members.empty()) {
+        traffic_gen_group_.terminate_all();
+        active_traffic_gen_pid_ = 0;
+    } else if (active_traffic_gen_pid_ > 0) {
         terminate_traffic_gen(active_traffic_gen_pid_);
     }
     cleanup_zombie_traffic_gen();
-    current_traffic_gen_pid_ = 0;
     active_traffic_gen_pid_ = 0;
     persistent_traffic_gen_valid_ = false;
-    if (!ready_fifo_path_.empty()) {
-        platform::MessagePipe::destroy_endpoint(ready_fifo_path_);
+    if (!ready_fifo_path_.empty()) platform::MessagePipe::destroy_endpoint(ready_fifo_path_);
+}
+
+bool TrafficGenProcessManager::launch_for_mode(ExecutionMode mode, double ratio_pct, int pause, int traffic_gen_cores, const std::vector<int>& traffic_gen_mem_nodes, const std::string& traffic_gen_log_file, platform::ProcessId& traffic_gen_pid) {
+#if USE_MPI_SPAWN
+    if (config_.traffic_gen_explicit_cores.empty()) {
+        return launch_traffic_gen_mpi(mode, ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
     }
+#endif
+    return launch_single_mode(mode, ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
 }
 
-bool TrafficGenProcessManager::launch_traffic_gen_multiseq(double ratio_pct,
-                                                 int pause,
-                                                 int traffic_gen_cores,
-                                                 const std::vector<int>& traffic_gen_mem_nodes,
-                                                 const std::string& traffic_gen_log_file,
-                                                 platform::ProcessId& traffic_gen_pid) const {
-    return launch_traffic_gen_impl(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                                                traffic_gen_log_file, traffic_gen_pid);
-
-}
-
-
-bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
-                                                 int pause,
-                                                 int traffic_gen_cores,
-                                                 const std::vector<int>& traffic_gen_mem_nodes,
-                                                 const std::string& traffic_gen_log_file,
-                                                 platform::ProcessId& traffic_gen_pid
-                                                ) const {
-    std::string pid_filename = "/tmp/traffic_gen_pid_" + std::to_string(getpid()) + "_" +
-                               std::to_string(static_cast<int>(ratio_pct)) + "_" +
-                               std::to_string(pause) + ".tmp";
-
-    std::vector<std::string> cores;
-    if (!resolve_core_list(traffic_gen_cores, config_.traffic_gen_explicit_cores, cores)) {
-        std::cerr << "ERROR: Failed to select core list" << std::endl;
+bool TrafficGenProcessManager::launch_single_mode(ExecutionMode mode, double ratio_pct, int pause, int traffic_gen_cores, const std::vector<int>& traffic_gen_mem_nodes, const std::string& traffic_gen_log_file, platform::ProcessId& traffic_gen_pid) {
+    std::vector<std::string> resolved_cores;
+    if (!resolve_core_list(traffic_gen_cores, config_.traffic_gen_explicit_cores, resolved_cores)) {
+        std::cerr << "ERROR: Failed to select MultiSequential core list" << std::endl;
         return false;
     }
 
-    expected_ready_count_ = static_cast<int>(cores.size());
+    if (!prepare_ready_fifo(static_cast<int>(resolved_cores.size()))) {
+        return false;
+    }
+
+    traffic_gen_group_.terminate_all();
+    traffic_gen_group_ = platform::ProcessGroup();
+    return launch_traffic_gen_impl(mode, ratio_pct, pause, resolved_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
+}
+
+
+
+bool TrafficGenProcessManager::launch_traffic_gen_impl(ExecutionMode mode, double ratio_pct, int pause, const std::vector<std::string>& cores, const std::vector<int>& traffic_gen_mem_nodes, const std::string& traffic_gen_log_file, platform::ProcessId& traffic_gen_pid) {
+    if (cores.empty()) {
+        std::cerr << "ERROR: Cannot launch TrafficGen with an empty core list" << std::endl;
+        return false;
+    }
 
     const auto& cache = SystemToolsCache::instance();
     bool have_taskset = cache.have_taskset;
     bool have_numactl = cache.have_numactl;
 
-    std::string bin_name = "traffic_gen_multiseq.x";
     std::string mode_label = "MultiSeq";
 
-    std::string worker_executable;
-    std::filesystem::path build_bin = platform::runtime_directory();
-    const std::string bin_file = platform::exe_name(bin_name);
-    std::filesystem::path binary_path = build_bin / bin_file;
+    const std::string bin_file = traffic_gen_binary(mode);
 
-    if (std::filesystem::exists(binary_path)) {
-        worker_executable = string_utils::shell_quote(binary_path.string());
-    } else {
-        worker_executable = "./" + bin_file;
-    }
-
-    const std::string quoted_log_file = string_utils::shell_quote(traffic_gen_log_file);
     std::vector<std::string> worker_cmds;
-    
+
     const std::map<int, CpuTopology>& cpu_topo = cache.cpu_topology;
-    std::map<int, std::set<int>> socket_nodes_map = get_socket_to_nodes_map(cpu_topo);
-    (void)socket_nodes_map;
-    
-    std::string explicit_membind_str;
-    if (!traffic_gen_mem_nodes.empty()) {
-        for (size_t i = 0; i < traffic_gen_mem_nodes.size(); ++i) {
-            explicit_membind_str += std::to_string(traffic_gen_mem_nodes[i]);
-            if (i < traffic_gen_mem_nodes.size() - 1) explicit_membind_str += ",";
-        }
-    }
+    const std::string explicit_membind_str = string_utils::join(traffic_gen_mem_nodes, ",");
 
     std::map<std::string, std::vector<int>> node_to_cores;
 
@@ -883,14 +711,6 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
     uint64_t active_array_elements = active_traffic_gen_array_elements();
 
 
-    if (!ready_fifo_path_.empty()) {
-        platform::MessagePipe::destroy_endpoint(ready_fifo_path_);
-        if (!platform::MessagePipe::create_endpoint(ready_fifo_path_)) {
-            std::cerr << "Warning: Failed to create ready FIFO " << ready_fifo_path_
-                      << ": " << std::strerror(errno) << std::endl;
-        }
-    }
-
     std::vector<std::string> worker_args = {
         "-r", std::to_string(static_cast<int>(ratio_pct)),
         "-p", std::to_string(pause), "-w", std::to_string(cores.size()),
@@ -909,16 +729,13 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
     (void)have_taskset;
     (void)have_numactl;
     (void)bind_aligned_with_cores;
-    (void)pid_filename;
 
-    traffic_gen_group_.terminate_all();
-    traffic_gen_group_ = platform::ProcessGroup();
     if (!traffic_gen_group_.valid()) {
         std::cerr << "ERROR: Could not create the TrafficGen job object" << std::endl;
         return false;
     }
 
-    const std::filesystem::path win_worker_path = build_bin / bin_file;
+    const std::filesystem::path win_worker_path = platform::runtime_directory() / bin_file;
     const std::string win_worker_exe = std::filesystem::exists(win_worker_path)
         ? win_worker_path.string()
         : bin_file;
@@ -951,10 +768,13 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
         }
     }
 
-    // The POSIX launcher reports the subshell's pid; the first worker plays that role here.
+    // The public PID identifies the whole owned worker group.
     traffic_gen_pid = traffic_gen_group_.members().front();
     return true;
 #else
+    if (!traffic_gen_group_.valid()) return false;
+
+    const std::string worker_exe = worker_executable(bin_file);
 
 #ifdef __APPLE__
     int apple_ecores = 0;
@@ -964,7 +784,7 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
             apple_ecores = 0;
         }
     }
-    size_t apple_worker_idx = 0;
+    size_t apple_worker_idx = traffic_gen_group_.members().size();
 #endif
     for (const auto& core_str : cores) {
         int core_id = -1;
@@ -997,14 +817,14 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
         std::string cmd;
         if (have_numactl && have_taskset) {
             cmd = "numactl --membind=" + membind_arg + " taskset -c " + core_str + " " +
-                  worker_executable + worker_args;
+                  worker_exe + worker_args;
         } else if (have_numactl) {
             cmd = "numactl --membind=" + membind_arg + " --physcpubind=" + core_str + " " +
-                  worker_executable + worker_args;
+                  worker_exe + worker_args;
         } else if (have_taskset) {
-            cmd = "taskset -c " + core_str + " " + worker_executable + worker_args;
+            cmd = "taskset -c " + core_str + " " + worker_exe + worker_args;
         } else {
-            cmd = worker_executable + worker_args;
+            cmd = worker_exe + worker_args;
         }
 #ifdef __APPLE__
         if (apple_worker_idx < (size_t)apple_ecores) {
@@ -1014,14 +834,6 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
 #endif
         worker_cmds.push_back(cmd);
     }
-
-    std::string spawn_script;
-    for (const auto& cmd : worker_cmds) {
-        spawn_script += cmd + " >>" + quoted_log_file + " 2>&1 & ";
-    }
-    spawn_script += "wait";
-
-    std::string launcher = "set -m; ( " + spawn_script + " ) & echo $! > " + pid_filename;
 
     if (config_.verbosity >= 2) {
         std::cout << "    Launching TrafficGen (" << mode_label << " - " << cores.size() << " procs)";
@@ -1056,28 +868,23 @@ bool TrafficGenProcessManager::launch_traffic_gen_impl(double ratio_pct,
         }
     }
 
-    int traffic_gen_ret = system(launcher.c_str());
-    if (traffic_gen_ret != 0) {
-        std::cerr << "ERROR: Failed to launch TrafficGen" << std::endl;
-        return false;
+    platform::SpawnOptions spawn_opts;
+    spawn_opts.log_path = platform::local_path(traffic_gen_log_file);
+    for (const auto& cmd : worker_cmds) {
+        // exec keeps the owned PID through taskset/numactl/taskpolicy and the worker.
+        if (traffic_gen_group_.spawn("/bin/sh", {"-c", "exec " + cmd}, spawn_opts) <= 0) {
+            std::cerr << "ERROR: Failed to launch TrafficGen: " << traffic_gen_group_.error() << '\n';
+            traffic_gen_group_.terminate_all();
+            return false;
+        }
     }
-
-    if (!read_traffic_gen_pid(pid_filename, traffic_gen_pid)) {
-        std::cerr << "ERROR: Could not obtain TrafficGen PID" << std::endl;
-        return false;
-    }
+    traffic_gen_pid = traffic_gen_group_.members().front();
     return true;
 #endif  // _WIN32
 }
 
 #if USE_MPI_SPAWN
-bool TrafficGenProcessManager::launch_traffic_gen_mpi(double ratio_pct,
-                                             int pause,
-                                             int traffic_gen_cores,
-                                             const std::vector<int>& traffic_gen_mem_nodes,
-                                             const std::string& traffic_gen_log_file,
-                                             platform::ProcessId& traffic_gen_pid
-                                             ) const {
+bool TrafficGenProcessManager::launch_traffic_gen_mpi(ExecutionMode mode, double ratio_pct, int pause, int traffic_gen_cores, const std::vector<int>& traffic_gen_mem_nodes, const std::string& traffic_gen_log_file, platform::ProcessId& traffic_gen_pid) {
     std::string pid_filename = "/tmp/traffic_gen_pid_" + std::to_string(getpid()) + "_" +
                                std::to_string(static_cast<int>(ratio_pct)) + "_" +
                                std::to_string(pause) + ".tmp";
@@ -1087,19 +894,10 @@ bool TrafficGenProcessManager::launch_traffic_gen_mpi(double ratio_pct,
         return false;
     }
 
-    if (!config_.traffic_gen_explicit_cores.empty()) {
-
-        if (config_.verbosity >= 1) {
-           std::cout << "    Notice: Explicit core list with cross-socket binding is not fully supported in MPI mode yet." << std::endl;
-           std::cout << "            Falling back to standard MultiSequential launcher for accurate binding." << std::endl;
-        }
-        return launch_traffic_gen_multiseq(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
-    }
-
     const int selected_core_count = static_cast<int>(cores.size());
     expected_ready_count_ = selected_core_count;
 
-    std::string core_list = join_core_list(cores, ",");
+    std::string core_list = string_utils::join(cores, ",");
 
     const auto& cache = SystemToolsCache::instance();
     bool have_srun = cache.have_srun;
@@ -1110,23 +908,12 @@ bool TrafficGenProcessManager::launch_traffic_gen_mpi(double ratio_pct,
         if (config_.verbosity >= 1) {
             std::cout << "    Notice: MPI launchers not found. Falling back to taskset method." << std::endl;
         }
-        return launch_traffic_gen_multiseq(ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes,
-                                 traffic_gen_log_file, traffic_gen_pid);
+        return launch_single_mode(mode, ratio_pct, pause, traffic_gen_cores, traffic_gen_mem_nodes, traffic_gen_log_file, traffic_gen_pid);
     }
 
     bool use_srun = have_srun;
 
-    std::string worker_executable;
-    std::filesystem::path build_bin = platform::runtime_directory();
-    std::string bin_name = "traffic_gen_multiseq.x";
-    const std::string bin_file = platform::exe_name(bin_name);
-    std::filesystem::path binary_path = build_bin / bin_file;
-
-    if (std::filesystem::exists(binary_path)) {
-        worker_executable = string_utils::shell_quote(binary_path.string());
-    } else {
-        worker_executable = "./" + bin_file;
-    }
+    const std::string worker_exe = worker_executable(traffic_gen_binary(mode));
     std::string worker_args = " -r " + std::to_string(static_cast<int>(ratio_pct)) +
                               " -p " + std::to_string(pause) +
                               " -w " + std::to_string(selected_core_count);
@@ -1163,22 +950,22 @@ bool TrafficGenProcessManager::launch_traffic_gen_mpi(double ratio_pct,
         if (have_numactl) {
             spawn_cmd = "srun -n " + std::to_string(selected_core_count) +
                         " --cpu-bind=map_cpu:" + core_list +
-                        srun_mem_bind_option + " " + numactl_cmd + " " + worker_executable +
+                        srun_mem_bind_option + " " + numactl_cmd + " " + worker_exe +
                         worker_args + " >>" + string_utils::shell_quote(traffic_gen_log_file) + " 2>&1";
         } else {
             spawn_cmd = "srun -n " + std::to_string(selected_core_count) +
                         " --cpu-bind=map_cpu:" + core_list +
-                        srun_mem_bind_option + " " + worker_executable +
+                        srun_mem_bind_option + " " + worker_exe +
                         worker_args + " >>" + string_utils::shell_quote(traffic_gen_log_file) + " 2>&1";
         }
     } else {
         if (have_numactl) {
             spawn_cmd = numactl_cmd + " mpirun -np " + std::to_string(selected_core_count) +
-                        " --bind-to core " + worker_executable + worker_args + " >>" +
+                        " --bind-to core " + worker_exe + worker_args + " >>" +
                         string_utils::shell_quote(traffic_gen_log_file) + " 2>&1";
         } else {
             spawn_cmd = "mpirun -np " + std::to_string(selected_core_count) +
-                        " --bind-to core " + worker_executable + worker_args + " >>" +
+                        " --bind-to core " + worker_exe + worker_args + " >>" +
                         string_utils::shell_quote(traffic_gen_log_file) + " 2>&1";
         }
     }
@@ -1248,8 +1035,7 @@ bool TrafficGenProcessManager::read_traffic_gen_pid(const std::string& pid_filen
     return have_pid;
 }
 
-static bool no_traffic_gen_running() {
-    auto pids = list_traffic_gen_pids();
+static bool no_traffic_gen_running(const std::vector<platform::ProcessId>& pids) {
     for (platform::ProcessId pid : pids) {
         if (process_alive_and_running(pid)) {
             return false;
@@ -1270,7 +1056,6 @@ static std::string get_process_info(platform::ProcessId pid) {
                 line.rfind("Name:", 0) == 0  || line.rfind("Tgid:", 0) == 0) {
                 line.erase(0, line.find_first_not_of(" \t", line.find(':') + 1));
                 if (line.empty()) continue;
-                std::string key = line.substr(0, line.find(':'));
                 info << " | " << line;
             }
         }
@@ -1281,14 +1066,14 @@ static std::string get_process_info(platform::ProcessId pid) {
         info << " | kill(0)=err:" << strerror(kill_err);
     }
 #else
-    if (process_is_zombie(pid)) info << " [zombie]";
+    if (proc_state(pid) == 'Z') info << " [zombie]";
     else if (!process_exists(pid)) info << " [gone]";
     else info << " [alive]";
 #endif
     return info.str();
 }
 
-bool TrafficGenProcessManager::cleanup_zombie_traffic_gen() const {
+bool TrafficGenProcessManager::cleanup_zombie_traffic_gen() {
 #if defined(_WIN32)
     // signal_process_tree() would reach only worker 0. Closing the job takes all of them.
     traffic_gen_group_.terminate_all();
@@ -1298,11 +1083,8 @@ bool TrafficGenProcessManager::cleanup_zombie_traffic_gen() const {
     if (active_traffic_gen_pid_ > 0) {
         targets.push_back(active_traffic_gen_pid_);
     }
-    if (current_traffic_gen_pid_ > 0 && current_traffic_gen_pid_ != active_traffic_gen_pid_) {
-        targets.push_back(current_traffic_gen_pid_);
-    }
-    auto scanned = list_traffic_gen_pids();
-    targets.insert(targets.end(), scanned.begin(), scanned.end());
+    auto descendants = collect_descendant_traffic_gen_pids(targets);
+    targets.insert(targets.end(), descendants.begin(), descendants.end());
     std::sort(targets.begin(), targets.end());
     targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
 
@@ -1316,28 +1098,29 @@ bool TrafficGenProcessManager::cleanup_zombie_traffic_gen() const {
             all_stopped = false;
         }
     }
-    if (all_stopped && no_traffic_gen_running()) {
+    if (all_stopped && no_traffic_gen_running(targets)) {
         return true;
     }
 
     for (int attempt = 0; attempt < 3; ++attempt) {
-        auto survivors = list_traffic_gen_pids();
-        for (platform::ProcessId pid : survivors) {
+        for (platform::ProcessId pid : targets) {
             if (process_alive_and_running(pid)) {
                 signal_process_tree(pid, platform::Stop::Force);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200 * (attempt + 1)));
 
-        if (no_traffic_gen_running()) {
+        if (no_traffic_gen_running(targets)) {
             return true;
         }
     }
 
-    auto remaining = list_traffic_gen_pids();
+    std::vector<platform::ProcessId> remaining;
+    for (const auto pid : targets) if (process_exists(pid)) remaining.push_back(pid);
     bool all_harmless = true;
     for (platform::ProcessId pid : remaining) {
-        if (!process_is_zombie(pid) && !process_is_disk_sleep(pid)) {
+        const char state = proc_state(pid);
+        if (state != 'Z' && state != 'D') {
             all_harmless = false;
             break;
         }
@@ -1365,59 +1148,42 @@ bool TrafficGenProcessManager::cleanup_zombie_traffic_gen() const {
 }
 
 std::vector<platform::ProcessId> TrafficGenProcessManager::traffic_gen_worker_pids() const {
-#if defined(_WIN32)
-    // Report live workers for comparison with the expected batch size.
-    std::vector<platform::ProcessId> live;
-    for (platform::ProcessId pid : traffic_gen_group_.members()) {
-        if (platform::process_exists(pid)) {
-            live.push_back(pid);
-        }
+    const auto members = traffic_gen_group_.members();
+    if (!members.empty()) {
+        traffic_gen_group_.alive(); // Reap exited children before reporting live workers.
+        std::vector<platform::ProcessId> live;
+        for (const auto pid : members) if (platform::process_exists(pid)) live.push_back(pid);
+        return live;
     }
-    return live;
-#else
+#if !defined(_WIN32)
     std::vector<platform::ProcessId> roots;
     if (active_traffic_gen_pid_ > 0) {
         roots.push_back(active_traffic_gen_pid_);
     }
-    if (current_traffic_gen_pid_ > 0 && current_traffic_gen_pid_ != active_traffic_gen_pid_) {
-        roots.push_back(current_traffic_gen_pid_);
-    }
-
-    std::sort(roots.begin(), roots.end());
-    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
 
     std::vector<platform::ProcessId> worker_pids = collect_descendant_traffic_gen_pids(roots);
     if (!worker_pids.empty()) {
         return worker_pids;
     }
 
-    std::vector<platform::ProcessId> scanned = list_traffic_gen_pids();
-    std::vector<platform::ProcessId> live_pids;
-    for (platform::ProcessId pid : scanned) {
-        if (process_alive_and_running(pid)) {
-            live_pids.push_back(pid);
-        }
-    }
-    return live_pids;
+    // No global scan: an empty owned workload must report no workers.
+    return {};
+#else
+    return {};
 #endif
 }
 
 
 std::string TrafficGenProcessManager::get_membind_arg(int default_node) const {
-    std::string membind_arg;
-    
-    if (!config_.memory_bind_nodes.empty()) {
-        for (size_t i = 0; i < config_.memory_bind_nodes.size(); ++i) {
-            membind_arg += std::to_string(config_.memory_bind_nodes[i]);
-            if (i < config_.memory_bind_nodes.size() - 1) membind_arg += ",";
-        }
-    } else {
-        membind_arg = std::to_string(default_node);
+    if (config_.memory_bind_nodes.empty()) {
+        return std::to_string(default_node);
     }
-    return membind_arg;
+    return string_utils::join(config_.memory_bind_nodes, ",");
 }
 
-bool TrafficGenProcessManager::resolve_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& out_cores) const {
+
+
+bool TrafficGenProcessManager::resolve_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& out_cores) {
     bool can_use_cache = true;
     
     if (explicit_cores != cached_explicit_cores_) {
@@ -1437,7 +1203,7 @@ bool TrafficGenProcessManager::resolve_core_list(int traffic_gen_cores, const st
         return true;
     }
 
-    if (collect_core_list(traffic_gen_cores, explicit_cores, out_cores)) {
+    if (resolve_traffic_gen_core_list(traffic_gen_cores, explicit_cores, out_cores)) {
         cached_core_list_ = out_cores;
         cached_traffic_gen_cores_ = traffic_gen_cores;
         cached_explicit_cores_ = explicit_cores;

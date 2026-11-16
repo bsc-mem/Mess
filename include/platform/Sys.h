@@ -36,6 +36,7 @@
 #ifndef PLATFORM_SYS_H
 #define PLATFORM_SYS_H
 
+#include <cstdint>
 #include <vector>
 
 namespace platform {
@@ -53,6 +54,17 @@ struct CpuPlacement {
 std::vector<CpuPlacement> cpu_placements();
 bool large_pages_available();
 bool cpu_is_amd();
+
+class SleepInhibitor {
+public:
+    SleepInhibitor();
+    ~SleepInhibitor();
+    SleepInhibitor(const SleepInhibitor&) = delete;
+    SleepInhibitor& operator=(const SleepInhibitor&) = delete;
+
+private:
+    uint32_t assertion_ = 0;
+};
 
 }
 

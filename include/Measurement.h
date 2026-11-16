@@ -46,6 +46,9 @@
 #include <unordered_set>
 #include <vector>
 
+struct TrafficGenHealthChecker;
+class BandwidthStabilizer;
+
 /**
  * @file Measurement.h
  * @brief Storage and measurement abstractions used by benchmark execution and profiling.
@@ -88,7 +91,8 @@ public:
 
     void cleanup_measurement_files(double ratio_pct, int pause) const;
     void ensure_directories_exist() const;
-    void write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr) const;
+    void write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, int worker_cores,
+    double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr) const;
 
     void set_bytes_per_cas(int bytes) { bytes_per_cas_ = bytes; }
     int bw_bytes_per_cas() const { return bytes_per_cas_ > 0 ? bytes_per_cas_ : cache_line_size_; }
@@ -149,6 +153,10 @@ public:
     void set_sampling_interval_ms(double interval) { sampling_interval_ms_ = interval; }
     double sampling_interval_ms() const { return sampling_interval_ms_; }
     double stability_noise_floor_gbps() const { return stability_noise_floor_gbps_; }
+    void set_cancellation_check(std::function<bool()> check) { cancellation_check_ = std::move(check); }
+    virtual bool shutdown() { return true; }
+    virtual bool allows_unstable_samples() const { return true; }
+    virtual bool pools_stabilized_window() const { return false; }
 
     /**
      * @brief Collects one raw bandwidth sample.
@@ -172,20 +180,7 @@ public:
                                 bool reuse_existing_traffic_gen,
                                 std::function<void()> on_sample_callback = nullptr) = 0;
 
-    void set_counter_selection(const BandwidthCounterSelection& selection) {
-        counter_selection_ = selection;
-        scaling_factor_initialized_ = false;
-        cached_scaling_factor_ = 1.0;
-        if (sys_info_.socket_count > 0 && sys_info_.sockets[0].cache_count > 0) {
-            cached_cache_line_size_ = sys_info_.sockets[0].caches[0].line_size_bytes;
-        }
-        if (selection.cas.uses_read_subtract_formula) {
-            cached_cache_line_size_ = 256;
-        }
-        if (selection.cas.bytes_per_cas > 0) {
-            cached_cache_line_size_ = selection.cas.bytes_per_cas;
-        }
-    }
+    void set_counter_selection(const BandwidthCounterSelection& selection);
 
     const BandwidthCounterSelection& get_counter_selection() const {
         return counter_selection_;
@@ -221,12 +216,20 @@ protected:
     
     int cached_cache_line_size_ = 64;
     double cached_scaling_factor_ = 1.0;
-    mutable bool scaling_factor_initialized_ = false;
+
+    std::function<bool()> cancellation_check_;
+    bool cancellation_requested() const {
+        return cancellation_check_ && cancellation_check_();
+    }
 
     // Success means all workers have reported ready and remain alive.
-    bool relaunch_traffic_gen(int ratio, int pause, int traffic_gen_cores);
-    void ensure_scaling_factor_cached() const;
+    bool relaunch_traffic_gen(int ratio, int pause);
+    bool ensure_traffic_gen_running(int ratio, int pause, int& relaunch_attempts);
     int get_traffic_gen_cores() const;
+    TrafficGenHealthChecker traffic_gen_health() const;
+    double achievable_peak_gbps(bool remote) const;
+    BandwidthStabilizer make_stabilizer(double peak_gbps, int pause, size_t window, bool allow_forced = true);
+    double bandwidth_gbps(long long rd, long long wr, double seconds) const;
     
 public:
     using MonitorSampleExtras = std::map<std::string, long long>;

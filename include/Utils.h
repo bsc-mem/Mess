@@ -107,7 +107,12 @@ std::string replace_template_variables(const std::string& template_content,
                                       const std::map<std::string, std::string>& replacements);
 
 int get_numa_node_of_cpu(int cpu);
-void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr);
+struct BenchmarkConfig;
+bool resolve_traffic_gen_core_list(int requested, const std::vector<std::string>& explicit_cores, std::vector<std::string>& cores);
+int get_traffic_gen_worker_count(const BenchmarkConfig& config, const system_info& info);
+void append_gpu_workload_config_to_plotter(const std::filesystem::path& path, const BenchmarkConfig& config);
+void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, int worker_cores,
+    double upi_scaling_factor = 0.0, double page_walk_lat_ns = -1.0, const GPUCapabilities* gpu_caps = nullptr);
 
 /**
  * @brief Per-NUMA-node memory characterization, derived from HMAT/sysfs/daxctl.

@@ -42,7 +42,8 @@
 #include <map>
 #include <string>
 #include <chrono>
-#include <future>
+#include <csignal>
+#include <deque>
 #include <thread>
 #include <semaphore.h>
 #include <memory>
@@ -63,9 +64,6 @@
  */
 
 /**
- * @brief Coordinates traffic generation, bandwidth measurement, latency measurement, and result aggregation.
- */
-/**
  * @brief Coordinates the full execution flow of the memory benchmark.
  * 
  * The `BenchmarkExecutor` acts as the master controller for the test lifecycle.
@@ -85,6 +83,14 @@ private:
     const CPUCapabilities& caps_;
     std::vector<BenchmarkResult> results_;
     int bw_bytes_per_cas_;
+    int cache_line_size_;
+    double tlb_latency_ns_;
+    std::string expected_tlb1_event_;
+    std::string expected_tlb2_event_;
+    CPUCapabilities plotter_caps_;
+    std::string plotter_binding_type_;
+    double plotter_upi_scaling_factor_ = 0.0;
+    double plotter_page_walk_lat_ns_ = -1.0;
 
     static const int LAT_REQUIRED_STABLE_COUNT = 3;
     BandwidthCounterStrategy* counter_strategy_;
@@ -92,12 +98,17 @@ private:
     std::unique_ptr<TrafficGenProcessManager> traffic_gen_manager_;
     std::unique_ptr<PtrChaseProcessManager> ptrchase_manager_;
     
-    std::unique_ptr<MeasurementStorage> measurement_storage_multiseq_;
-    std::unique_ptr<BandwidthMeasurer> bandwidth_measurer_multiseq_;
-    std::unique_ptr<LatencyMeasurer> latency_measurer_multiseq_;
-    std::unique_ptr<OutlierDetector> outlier_detector_multiseq_;
+    struct ModeResources {
+        std::unique_ptr<MeasurementStorage> storage;
+        std::unique_ptr<BandwidthMeasurer> bandwidth;
+        std::unique_ptr<LatencyMeasurer> latency;
+        std::unique_ptr<OutlierDetector> outliers;
+    };
+    std::map<ExecutionMode, ModeResources> mode_resources_;
+    void initialize_mode_resources(ExecutionMode mode, const std::string& output_root);
+    void write_mode_metadata(ExecutionMode mode);
+    const ModeResources* resources_for_mode(ExecutionMode mode) const;
 
-    
     std::unique_ptr<InstructionSampler> instruction_sampler_;
     // Instruction sampling has no pointer-chase bursts; calibrate lazily once.
     double sampler_frequency_ghz_ = 0.0;
@@ -108,6 +119,9 @@ private:
 
     mutable BandwidthCounterSelection cached_bw_counters_;
     mutable bool bw_counters_discovered_ = false;
+    bool measurement_backends_shutdown_ = false;
+    bool measurement_backends_shutdown_ok_ = true;
+    static volatile std::sig_atomic_t stop_requested_;
     void discover_bandwidth_counters_if_needed() const;
 
     enum class BenchmarkStatus {
@@ -127,12 +141,12 @@ private:
 
     std::vector<int> get_memory_binding_nodes() const;    
 
-    void cleanup_measurement_files(double ratio_pct, int pause) const;
-
     std::string mode_label(ExecutionMode mode) const;
     MeasurementStorage* storage_for_mode(ExecutionMode mode) const;
     OutlierDetector* outlier_detector_for_mode(ExecutionMode mode) const;
     BandwidthMeasurer* bandwidth_measurer_for_mode(ExecutionMode mode) const;
+    int resolved_traffic_gen_cores() const;
+
     void flush_point_results(double ratio_pct,
                              int pause,
                              ExecutionMode mode,
@@ -154,12 +168,17 @@ private:
     std::string format_bandwidth_output(const BenchmarkResult& result, const BandwidthCounterSelection& selection) const;
     std::string format_latency_output(const BenchmarkResult& result, pid_t ptrchase_pid) const;
 
-    double get_upi_scaling_factor() const;
+    bool start_point_traffic(MeasurementStorage& storage, double ratio_pct, int pause, ExecutionMode mode, bool reuse_traffic_gen, TrafficGenPreparation& prep);
+    bool last_bursts_stable(const std::deque<PerfBurstCounters>& samples) const;
+    bool collect_latency_bursts(LatencyMeasurer& latency, std::deque<PerfBurstCounters>& samples);
+    BenchmarkStatus recheck_bandwidth(const BandwidthMeasurer& bandwidth, long long& rd, long long& wr, double& seconds, bool pool_stabilized_window);
+    double point_bandwidth_gbps(CounterType type, long long rd, long long wr, double seconds) const;
     std::vector<int> resolve_monitored_nodes(int src_cpu) const;
 
     bool run_adaptive_for_ratio(double ratio_pct,
                                 const std::vector<ExecutionMode>& modes,
                                 int& total_global_measurements);
+    bool run_fixed_pauses_for_ratio(double ratio_pct, const std::vector<ExecutionMode>& modes, int& total_global_measurements);
     AdaptiveMeasuredPoint adaptive_probe(double ratio_pct, int pause,
                                          ExecutionMode mode,
                                          int& total_global_measurements,
@@ -167,6 +186,11 @@ private:
                                          bool count_progress = true,
                                          bool replace_existing = false);
 public:
+    void force_cleanup();
+    bool shutdown_measurement_backends();
+    static void request_stop() noexcept { stop_requested_ = 1; }
+    static bool stop_requested() noexcept { return stop_requested_ != 0; }
+
     /**
      * @brief Builds an executor bound to a resolved runtime configuration.
      * @param config Benchmark configuration to execute.
@@ -175,7 +199,6 @@ public:
      * @param tlb_latency_ns Cached TLB-hit penalty used when correcting latency.
      * @param cache_line_size Cache-line size used for bandwidth conversion.
      */
-    void force_cleanup();
     BenchmarkExecutor(const BenchmarkConfig& config, const system_info& sys_info, const CPUCapabilities& caps,
                      double tlb_latency_ns = 7.0, int cache_line_size = 64);
 

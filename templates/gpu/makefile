@@ -41,7 +41,7 @@ WORKLOADS := $(patsubst %.cu,%.o,$(wildcard workload_*.cu))
 main: main.o $(WORKLOADS)
 	nvcc $(NVCC_GENCODE) -o $@ $^ -L"$(CUPTI_HOME)/lib64" -Xlinker -rpath,"$(CUPTI_HOME)/lib64" -lcupti -lcuda
 
-main.o: main.cu kernels.cuh range_profiler.cuh workloads.cuh loopGPU.h
+main.o: main.cu kernels.cuh profiler.cuh range_profiler.cuh legacy_profiler.cuh workloads.cuh loopGPU.h
 $(WORKLOADS): kernels.cuh loopGPU.h
 
 %.o: %.cu

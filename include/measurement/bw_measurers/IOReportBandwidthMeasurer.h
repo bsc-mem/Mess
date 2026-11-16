@@ -11,7 +11,7 @@
  * modification, are permitted provided that the following conditions are met:
  *
  *     * Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and this disclaimer.
+ *       this list of conditions and the following disclaimer.
  *
  *     * Redistributions in binary form must reproduce the above copyright
  *       notice, this list of conditions and the following disclaimer in the
@@ -51,6 +51,7 @@ public:
 
     bool sample_bandwidth(long long& cas_rd, long long& cas_wr, double& elapsed,
                           const std::vector<int>& mem_nodes) const override;
+    bool pools_stabilized_window() const override { return true; }
 
     bool wait_for_stabilization(int& samples_collected, long long& bw_cas_rd, long long& bw_cas_wr,
                                 double& bw_elapsed, int pause, int ratio_pct,
@@ -62,6 +63,8 @@ private:
     IOReportState* state_ = nullptr;
 
     bool ensure_subscribed() const;
+    void reset_subscription() const;
+    bool restart_dcs_window() const;
     bool read_dcs_delta(long long& rd_bytes, long long& wr_bytes, double& dt_seconds) const;
 };
 

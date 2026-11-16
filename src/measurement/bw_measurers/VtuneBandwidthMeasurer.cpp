@@ -36,7 +36,6 @@
 #include "measurement/bw_measurers/VtuneBandwidthMeasurer.h"
 #include "measurement/BandwidthSampleAggregation.h"
 #include "measurement/BandwidthStabilizer.h"
-#include "measurement/TheoreticalPeakCalculator.h"
 #include "utils/StringUtils.h"
 #include "platform/Process.h"
 #include <algorithm>
@@ -88,49 +87,15 @@ bool VtuneBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lon
         return false;
     }
 
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!relaunch_traffic_gen(ratio_pct, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
-
     int relaunch_attempts = 0;
-    int traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (!relaunch_current_traffic_gen()) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
+    if (!ensure_traffic_gen_running(ratio_pct, pause, relaunch_attempts)) {
+        return false;
     }
 
-    const bool is_remote = (counter_selection_.type == CounterType::UPI_FLITS);
-    const int expected_cores = get_traffic_gen_cores();
-    const int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-
-    double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
-        caps_, expected_cores, socket_cores, is_remote);
-
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        if (!traffic_gen_manager_) {
-            return TrafficGenHealthChecker::count_taskset_traffic_gen();
-        }
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
+    const double theoretical_peak_gb_s = achievable_peak_gbps(counter_selection_.type == CounterType::UPI_FLITS);
 
     const size_t stabilization_window = 3;
-    BandwidthStabilizer stabilizer(
-        theoretical_peak_gb_s, pause, health_checker,
-        stabilization_window, 0.05, config_.verbosity);
-    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    BandwidthStabilizer stabilizer = make_stabilizer(theoretical_peak_gb_s, pause, stabilization_window);
 
     const double sample_window_seconds = collection_->window_seconds(sampling_interval_ms_);
 #if defined(_WIN32)
@@ -172,7 +137,7 @@ bool VtuneBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lon
 
     for (int total_samples = 0; total_samples < max_samples; ) {
         if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_manager_->active_traffic_gen_pid())) {
-            if (relaunch_attempts >= 2 || !relaunch_current_traffic_gen()) {
+            if (relaunch_attempts >= 2 || !relaunch_traffic_gen(ratio_pct, pause)) {
                 samples_taken = total_samples;
                 return false;
             }
@@ -275,7 +240,6 @@ bool VtuneBandwidthMeasurer::monitor_command(const std::string& command,
     }
 
     extra_perf_values_.clear();
-    ensure_scaling_factor_cached();
 
     if (!summary_mode) {
         const double window_seconds = collection_->window_seconds(sampling_interval_ms_);

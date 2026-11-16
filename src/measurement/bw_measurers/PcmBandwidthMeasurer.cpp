@@ -37,7 +37,6 @@
 #include "platform/Console.h"   // platform::glyph
 #include "measurement/BandwidthSampleAggregation.h"
 #include "measurement/BandwidthStabilizer.h"
-#include "measurement/TheoreticalPeakCalculator.h"
 #include "Utils.h"
 #include "utils/StringUtils.h"
 #include <algorithm>
@@ -367,31 +366,12 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
         return false;
     }
 
-    std::vector<int> mem_nodes = numa_resolver_ ? numa_resolver_() : std::vector<int>{0};
-    (void)mem_nodes;
-
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!relaunch_traffic_gen(ratio_pct, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
-
     int relaunch_attempts = 0;
-    int traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (!relaunch_current_traffic_gen()) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
+    if (!ensure_traffic_gen_running(ratio_pct, pause, relaunch_attempts)) {
+        return false;
     }
 
-    const bool is_remote = false;
-    const int expected_cores = get_traffic_gen_cores();
-    const int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
-        caps_, expected_cores, socket_cores, is_remote);
+    double theoretical_peak_gb_s = achievable_peak_gbps(false);
     if (theoretical_peak_gb_s <= 0.0) {
         theoretical_peak_gb_s = 300.0;
     }
@@ -399,25 +379,8 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
     // CXL bandwidth typically 5-60 GB/s; use a low floor to avoid discarding valid samples.
     theoretical_peak_gb_s = std::max(1.0, theoretical_peak_gb_s * 0.05);
 
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        if (!traffic_gen_manager_) {
-            return TrafficGenHealthChecker::count_taskset_traffic_gen();
-        }
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
-
     const size_t stabilization_window = fast_resume ? 5 : 7;
-    BandwidthStabilizer stabilizer(
-        theoretical_peak_gb_s, pause, health_checker,
-        stabilization_window, 0.05, config_.verbosity);
-    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    BandwidthStabilizer stabilizer = make_stabilizer(theoretical_peak_gb_s, pause, stabilization_window);
 
     const int max_samples = 20;
     int sample_failures = 0;
@@ -469,7 +432,7 @@ bool PcmBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
 
     for (int total_samples = 0; total_samples < max_samples && !success; ) {
         if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_manager_->active_traffic_gen_pid())) {
-            if (relaunch_attempts >= 2 || !relaunch_current_traffic_gen()) {
+            if (relaunch_attempts >= 2 || !relaunch_traffic_gen(ratio_pct, pause)) {
                 close_pcm_stream();
                 samples_taken = total_samples;
                 return false;

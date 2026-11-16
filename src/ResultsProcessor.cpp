@@ -141,8 +141,11 @@ void ResultsProcessor::print_timing_statistics() const {
         if (result.bandwidth_mbps > 0.0 || result.latency_ns > 0.0) {
             has_valid_measurements = true;
         }
-        if (result.mode == ExecutionMode::MULTISEQUENTIAL) {
-            seq_results.push_back(&result);
+
+        switch (result.mode) {
+            case ExecutionMode::MULTISEQUENTIAL:
+                seq_results.push_back(&result);
+                break;
         }
     }
 

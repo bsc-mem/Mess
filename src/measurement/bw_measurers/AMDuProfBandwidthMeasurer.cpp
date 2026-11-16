@@ -39,7 +39,6 @@
 #include "measurement/UprofParser.h"
 #include "measurement/UprofCollection.h"
 #include "measurement/BandwidthSampleAggregation.h"
-#include "measurement/TheoreticalPeakCalculator.h"
 #include "platform/Fs.h"
 #include "platform/Process.h"
 
@@ -187,7 +186,6 @@ bool AMDuProfBandwidthMeasurer::sample_bandwidth(long long& cas_rd,
     const UprofSample s = parse_cumulative(csv);
     if (!s.valid) return false;
 
-    ensure_scaling_factor_cached();
     elapsed = static_cast<double>(duration_s);
     cas_rd = gbps_to_cas(s.read_gbps,  elapsed, cached_cache_line_size_, cached_scaling_factor_);
     cas_wr = gbps_to_cas(s.write_gbps, elapsed, cached_cache_line_size_, cached_scaling_factor_);
@@ -227,47 +225,15 @@ bool AMDuProfBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
         interval_ms = kMinIntervalMs;
     }
 
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
-
     int relaunch_attempts = 0;
-    const platform::ProcessId traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (verbose2) {
-            std::cout << "    TrafficGen not running, relaunching..." << '\n';
-        }
-        if (!relaunch_current_traffic_gen()) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
+    if (!ensure_traffic_gen_running(ratio, pause, relaunch_attempts)) {
+        return false;
     }
 
-    const int expected_cores = get_traffic_gen_cores();
-    const int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    const double theoretical_peak_gb_s =
-        TheoreticalPeakCalculator::calculate_achievable_peak(caps_, expected_cores,
-                                                             socket_cores, false);
-
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
     const int    cache_line_size = cached_cache_line_size_;
     const double scaling_factor  = cached_scaling_factor_;
 
-    BandwidthStabilizer stabilizer(theoretical_peak_gb_s, pause, health_checker,
-                                   fast_resume ? 5 : 7, 0.05, config_.verbosity);
+    BandwidthStabilizer stabilizer = make_stabilizer(achievable_peak_gbps(false), pause, fast_resume ? 5 : 7);
 
     // The CSV appears only when the process exits, so samples arrive a batch at a time.
     const int samples_per_batch = (fast_resume ? 5 : 7) + 3;
@@ -320,7 +286,7 @@ bool AMDuProfBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
         // Check worker health after each blocking collection.
         if (!traffic_gen_manager_->is_traffic_gen_running(
                 traffic_gen_manager_->active_traffic_gen_pid())) {
-            if (relaunch_attempts < 2 && relaunch_current_traffic_gen()) {
+            if (relaunch_attempts < 2 && relaunch_traffic_gen(ratio, pause)) {
                 relaunch_attempts++;
                 stabilizer.reset();
                 continue;
@@ -419,7 +385,6 @@ bool AMDuProfBandwidthMeasurer::monitor_command(const std::string& command,
     auto child = platform::spawn_shell(command);
     if (!child) return false;
 
-    ensure_scaling_factor_cached();
     const int    line = cached_cache_line_size_;
     const double sf   = cached_scaling_factor_;
 

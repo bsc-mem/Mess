@@ -39,22 +39,28 @@
 
 #include "KernelTypes.h"
 #include <string>
+#include <utility>
 #include <vector>
+
+struct BenchmarkConfig;
 
 class GpuKernelGenerator {
 public:
     static std::string generate_pointer_chase();
-    static std::string workload_file(int ratio_pct);
-    static std::string generate_workload(int minTotalOps, int ratio_pct);
-    static std::string generate_workload_table(int minTotalOps, const std::vector<int>& ratios_pct, const std::vector<ExecutionMode>& modes);
+    static const char* mode_name(ExecutionMode mode);
+    static std::pair<std::string, std::string> mode_workload(ExecutionMode mode, int minTotalOps, int ratio_pct, const BenchmarkConfig& config);
+    static std::string generate_workload(int minTotalOps, int ratio_pct, const KernelConfigMultiSeq& config);
+    static std::string generate_workload_table(int minTotalOps, const std::vector<int>& ratios_pct, const std::vector<ExecutionMode>& modes,
+                                               const KernelConfigMultiSeq& config);
 
 private:
+    static std::string generate_multiseq_body(int minTotalOps, int ratio_pct, const KernelConfigMultiSeq& config);
     static void computeLoadStoreOps(int minTotalOps, double loadPercentage, int &outTotalOps, int &outLoadOps, int &outStoreOps);
     static std::vector<bool> operationOrder(int totalOps, int targetLoads, int targetStores);
     static std::string genFunctInit();
     static std::string genPauseBlock(int index);
-    static std::string loadStoreOpsGen(int totalOps, int targetLoads, int targetStores);
-    static std::string genFunctEnd(int totalOps, int loadOps, int storeOps);
+    static std::string loadStoreOpsGen(int totalOps, int targetLoads, int targetStores, const KernelConfigMultiSeq& config);
+    static std::string genFunctEnd(int loadOps, int storeOps, const KernelConfigMultiSeq& config);
 };
 
 #endif

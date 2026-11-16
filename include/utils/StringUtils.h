@@ -39,15 +39,16 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <vector>
 
 namespace string_utils {
 
 inline std::string trim(const std::string& value) {
-    const size_t first = value.find_first_not_of(" \t\r\n");
+    const size_t first = value.find_first_not_of(" \t\n\v\f\r");
     if (first == std::string::npos) {
         return "";
     }
-    const size_t last = value.find_last_not_of(" \t\r\n");
+    const size_t last = value.find_last_not_of(" \t\n\v\f\r");
     return value.substr(first, last - first + 1);
 }
 
@@ -109,6 +110,43 @@ inline bool parse_int_strict(const std::string& value, int& out) {
     } catch (...) {
         return false;
     }
+}
+
+inline bool parse_int_range(const std::string& token, int& lo, int& hi) {
+    try {
+        const size_t dash = token.find('-');
+        if (dash == std::string::npos) {
+            lo = hi = std::stoi(token);
+        } else {
+            lo = std::stoi(token.substr(0, dash));
+            hi = std::stoi(token.substr(dash + 1));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+inline bool is_digits(const std::string& value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); });
+}
+
+inline std::string join(const std::vector<std::string>& items, const std::string& sep) {
+    std::string out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) out += sep;
+        out += items[i];
+    }
+    return out;
+}
+
+inline std::string join(const std::vector<int>& items, const std::string& sep) {
+    std::string out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) out += sep;
+        out += std::to_string(items[i]);
+    }
+    return out;
 }
 
 inline bool contains_word(const std::string& haystack, const std::string& word) {

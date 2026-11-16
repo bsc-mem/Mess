@@ -42,6 +42,7 @@
 #include "architecture/BandwidthCounterStrategy.h"
 #include "SystemDetection.h"
 #include "Utils.h"
+#include "utils/CpuTopology.h"
 #include "utils/SubprocessCapture.h"
 #include "utils/StringUtils.h"
 #include <iostream>
@@ -63,24 +64,6 @@
 #include <sys/wait.h>
 
 namespace {
-std::string make_membind_arg(const std::vector<int>& mem_nodes) {
-    if (mem_nodes.empty()) {
-        return "0";
-    }
-    std::string membind_arg;
-    membind_arg.reserve(mem_nodes.size() * 4);
-    for (size_t i = 0; i < mem_nodes.size(); ++i) {
-        if (i > 0) membind_arg += ",";
-        membind_arg += std::to_string(mem_nodes[i]);
-    }
-    return membind_arg;
-}
-
-int get_perf_bind_cpu() {
-    const auto& cache = SystemToolsCache::instance();
-    return cache.initialized ? cache.ptr_chase_cpu : find_ptr_chase_cpu().first;
-}
-
 bool use_per_socket_aggregation(const BandwidthCounterSelection& selection) {
     if (selection.type != CounterType::CAS_COUNT &&
         selection.type != CounterType::NVIDIA_GRACE &&
@@ -131,7 +114,7 @@ std::string build_preferred_perf_events(const BandwidthCounterSelection& selecti
     }
 
     if (events.find("uncore_type_14_") != std::string::npos ||
-        events.find("uncore_hbm_") != std::string::npos) {
+        events.find("uncore_hbm") != std::string::npos) {
         return events;
     }
 
@@ -148,6 +131,23 @@ std::string build_preferred_perf_events(const BandwidthCounterSelection& selecti
         }
     }
     return preferred;
+}
+
+std::vector<std::string> counted_socket_scopes(const BandwidthCounterSelection& selection, const std::vector<int>& mem_nodes) {
+    std::vector<std::string> scopes;
+    if (selection.type != CounterType::CAS_COUNT) return scopes;
+    for (int node : mem_nodes) {
+        const int socket = cpu_topology::socket_of_memory_node(node);
+        if (socket < 0) return {};
+        const std::string scope = "S" + std::to_string(socket);
+        if (std::find(scopes.begin(), scopes.end(), scope) == scopes.end()) scopes.push_back(scope);
+    }
+    return scopes;
+}
+
+bool skip_socket_row(const std::string& scope, const std::vector<std::string>& counted_scopes) {
+    if (counted_scopes.empty()) return scope == "S1";
+    return !scope.empty() && std::find(counted_scopes.begin(), counted_scopes.end(), scope) == counted_scopes.end();
 }
 
 bool use_pid_attach_mode(const BandwidthCounterSelection& selection) {
@@ -225,12 +225,9 @@ bool PerfBandwidthMeasurer::sample_bandwidth(long long& cas_rd, long long& cas_w
 bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_wr, double& elapsed, const std::vector<int>& mem_nodes) const {
     const bool verbose4 = config_.verbosity >= 4;
     extra_perf_values_.clear();
-    ensure_scaling_factor_cached();
     const int cache_line_size = std::max(1, cached_cache_line_size_);
 
     int interval = static_cast<int>(sampling_interval_ms_);
-    
-    const std::string membind_arg = make_membind_arg(mem_nodes);
 
     const BandwidthCounterSelection& selection = counter_selection_;
 
@@ -244,7 +241,7 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
     }
 
     std::string events_str = build_preferred_perf_events(selection);
-    const int perf_bind_cpu = get_perf_bind_cpu();
+    const std::vector<std::string> counted_scopes = counted_socket_scopes(selection, mem_nodes);
     const bool attach_mode = use_pid_attach_mode(selection);
     const std::string scope_args = build_perf_scope_args(selection, traffic_gen_manager_);
     if (scope_args.empty()) {
@@ -256,14 +253,10 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
 
     ensure_a64fx_pmu_available();
 
-    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
-    if (!attach_mode) {
-        (void)perf_bind_cpu;
-        (void)membind_arg;
-        // For system-wide perf stat (-a/--per-socket), avoid numactl wrapping.
-        // Some Emerald Rapids/CXL setups can hang with:
-        //   numactl ... perf stat -a --per-socket ...
-    }
+    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && export LC_ALL=C && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
+    // For system-wide perf stat (-a/--per-socket), avoid numactl wrapping.
+    // Some Emerald Rapids/CXL setups can hang with:
+    //   numactl ... perf stat -a --per-socket ...
     cmd += "perf stat -I " + std::to_string(interval) +
            " -x, " + scope_args + " -e " + events_str + " 2>&1";
 
@@ -313,7 +306,7 @@ bool PerfBandwidthMeasurer::sample_with_popen(long long& cas_rd, long long& cas_
 
         perf_stat_csv::Row row;
         if (perf_stat_csv::parse_row(buffer, true, row)) {
-            if (row.scope == "S1") {
+            if (skip_socket_row(row.scope, counted_scopes)) {
                 continue;
             }
             double timestamp = row.timestamp;
@@ -431,33 +424,13 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
     int interval = static_cast<int>(sampling_interval_ms_);
     std::vector<int> mem_nodes = numa_resolver_ ? numa_resolver_() : std::vector<int>{0};
 
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
-
     int relaunch_attempts = 0;
-    int traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (verbose2) {
-            std::cout << "    TrafficGen not running, relaunching..." << '\n';
-        }
-        if (!relaunch_current_traffic_gen()) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
-        traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
+    if (!ensure_traffic_gen_running(ratio, pause, relaunch_attempts)) {
+        return false;
     }
 
     bool is_remote = (counter_selection_.type == CounterType::UPI_FLITS);
-    int expected_cores = get_traffic_gen_cores();
-    int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    
-    double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
-        caps_, expected_cores, socket_cores, is_remote);
+    double theoretical_peak_gb_s = achievable_peak_gbps(is_remote);
 
     if (verbose3) {
         double full_peak = TheoreticalPeakCalculator::calculate_from_capabilities(caps_, is_remote);
@@ -468,45 +441,13 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
             return oss.str();
         };
         std::cout << "      [Stabilizer] Theoretical peak: " << fmt_gb(full_peak)
-                  << ", Achievable (" << expected_cores << " cores): " << fmt_gb(theoretical_peak_gb_s)
+                  << ", Achievable (" << get_traffic_gen_cores() << " cores): " << fmt_gb(theoretical_peak_gb_s)
                   << ", Noise floor: "
                   << std::fixed << std::setprecision(2)
                   << TheoreticalPeakCalculator::get_noise_floor(theoretical_peak_gb_s)
                   << " GB/s" << '\n';
     }
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        if (!traffic_gen_manager_) {
-            return TrafficGenHealthChecker::count_taskset_traffic_gen();
-        }
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
-    int cache_line_size = cached_cache_line_size_;
-    double scaling_factor = cached_scaling_factor_;
-
-    auto calculate_bw_gb_s = [&](long long cas_rd, long long cas_wr, double elapsed_s) -> double {
-        if (elapsed_s <= 0) return 0.0;
-        if (counter_selection_.type == CounterType::NVIDIA_GRACE) {
-            double bytes_rd = static_cast<double>(cas_rd) * 32.0;
-            double bytes_wr = static_cast<double>(cas_wr);
-            return (bytes_rd + bytes_wr) / (elapsed_s * 1e9);
-        }
-        if (counter_selection_.type == CounterType::TOTAL_BYTES) {
-            return static_cast<double>(cas_rd + cas_wr) / (elapsed_s * 1e9);
-        }
-        if (counter_selection_.type == CounterType::UPI_FLITS) {
-            return static_cast<double>(cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
-        }
-        return static_cast<double>(cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
-    };
-
-    const std::string membind_arg = make_membind_arg(mem_nodes);
+    const TrafficGenHealthChecker health_checker = traffic_gen_health();
 
     const BandwidthCounterSelection& selection = counter_selection_;
     if (!selection.is_valid()) {
@@ -515,7 +456,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
         return false;
     }
     std::string events_str = build_preferred_perf_events(selection);
-    const int perf_bind_cpu = get_perf_bind_cpu();
+    const std::vector<std::string> counted_scopes = counted_socket_scopes(selection, mem_nodes);
     const bool attach_mode = use_pid_attach_mode(selection);
     const std::string scope_args = build_perf_scope_args(selection, traffic_gen_manager_);
     if (scope_args.empty()) {
@@ -527,14 +468,10 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
 
     ensure_a64fx_pmu_available();
 
-    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
-    if (!attach_mode) {
-        (void)perf_bind_cpu;
-        (void)membind_arg;
-        // For system-wide perf stat (-a/--per-socket), avoid numactl wrapping.
-        // Some Emerald Rapids/CXL setups can hang with:
-        //   numactl ... perf stat -a --per-socket ...
-    }
+    std::string cmd = std::string("cd ") + string_utils::shell_quote(storage_->bandwidth_dir()) + " && export LC_ALL=C && echo \"__PID__$$\" && exec stdbuf -oL -eL ";
+    // For system-wide perf stat (-a/--per-socket), avoid numactl wrapping.
+    // Some Emerald Rapids/CXL setups can hang with:
+    //   numactl ... perf stat -a --per-socket ...
     cmd += "perf stat -I " + std::to_string(interval) +
            " -x, " + scope_args + " -e " + events_str + " 2>&1";
 
@@ -566,10 +503,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
         pipe = nullptr;
     };
 
-    BandwidthStabilizer stabilizer(
-        theoretical_peak_gb_s, pause, health_checker,
-        fast_resume ? 5 : 7, 0.05, config_.verbosity);
-    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    BandwidthStabilizer stabilizer = make_stabilizer(theoretical_peak_gb_s, pause, fast_resume ? 5 : 7);
     
     int total_samples = 0;
     const int OVERALL_TIMEOUT_SECONDS = 60;
@@ -694,7 +628,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
         }
         
         if (parsed) {
-            if (row.scope == "S1") {
+            if (skip_socket_row(row.scope, counted_scopes)) {
                 continue;
             }
             double timestamp = row.timestamp;
@@ -732,7 +666,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
                             if (verbose2) {
                                 std::cout << "    TrafficGen died during stabilization, relaunching..." << '\n';
                             }
-                            if (relaunch_current_traffic_gen()) {
+                            if (relaunch_traffic_gen(ratio, pause)) {
                                 relaunch_attempts++;
                                 stabilizer.reset();
                                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -768,7 +702,7 @@ bool PerfBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long long
                         aggregated_extra[kv.first] += kv.second;
                     }
 
-                    double bw_gb_s = calculate_bw_gb_s(norm_rd, norm_wr, target_duration);
+                    double bw_gb_s = bandwidth_gbps(norm_rd, norm_wr, target_duration);
                     StabilizationResult result = stabilizer.add_sample(norm_rd, norm_wr, bw_gb_s);
 
                     if (result == StabilizationResult::ZOMBIE_DETECTED) {
@@ -889,6 +823,7 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
     }
 
     std::string events_str = build_preferred_perf_events(selection);
+    const std::vector<std::string> counted_scopes = counted_socket_scopes(selection, mem_nodes);
 
     std::string trimmed_command = command;
     const auto first_non_ws = trimmed_command.find_first_not_of(" \t\r\n");
@@ -906,7 +841,7 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
         (trimmed_command.rfind("--pid ", 0) == 0);
 
     std::stringstream perf_cmd;
-    perf_cmd << "perf stat -x, ";
+    perf_cmd << "export LC_ALL=C && perf stat -x, ";
     if (!pid_attach_mode) {
         perf_cmd << "-a ";
         if (use_per_socket_aggregation(selection)) {
@@ -940,7 +875,6 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
     std::map<std::string, long long> total_extra;
     bool has_data = false;
 
-    ensure_scaling_factor_cached();
 
     auto process_aggregation = [&](double timestamp, double duration_s) {
         long long effective_rd = 0;
@@ -964,14 +898,14 @@ bool PerfBandwidthMeasurer::monitor_command(const std::string& command,
             if (!perf_stat_csv::parse_row(buffer, true, row)) {
                 continue;
             }
-            if (row.scope == "S1") {
+            if (skip_socket_row(row.scope, counted_scopes)) {
                 continue;
             }
         } else {
             if (!perf_stat_csv::parse_row(buffer, false, row)) {
                 continue;
             }
-            if (row.scope == "S1") {
+            if (skip_socket_row(row.scope, counted_scopes)) {
                 continue;
             }
             row.timestamp = 0.0;

@@ -37,7 +37,6 @@
 
 #include "measurement/BandwidthStabilizer.h"
 #include "measurement/BandwidthSampleAggregation.h"
-#include "measurement/TheoreticalPeakCalculator.h"
 #include "platform/Process.h"
 
 #ifndef _WIN32_WINNT
@@ -338,47 +337,15 @@ bool WindowsImcBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
     }
     if (interval_ms <= 0.0) interval_ms = 100.0;
 
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
-
     int relaunch_attempts = 0;
-    const platform::ProcessId traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (verbose2) {
-            std::cout << "    TrafficGen not running, relaunching..." << '\n';
-        }
-        if (!relaunch_current_traffic_gen()) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
+    if (!ensure_traffic_gen_running(ratio, pause, relaunch_attempts)) {
+        return false;
     }
 
-    const int expected_cores = get_traffic_gen_cores();
-    const int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    const double theoretical_peak_gb_s =
-        TheoreticalPeakCalculator::calculate_achievable_peak(caps_, expected_cores,
-                                                             socket_cores, false);
-
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
     const int    cache_line_size = cached_cache_line_size_;
     const double scaling_factor  = cached_scaling_factor_;
 
-    BandwidthStabilizer stabilizer(theoretical_peak_gb_s, pause, health_checker,
-                                   fast_resume ? 5 : 7, 0.05, config_.verbosity);
+    BandwidthStabilizer stabilizer = make_stabilizer(achievable_peak_gbps(false), pause, fast_resume ? 5 : 7);
 
     const int OVERALL_TIMEOUT_SECONDS = 60;
     const int max_samples = std::max(1, static_cast<int>(
@@ -439,7 +406,7 @@ bool WindowsImcBandwidthMeasurer::wait_for_stabilization(int& samples_taken,
         if (total_samples % 20 == 0 &&
             !traffic_gen_manager_->is_traffic_gen_running(
                 traffic_gen_manager_->active_traffic_gen_pid())) {
-            if (relaunch_attempts < 2 && relaunch_current_traffic_gen()) {
+            if (relaunch_attempts < 2 && relaunch_traffic_gen(ratio, pause)) {
                 relaunch_attempts++;
                 stabilizer.reset();
                 prev_rd = imc_->reads();

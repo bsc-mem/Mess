@@ -43,8 +43,6 @@
 #include <iomanip>
 #include <functional>
 #include <string>
-#include <cstdio>
-#include <cstdlib>
 #include <sstream>
 
 #include "measurement/TheoreticalPeakCalculator.h"
@@ -78,7 +76,6 @@ enum class StabilizationResult {
  * @brief Health checks used to detect crashed or stalled traffic generators.
  */
 struct TrafficGenHealthChecker {
-    std::function<bool(int)> is_pid_alive;
     std::function<int()> count_running_instances;
     int expected_instance_count = 0;
     
@@ -86,24 +83,6 @@ struct TrafficGenHealthChecker {
         if (!count_running_instances) return true;
         int running = count_running_instances();
         return running >= expected_instance_count;
-    }
-    
-    static int count_traffic_gen_processes(const std::string& pattern) {
-        std::string cmd = "pgrep -c -f '" + pattern + "' 2>/dev/null || echo 0";
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) return 0;
-        
-        char buffer[64];
-        int count = 0;
-        if (fgets(buffer, sizeof(buffer), pipe)) {
-            count = std::atoi(buffer);
-        }
-        pclose(pipe);
-        return count;
-    }
-    
-    static int count_taskset_traffic_gen() {
-        return count_traffic_gen_processes("taskset.*traffic_gen");
     }
 };
 
@@ -118,13 +97,15 @@ public:
         TrafficGenHealthChecker health_checker,
         size_t window_size = 7,
         double threshold_pct = 0.05,
-        int verbosity = 0)
+        int verbosity = 0,
+        bool allow_forced_stability = true)
         : theoretical_peak_gb_s_(theoretical_peak_gb_s),
           pause_value_(pause_value),
           health_checker_(health_checker),
           window_size_(window_size),
           threshold_pct_(threshold_pct),
-          verbosity_(verbosity)
+          verbosity_(verbosity),
+          allow_forced_stability_(allow_forced_stability)
     {
         noise_floor_gb_s_ = TheoreticalPeakCalculator::get_noise_floor(theoretical_peak_gb_s_);
         warmup_threshold_gb_s_ = TheoreticalPeakCalculator::get_warmup_threshold(theoretical_peak_gb_s_);
@@ -169,7 +150,7 @@ public:
         
         if (gate3_stability_check() && gate4_trend_check()) {
             last_result_ = StabilizationResult::STABLE;
-        } else if (total_samples_seen_ >= max_samples_before_force_stable_
+        } else if (allow_forced_stability_ && total_samples_seen_ >= max_samples_before_force_stable_
                    && samples_.size() >= window_size_) {
             if (verbosity_ >= 2) {
                 std::cout << "      [FORCE STABLE] Max samples (" << max_samples_before_force_stable_ 
@@ -247,6 +228,7 @@ private:
     size_t window_size_;
     double threshold_pct_;
     int verbosity_;
+    bool allow_forced_stability_;
     
     std::deque<BWSample> samples_;
     double mean_bw_gb_s_ = 0.0;

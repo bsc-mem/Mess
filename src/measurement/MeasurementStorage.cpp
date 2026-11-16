@@ -378,12 +378,15 @@ void MeasurementStorage::copy_plotter_to(const std::string& source_plotter,
 }
 
 
-void MeasurementStorage::write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) const {
+void MeasurementStorage::write_plotter_file(const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, int worker_cores,
+    double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) const {
     if (measurement_root_is_temp_) {
         return;
     }
 
     std::filesystem::path plotter_path = std::filesystem::path(measurement_root_) / "plotter.txt";
+    if (config_.run_gpu) append_gpu_workload_config_to_plotter(plotter_path, config_);
     const int plotter_bytes_per_cas = bytes_per_cas_ > 0 ? bytes_per_cas_ : cache_line_size;
-    append_memory_config_to_plotter(plotter_path, caps, binding_type, tlb_ns, plotter_bytes_per_cas, upi_scaling_factor, page_walk_lat_ns, gpu_caps);
+    append_memory_config_to_plotter(plotter_path, caps, binding_type, tlb_ns, plotter_bytes_per_cas, worker_cores,
+                                    upi_scaling_factor, page_walk_lat_ns, gpu_caps);
 }

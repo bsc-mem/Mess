@@ -67,9 +67,9 @@ struct MessArgs {
     uint64_t settleNs;
     Flags* flags;
     dataType** streamsLD;
-    uint64_t groupLD;
+    uint64_t loadSlotBytes;
     dataType** streamsST;
-    uint64_t groupST;
+    uint64_t storeSlotBytes;
     uint64_t pause;
     uint64_t sectionsLD;
     uint64_t sectionsST;
@@ -158,16 +158,20 @@ static __device__ uint64_t first_pause(const MessArgs& args, uint64_t thread) {
 }
 
 template <class Workload>
-__global__ void mess(const MessArgs args) {
-    if (chase_on_this_sm(args)) return;
-
-    const uint64_t threadPointer_LD = (uint64_t)&args.streamsLD[blockIdx.x][threadIdx.x * args.groupLD];
-    const uint64_t threadPointer_ST = (uint64_t)&args.streamsST[blockIdx.x][threadIdx.x * args.groupST];
+static __device__ void run_multiseq(const MessArgs& args) {
+    const uint64_t threadPointer_LD = (uint64_t)args.streamsLD[blockIdx.x] + threadIdx.x * args.loadSlotBytes;
+    const uint64_t threadPointer_ST = (uint64_t)args.streamsST[blockIdx.x] + threadIdx.x * args.storeSlotBytes;
     const uint64_t thread = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     const uint64_t firstPause = first_pause(args, thread);
-    Workload::run(sizeof(dataType), threadPointer_LD, threadPointer_ST, args.pause,
-                  args.groupLD, args.groupST, (uint64_t)&args.flags->end, (uint64_t)&args.flags->start,
-                  args.sectionsLD, args.sectionsST, blockDim.x * args.groupST * sizeof(dataType), firstPause, args.result);
+    Workload::run(threadPointer_LD, threadPointer_ST, args.pause, blockDim.x * args.loadSlotBytes,
+                  blockDim.x * args.storeSlotBytes, (uint64_t)&args.flags->end, (uint64_t)&args.flags->start,
+                  args.sectionsLD, args.sectionsST, firstPause, args.result);
+}
+
+template <class Workload>
+__global__ void mess(const MessArgs args) {
+    if (chase_on_this_sm(args)) return;
+    run_multiseq<Workload>(args);
 }
 
 

@@ -11,7 +11,7 @@
  * modification, are permitted provided that the following conditions are met:
  *
  *     * Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and this disclaimer.
+ *       this list of conditions and the following disclaimer.
  *
  *     * Redistributions in binary form must reproduce the above copyright
  *       notice, this list of conditions and the following disclaimer in the
@@ -43,10 +43,11 @@
 #ifdef __APPLE__
 
 #include "measurement/BandwidthStabilizer.h"
-#include "measurement/TheoreticalPeakCalculator.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 
@@ -54,6 +55,7 @@ namespace {
 
 typedef struct IOReportSubscriptionRefOpaque* IOReportSubscriptionRef;
 typedef CFMutableDictionaryRef (*fn_copyall)(uint64_t, uint64_t);
+typedef CFMutableDictionaryRef (*fn_copygroup)(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
 typedef IOReportSubscriptionRef (*fn_sub)(void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef);
 typedef CFDictionaryRef (*fn_samples)(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef);
 typedef CFDictionaryRef (*fn_delta)(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
@@ -67,6 +69,8 @@ void scopy(CFStringRef cf, char* b, size_t n) {
     if (cf) CFStringGetCString(cf, b, n, kCFStringEncodingUTF8);
 }
 
+constexpr int kLaunchSettleMs = 250;
+
 double monotonic_s() {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -78,6 +82,7 @@ double monotonic_s() {
 struct IOReportBandwidthMeasurer::IOReportState {
     void* lib = nullptr;
     fn_copyall IOReportCopyAllChannels = nullptr;
+    fn_copygroup IOReportCopyChannelsInGroup = nullptr;
     fn_sub     IOReportCreateSubscription = nullptr;
     fn_samples IOReportCreateSamples = nullptr;
     fn_delta   IOReportCreateSamplesDelta = nullptr;
@@ -124,6 +129,7 @@ bool IOReportBandwidthMeasurer::ensure_subscribed() const {
         return false;
     }
     s->IOReportCopyAllChannels    = (fn_copyall)dlsym(s->lib, "IOReportCopyAllChannels");
+    s->IOReportCopyChannelsInGroup = (fn_copygroup)dlsym(s->lib, "IOReportCopyChannelsInGroup");
     s->IOReportCreateSubscription = (fn_sub)dlsym(s->lib, "IOReportCreateSubscription");
     s->IOReportCreateSamples      = (fn_samples)dlsym(s->lib, "IOReportCreateSamples");
     s->IOReportCreateSamplesDelta = (fn_delta)dlsym(s->lib, "IOReportCreateSamplesDelta");
@@ -142,7 +148,9 @@ bool IOReportBandwidthMeasurer::ensure_subscribed() const {
         return false;
     }
 
-    CFMutableDictionaryRef chans = s->IOReportCopyAllChannels(0, 0);
+    CFMutableDictionaryRef chans = s->IOReportCopyChannelsInGroup
+        ? s->IOReportCopyChannelsInGroup(CFSTR("AMC Stats"), nullptr, 0, 0, 0) : nullptr;
+    if (!chans) chans = s->IOReportCopyAllChannels(0, 0);
     if (!chans) {
         std::cerr << "ERROR: IOReportCopyAllChannels returned null." << std::endl;
         return false;
@@ -158,6 +166,29 @@ bool IOReportBandwidthMeasurer::ensure_subscribed() const {
     s->prev_t = monotonic_s();
     s->ready = (s->prev != nullptr);
     return s->ready;
+}
+
+void IOReportBandwidthMeasurer::reset_subscription() const {
+    IOReportState* s = state_;
+    if (!s) return;
+    if (s->prev) CFRelease(s->prev);
+    if (s->subbed) CFRelease(s->subbed);
+    if (s->sub) CFRelease(s->sub);
+    s->prev = nullptr;
+    s->subbed = nullptr;
+    s->sub = nullptr;
+    s->ready = false;
+}
+
+bool IOReportBandwidthMeasurer::restart_dcs_window() const {
+    if (!ensure_subscribed()) return false;
+    IOReportState* s = state_;
+    CFDictionaryRef cur = s->IOReportCreateSamples(s->sub, s->subbed, nullptr);
+    if (!cur) return false;
+    CFRelease(s->prev);
+    s->prev = cur;
+    s->prev_t = monotonic_s();
+    return true;
 }
 
 bool IOReportBandwidthMeasurer::read_dcs_delta(long long& rd_bytes, long long& wr_bytes,
@@ -183,6 +214,7 @@ bool IOReportBandwidthMeasurer::read_dcs_delta(long long& rd_bytes, long long& w
     if (!d) return false;
 
     __block long long rd = 0, wr = 0;
+    __block bool found_rd = false, found_wr = false;
     fn_str gGroup = s->gGroup, gSub = s->gSub, gName = s->gName, gUnit = s->gUnit;
     fn_int gVal = s->gVal;
     fn_fmt gFmt = s->gFmt;
@@ -195,12 +227,18 @@ bool IOReportBandwidthMeasurer::read_dcs_delta(long long& rd_bytes, long long& w
         if (gFmt && gFmt(ch) != 1) return 0;
         if (!strcmp(g, "AMC Stats") && !strcmp(sg, "Perf Counters") && !strcmp(un, "B")) {
             long long v = (long long)gVal(ch, 0);
-            if (!strcmp(cn, "DCS RD")) rd = v;
-            else if (!strcmp(cn, "DCS WR")) wr = v;
+            if (!strcmp(cn, "DCS RD")) { rd = v; found_rd = true; }
+            else if (!strcmp(cn, "DCS WR")) { wr = v; found_wr = true; }
         }
         return 0;
     });
     CFRelease(d);
+
+    if (!found_rd || !found_wr || rd + wr <= 0) {
+        std::cerr << "    IOReport returned no DRAM traffic; resubscribing." << std::endl;
+        reset_subscription();
+        return false;
+    }
 
     rd_bytes = rd;
     wr_bytes = wr;
@@ -212,10 +250,7 @@ bool IOReportBandwidthMeasurer::sample_bandwidth(long long& cas_rd, long long& c
                                                  const std::vector<int>&) const {
     long long rd = 0, wr = 0;
     double dt = 0.0;
-    read_dcs_delta(rd, wr, dt);
-    int interval_ms = static_cast<int>(sampling_interval_ms_);
-    std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, interval_ms)));
-    if (!read_dcs_delta(rd, wr, dt) || dt <= 0.0) return false;
+    if (!restart_dcs_window() || !read_dcs_delta(rd, wr, dt) || dt <= 0.0) return false;
     cas_rd = rd;
     cas_wr = wr;
     elapsed = dt;
@@ -233,39 +268,13 @@ bool IOReportBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long 
         return false;
     }
 
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) return false;
-        return true;
-    };
-    int traffic_gen_pid = traffic_gen_manager_->active_traffic_gen_pid();
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_pid)) {
-        if (verbose2) std::cout << "    TrafficGen not running, relaunching..." << '\n';
-        if (!relaunch_current_traffic_gen()) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    int relaunch_attempts = 0;
+    if (!ensure_traffic_gen_running(ratio, pause, relaunch_attempts)) return false;
 
-    int expected_cores = get_traffic_gen_cores();
-    int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
-        caps_, expected_cores, socket_cores, false);
+    double theoretical_peak_gb_s = achievable_peak_gbps(false);
     if (theoretical_peak_gb_s <= 0) theoretical_peak_gb_s = 10.0;
 
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
-    const int cache_line_size = cached_cache_line_size_;
-    const double scaling_factor = cached_scaling_factor_;
-
-    BandwidthStabilizer stabilizer(theoretical_peak_gb_s, pause, health_checker,
-                                   fast_resume ? 5 : 7, 0.05, config_.verbosity);
-    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    BandwidthStabilizer stabilizer = make_stabilizer(theoretical_peak_gb_s, pause, fast_resume ? 5 : 7);
 
     const int interval_ms = std::max(1, static_cast<int>(sampling_interval_ms_));
     const int OVERALL_TIMEOUT_SECONDS = 60;
@@ -273,21 +282,23 @@ bool IOReportBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long 
 
     long long rd = 0, wr = 0;
     double dt = 0.0;
-    read_dcs_delta(rd, wr, dt);
+    if (!fast_resume) std::this_thread::sleep_for(std::chrono::milliseconds(kLaunchSettleMs));
+    restart_dcs_window();
 
     int total_samples = 0;
+    int failed_reads = 0;
     bool success = false;
     long long final_rd = 0, final_wr = 0;
     double final_elapsed = interval_ms / 1000.0;
 
-    while (total_samples < max_samples) {
+    while (total_samples + failed_reads < max_samples) {
         if (!read_dcs_delta(rd, wr, dt) || dt <= 0.0) {
+            ++failed_reads;
             continue;
         }
         total_samples++;
 
-        double bw_gb_s = calculate_bandwidth_gbps(rd, wr, dt, counter_selection_.type,
-                                                  cache_line_size, scaling_factor);
+        double bw_gb_s = bandwidth_gbps(rd, wr, dt);
         final_rd = rd;
         final_wr = wr;
         final_elapsed = dt;
@@ -318,10 +329,19 @@ bool IOReportBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long 
         long long agg_rd = 0, agg_wr = 0;
         double agg_elapsed = 0.0;
         const auto& samples = stabilizer.get_samples();
+        double bw_sum = 0.0;
+        double bw_sum_sq = 0.0;
         for (const auto& sample : samples) {
             agg_rd += sample.cas_rd;
             agg_wr += sample.cas_wr;
             agg_elapsed += sample.elapsed_s;
+            bw_sum += sample.bw_gb_s;
+            bw_sum_sq += sample.bw_gb_s * sample.bw_gb_s;
+        }
+        if (samples.size() > 1) {
+            const double n = static_cast<double>(samples.size());
+            const double variance = std::max(0.0, (bw_sum_sq - bw_sum * bw_sum / n) / (n - 1.0));
+            stability_noise_floor_gbps_ = std::max(stability_noise_floor_gbps_, 2.0 * std::sqrt(variance));
         }
         last_cas_rd = agg_rd;
         last_cas_wr = agg_wr;
@@ -353,6 +373,10 @@ IOReportBandwidthMeasurer::IOReportBandwidthMeasurer(
 IOReportBandwidthMeasurer::~IOReportBandwidthMeasurer() = default;
 
 bool IOReportBandwidthMeasurer::ensure_subscribed() const { return false; }
+
+void IOReportBandwidthMeasurer::reset_subscription() const {}
+
+bool IOReportBandwidthMeasurer::restart_dcs_window() const { return false; }
 
 bool IOReportBandwidthMeasurer::read_dcs_delta(long long&, long long&, double&) const { return false; }
 

@@ -49,6 +49,29 @@
 #endif
 #include <iostream>
 
+namespace {
+void announce_measurer(bool enabled, const char* name) {
+    static bool announced = false;
+    if (enabled && !announced) {
+        std::cout << "Using " << name << std::endl;
+        announced = true;
+    }
+}
+
+void print_missing_tool(const char* tool, const char* mode, const char* requirement, const char* hint) {
+    std::cerr << "\n\033[1;31m============================================================\033[0m" << std::endl;
+    std::cerr << "\033[1;31m ERROR: Bandwidth Measurement Tool (" << tool << ") Not Found!\033[0m" << std::endl;
+    std::cerr << "\033[1;31m------------------------------------------------------------\033[0m" << std::endl;
+    std::cerr << " Mode: " << mode << std::endl;
+    std::cerr << " Requirement: " << requirement << std::endl;
+    if (hint) {
+        std::cerr << " Hint: " << hint << std::endl;
+    }
+    std::cerr << "\n Aborting execution." << std::endl;
+    std::cerr << "\033[1;31m============================================================\033[0m\n" << std::endl;
+}
+}
+
 #if defined(_WIN32)
 const WindowsAutoMeasurer& windows_auto_measurer(int verbosity) {
     static const WindowsAutoMeasurer choice = [verbosity] {
@@ -114,8 +137,6 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
     std::function<std::vector<int>()> numa_resolver,
     ExecutionMode mode) {
 
-    static bool printed_measurer_type = false;
-
     auto& strategy = BandwidthCounterStrategy::instance();
     MeasurerType measurer_type = strategy.get_resolved_measurer_type();
 
@@ -132,27 +153,18 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
             }
 
 
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using Likwid Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "Likwid Bandwidth Measurer");
 
             auto likwid_measurer = std::make_unique<LikwidBandwidthMeasurer>(config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
 
             if (likwid_measurer->find_likwid_binary().empty()) {
                 if (strategy.get_requested_measurer_type() == MeasurerType::LIKWID || strategy.is_hbm()) {
-                    std::cerr << "\n\033[1;31m============================================================\033[0m" << std::endl;
-                    std::cerr << "\033[1;31m ERROR: Bandwidth Measurement Tool (LIKWID) Not Found!\033[0m" << std::endl;
-                    std::cerr << "\033[1;31m------------------------------------------------------------\033[0m" << std::endl;
-                    if (strategy.get_requested_measurer_type() == MeasurerType::LIKWID) {
-                        std::cerr << " Mode: Forced Likwid (--measurer=likwid)" << std::endl;
-                    } else {
-                        std::cerr << " Mode: Auto-selected Likwid (HBM memory binding detected)" << std::endl;
-                    }
-                    std::cerr << " Requirement: 'likwid-perfctr' must be in PATH." << std::endl;
-                    std::cerr << " Hint: install/load LIKWID or explicitly override with --measurer=perf." << std::endl;
-                    std::cerr << "\n Aborting execution." << std::endl;
-                    std::cerr << "\033[1;31m============================================================\033[0m\n" << std::endl;
+                    print_missing_tool("LIKWID",
+                        strategy.get_requested_measurer_type() == MeasurerType::LIKWID
+                            ? "Forced Likwid (--measurer=likwid)"
+                            : "Auto-selected Likwid (HBM binding, perf HBM CAS counters unavailable)",
+                        "'likwid-perfctr' must be in PATH.",
+                        "install/load LIKWID or explicitly override with --measurer=perf.");
                     return nullptr;
                 }
                 std::cerr << "Warning: LIKWID backend unavailable; falling back to perf measurer." << std::endl;
@@ -169,25 +181,16 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
             return unavailable_on_windows(
                 "pcm", "the pcm-memory CLI it drives is POSIX-only.");
 #else
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using Intel PCM Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "Intel PCM Bandwidth Measurer");
 
             auto pcm_measurer = std::make_unique<PcmBandwidthMeasurer>(config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
             if (pcm_measurer->find_pcm_binary().empty()) {
-                std::cerr << "\n\033[1;31m============================================================\033[0m" << std::endl;
-                std::cerr << "\033[1;31m ERROR: Bandwidth Measurement Tool (Intel PCM) Not Found!\033[0m" << std::endl;
-                std::cerr << "\033[1;31m------------------------------------------------------------\033[0m" << std::endl;
-                if (strategy.get_requested_measurer_type() == MeasurerType::PCM) {
-                    std::cerr << " Mode: Forced PCM (--measurer=pcm)" << std::endl;
-                } else {
-                    std::cerr << " Mode: Auto-selected PCM (CXL memory-node binding detected)" << std::endl;
-                }
-                std::cerr << " Requirement: 'pcm-memory' must be in PATH." << std::endl;
-                std::cerr << " Hint: install Intel PCM or override with --measurer=perf." << std::endl;
-                std::cerr << "\n Aborting execution." << std::endl;
-                std::cerr << "\033[1;31m============================================================\033[0m\n" << std::endl;
+                print_missing_tool("Intel PCM",
+                    strategy.get_requested_measurer_type() == MeasurerType::PCM
+                        ? "Forced PCM (--measurer=pcm)"
+                        : "Auto-selected PCM (CXL memory-node binding detected)",
+                    "'pcm-memory' must be in PATH.",
+                    "install Intel PCM or override with --measurer=perf.");
                 return nullptr;
             }
             measurer = std::move(pcm_measurer);
@@ -196,21 +199,13 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
         }
 
         case MeasurerType::VTUNE: {
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using Intel VTune Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "Intel VTune Bandwidth Measurer");
             auto vtune_measurer = std::make_unique<VtuneBandwidthMeasurer>(config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
 
             if (vtune_measurer->find_vtune_binary().empty()) {
                 if (strategy.get_requested_measurer_type() == MeasurerType::VTUNE) {
-                    std::cerr << "\n\033[1;31m============================================================\033[0m" << std::endl;
-                    std::cerr << "\033[1;31m ERROR: Bandwidth Measurement Tool (VTune) Not Found!\033[0m" << std::endl;
-                    std::cerr << "\033[1;31m------------------------------------------------------------\033[0m" << std::endl;
-                    std::cerr << " Mode: Forced VTune (--measurer=vtune)" << std::endl;
-                    std::cerr << " Requirement: 'vtune' must be installed and available in PATH." << std::endl;
-                    std::cerr << "\n Aborting execution." << std::endl;
-                    std::cerr << "\033[1;31m============================================================\033[0m\n" << std::endl;
+                    print_missing_tool("VTune", "Forced VTune (--measurer=vtune)",
+                        "'vtune' must be installed and available in PATH.", nullptr);
                     return nullptr;
                 }
 #if defined(_WIN32)
@@ -226,14 +221,12 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
             break;
         }
 
+
         case MeasurerType::IOREPORT: {
 #if defined(_WIN32)
             return unavailable_on_windows("ioreport", "IOReport is an Apple Silicon framework.");
 #else
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using IOReport Bandwidth Measurer (Apple Silicon AMC)" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "IOReport Bandwidth Measurer (Apple Silicon AMC)");
             measurer = std::make_unique<IOReportBandwidthMeasurer>(config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
             break;
 #endif
@@ -241,10 +234,7 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
 
         case MeasurerType::IMC: {
 #if defined(_WIN32)
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using IMC Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "IMC Bandwidth Measurer");
 
             auto imc_measurer = std::make_unique<WindowsImcBandwidthMeasurer>(
                 config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
@@ -266,10 +256,7 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
 
         case MeasurerType::UPROF: {
 #if defined(_WIN32)
-            if (config.verbosity >= 1 && !printed_measurer_type) {
-                std::cout << "Using AMD uProf Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 1, "AMD uProf Bandwidth Measurer");
 
             auto uprof_measurer = std::make_unique<AMDuProfBandwidthMeasurer>(
                 config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
@@ -301,10 +288,7 @@ std::unique_ptr<BandwidthMeasurer> create_bandwidth_measurer(
             return unavailable_on_windows(
                 "perf", "perf_event_open is a Linux system call.");
 #else
-            if (config.verbosity >= 2 && !printed_measurer_type) {
-                std::cout << "Using Perf Bandwidth Measurer" << std::endl;
-                printed_measurer_type = true;
-            }
+            announce_measurer(config.verbosity >= 2, "Perf Bandwidth Measurer");
             measurer = std::make_unique<PerfBandwidthMeasurer>(config, sys_info, caps, storage, traffic_gen_manager, numa_resolver, mode);
             break;
 #endif

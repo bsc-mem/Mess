@@ -115,6 +115,14 @@ struct KernelParameters {
     bool use_nontemporal;
 };
 
+/**
+ * @brief Memory touched per GPU access: one line per warp, or one sector per thread; ignored by CPU generators.
+ */
+enum class GpuAccessGranularity {
+    LINE,
+    SECTOR
+};
+
 /** 
  * @brief Configuration for the sequential multi-ratio traffic generator.
  * 
@@ -134,6 +142,9 @@ struct KernelConfigMultiSeq {
     bool enable_interleaving = true;
     bool use_nontemporal_stores = false;
     bool single_registers = true;
+    GpuAccessGranularity granularity = GpuAccessGranularity::LINE;
+    bool dependent_loads = true;
+    bool full_sector_stores = false;
 
     // Internal generator-resolved value. 0 means "use ISA default width".
     int resolved_bytes_per_mem_op = 0;

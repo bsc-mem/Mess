@@ -763,51 +763,9 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     if (verbose4) std::cout << "[LIKWID] Likwid command: " << cmd << std::endl;
 
     int relaunch_attempts = 0;
-    auto relaunch_current_traffic_gen = [&]() -> bool {
-        if (!this->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores())) {
-            return false;
-        }
-        return true;
-    };
+    if (!ensure_traffic_gen_running(ratio, pause, relaunch_attempts)) return false;
 
-    if (!traffic_gen_manager_->is_traffic_gen_running(traffic_gen_manager_->active_traffic_gen_pid())) {
-        if (!relaunch_current_traffic_gen()) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        relaunch_attempts++;
-    }
-
-    bool is_remote = (type == CounterType::UPI_FLITS);
-    int expected_cores = get_traffic_gen_cores();
-    int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
-    
-    double theoretical_peak_gb_s = TheoreticalPeakCalculator::calculate_achievable_peak(
-        caps_, expected_cores, socket_cores, is_remote);
-    TrafficGenHealthChecker health_checker;
-    health_checker.is_pid_alive = [this](int pid) -> bool {
-        return traffic_gen_manager_->is_traffic_gen_running(pid);
-    };
-    health_checker.count_running_instances = [this]() -> int {
-        if (!traffic_gen_manager_) {
-            return TrafficGenHealthChecker::count_taskset_traffic_gen();
-        }
-        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
-    };
-    health_checker.expected_instance_count = expected_cores;
-
-    ensure_scaling_factor_cached();
-    int cache_line_size = cached_cache_line_size_;
-    double scaling_factor = cached_scaling_factor_;
-
-    auto calculate_bw_gb_s = [&](long long cas_rd, long long cas_wr, double elapsed_s) -> double {
-        if (elapsed_s <= 0) return 0.0;
-        if (type == CounterType::NVIDIA_GRACE) {
-            double bytes_rd = static_cast<double>(cas_rd) * 32.0;
-            double bytes_wr = static_cast<double>(cas_wr);
-            return (bytes_rd + bytes_wr) / (elapsed_s * 1e9);
-        } else {
-            return static_cast<double>(cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
-        }
-    };
+    double theoretical_peak_gb_s = achievable_peak_gbps(type == CounterType::UPI_FLITS);
 
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return false;
@@ -829,13 +787,11 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     };
 
     size_t window_size = fast_resume ? 5 : (type == CounterType::UPI_FLITS ? 10 : 7);
-    BandwidthStabilizer stabilizer(
-        theoretical_peak_gb_s, pause, health_checker,
-        window_size, 0.05, config_.verbosity);
-    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    BandwidthStabilizer stabilizer = make_stabilizer(theoretical_peak_gb_s, pause, window_size);
     
+    const int OVERALL_TIMEOUT_SECONDS = 60;
     int total_samples = 0;
-    int max_samples = static_cast<int>(200 * sampling_interval_ms_);
+    int max_samples = static_cast<int>((OVERALL_TIMEOUT_SECONDS * 1000.0) / sampling_interval_ms_);
 
     char buffer[4096];
     bool success = false;
@@ -846,7 +802,6 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
     bool headerParsed = false;
 
     auto loop_start = std::chrono::steady_clock::now();
-    const int OVERALL_TIMEOUT_SECONDS = 60;
     const int READ_TIMEOUT_SECONDS = 10;
     int consecutive_timeouts = 0;
 
@@ -950,7 +905,7 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
             if (on_sample) on_sample();
 
             if (total_samples % 20 == 0 && !traffic_gen_manager_->is_traffic_gen_running(traffic_gen_manager_->active_traffic_gen_pid())) {
-                if (relaunch_attempts < 2 && relaunch_current_traffic_gen()) {
+                if (relaunch_attempts < 2 && relaunch_traffic_gen(ratio, pause)) {
                     relaunch_attempts++;
                     stabilizer.reset();
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -970,7 +925,7 @@ bool LikwidBandwidthMeasurer::wait_for_stabilization(int& samples_taken, long lo
             }
 
             double sample_elapsed = sampling_interval_ms_ / 1000.0;
-            double bw_gb_s = calculate_bw_gb_s(sample_cas_rd, sample_cas_wr, sample_elapsed);
+            double bw_gb_s = bandwidth_gbps(sample_cas_rd, sample_cas_wr, sample_elapsed);
             StabilizationResult result = stabilizer.add_sample(sample_cas_rd, sample_cas_wr, bw_gb_s);
 
             if (result == StabilizationResult::ZOMBIE_DETECTED) {
@@ -1091,8 +1046,6 @@ bool LikwidBandwidthMeasurer::monitor_command(const std::string& command,
 
     std::map<std::string, long long> current_extra;
     std::map<std::string, long long> total_extra;
-
-    ensure_scaling_factor_cached();
 
     auto process_sample = [&](double timestamp, long long rd, long long wr) {
         double duration_s = interval_ms / 1000.0;

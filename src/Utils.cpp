@@ -38,6 +38,7 @@
 #include "utils/CpuTopology.h"
 #include "utils/FileUtils.h"
 #include "utils/StringUtils.h"
+#include "BenchmarkConfig.h"
 #include "utils/SubprocessCapture.h"
 #include <chrono>
 #include <fstream>
@@ -57,6 +58,7 @@
 #include <cctype>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -77,15 +79,7 @@ std::vector<int> parse_cpu_range_list(const std::string& cpu_list) {
 
         int lo = -1;
         int hi = -1;
-        const size_t dash = token.find('-');
-        try {
-            if (dash == std::string::npos) {
-                lo = hi = std::stoi(token);
-            } else {
-                lo = std::stoi(token.substr(0, dash));
-                hi = std::stoi(token.substr(dash + 1));
-            }
-        } catch (...) {
+        if (!string_utils::parse_int_range(token, lo, hi)) {
             continue;
         }
 
@@ -243,7 +237,42 @@ std::filesystem::path get_project_root() {
     return p.filename() == "bin" ? p.parent_path() : p;
 }
 
-void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) {
+
+void append_gpu_workload_config_to_plotter(const std::filesystem::path& path, const BenchmarkConfig& config) {
+    auto lock = platform::FileLock::acquire(path);
+    if (!lock.valid()) throw std::runtime_error("Cannot save GPU workload metadata: " + path.string());
+    std::string content = lock.read_all();
+    std::map<std::string, std::string> expected{{"GPU_WORKLOAD_VERSION", "2"}};
+    auto add = [&](const std::string& prefix, GpuAccessGranularity granularity, bool dependent, bool full) {
+        const bool sector = granularity == GpuAccessGranularity::SECTOR;
+        expected[prefix + "GRANULARITY"] = sector ? "sector" : "line";
+        expected[prefix + "LOADS"] = dependent ? "dependent" : "independent";
+        expected[prefix + "STORE_BYTES_PER_THREAD"] = std::to_string(sector ? (full ? 32 : 8) : 4);
+    };
+    add("GPU_MULTISEQ_", config.gpu_multiseq.granularity, config.gpu_multiseq.dependent_loads,
+        config.gpu_multiseq.full_sector_stores);
+    bool has_measurements = false;
+    for (const auto& directory : {path.parent_path() / "bw", path.parent_path() / "lat"}) {
+        if (!std::filesystem::exists(directory)) continue;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".txt") has_measurements = true;
+        }
+    }
+    for (const auto& field : expected) {
+        if (has_measurements) {
+            std::istringstream lines(content);
+            std::string line;
+            bool matches = false;
+            while (std::getline(lines, line)) if (line == field.first + "=" + field.second) matches = true;
+            if (!matches) throw std::runtime_error("Existing GPU measurements use a different or unrecorded workload. Select a fresh --folder.");
+        }
+        upsert_plotter_key(content, field.first, field.second);
+    }
+    if (!lock.replace_all(content)) throw std::runtime_error("Cannot write GPU workload metadata: " + path.string());
+}
+
+void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, const CPUCapabilities& caps, const std::string& binding_type, double tlb_ns, int cache_line_size, int worker_cores,
+    double upi_scaling_factor, double page_walk_lat_ns, const GPUCapabilities* gpu_caps) {
     if (plotter_path.has_parent_path()) {
         std::filesystem::create_directories(plotter_path.parent_path());
     }
@@ -278,6 +307,12 @@ void append_memory_config_to_plotter(const std::filesystem::path& plotter_path, 
     }
     upsert_plotter_key(content, "CACHE_LINE_SIZE", std::to_string(cache_line_size));
     upsert_plotter_key(content, "MEMORY_BINDING", binding_type);
+    upsert_plotter_key(content, "CPU_MODEL", caps.model_name);
+    upsert_plotter_key(content, "MEMORY_TYPE", caps.memory_type);
+    const bool gpu = gpu_caps && gpu_caps->has_gpu;
+    const std::string worker_key = gpu ? "WORKER_SMS" : "WORKER_CORES";
+    if (worker_cores >= 0) upsert_plotter_key(content, worker_key, std::to_string(worker_cores));
+    else remove_plotter_key(worker_key);
 
 #if defined(_WIN32)
     upsert_plotter_key(content, "HUGEPAGES",
@@ -622,6 +657,58 @@ void ensure_a64fx_pmu_available() {
 #endif
 }
 
+bool resolve_traffic_gen_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& cores) {
+    cores.clear();
+
+    if (!explicit_cores.empty()) {
+        const auto& cache = SystemToolsCache::instance();
+        const int reserved_cpu = cache.initialized ? cache.ptr_chase_cpu : -1;
+        cores.reserve(explicit_cores.size());
+        for (const auto& c : explicit_cores) {
+            int cid = -1;
+            string_utils::parse_int_strict(c, cid);
+            if (cid == reserved_cpu && explicit_cores.size() > 1) continue;
+            cores.push_back(c);
+        }
+        return !cores.empty();
+    }
+
+    if (traffic_gen_cores <= 0) {
+        return false;
+    }
+
+    const auto& cache = SystemToolsCache::instance();
+    const int reserved_cpu = cache.initialized ? cache.ptr_chase_cpu : find_ptr_chase_cpu().first;
+    const std::vector<int> selected_cpus = select_worker_cpus(traffic_gen_cores, reserved_cpu);
+    cores.reserve(selected_cpus.size());
+    for (int cpu : selected_cpus) {
+        cores.push_back(std::to_string(cpu));
+    }
+
+    return static_cast<int>(cores.size()) == traffic_gen_cores;
+}
+
+int get_traffic_gen_worker_count(const BenchmarkConfig& config, const system_info& info) {
+    if (!config.traffic_gen_explicit_cores.empty()) {
+        std::vector<std::string> cores;
+        return resolve_traffic_gen_core_list(config.traffic_gen_cores, config.traffic_gen_explicit_cores, cores)
+            ? static_cast<int>(cores.size()) : 0;
+    }
+    int traffic_gen_cores = config.instruction_sampling && info.socket_count > 0
+        ? info.sockets[0].core_count
+        : get_default_traffic_gen_cores(info);
+
+    const int available_cores = info.socket_count > 0
+        ? info.sockets[0].core_count
+        : 0;
+    if (config.traffic_gen_cores > 0 &&
+        (available_cores <= 0 || config.traffic_gen_cores <= available_cores)) {
+        traffic_gen_cores = config.traffic_gen_cores;
+    }
+
+    return std::max(traffic_gen_cores, 1);
+}
+
 int get_default_traffic_gen_cores(const system_info& info) {
 #ifdef __APPLE__
     if (info.total_physical_cores > 1) {
@@ -659,7 +746,7 @@ namespace {
 
 bool node_has_any_cpu(int node_id) {
     std::string cpulist;
-    if (!file_utils::read_string_file("/sys/devices/system/node/node" + std::to_string(node_id) + "/cpulist", cpulist)) {
+    if (!file_utils::read_first_line("/sys/devices/system/node/node" + std::to_string(node_id) + "/cpulist", cpulist)) {
         return false;
     }
     for (char c : cpulist) {

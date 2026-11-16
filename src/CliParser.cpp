@@ -37,6 +37,7 @@
 #include "CliParser.h"
 #include "architecture/BandwidthCounterStrategy.h"
 #include "platform/Sys.h"
+#include "utils/StringUtils.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -46,7 +47,26 @@
 #include <cstdlib>
 #include <iomanip>
 #include <cmath>
+#include <cctype>
 #include <limits>
+
+namespace {
+template<class Config>
+bool parse_gpu_workload(const std::string& value, Config& config) {
+    std::istringstream input(value);
+    std::string granularity, loads, stores, extra;
+    if (!std::getline(input, granularity, ':') || !std::getline(input, loads, ':') ||
+        value.empty() || value.back() == ':') return false;
+    if (granularity != "line" && granularity != "sector") return false;
+    if (loads != "dependent" && loads != "independent") return false;
+    if (std::getline(input, stores, ':') &&
+        (stores != "full" || granularity != "sector" || std::getline(input, extra, ':'))) return false;
+    config.granularity = granularity == "line" ? GpuAccessGranularity::LINE : GpuAccessGranularity::SECTOR;
+    config.dependent_loads = loads == "dependent";
+    config.full_sector_stores = stores == "full";
+    return true;
+}
+}
 
 void CLIParser::display_configuration(const BenchmarkConfig& config, bool perf_accessible, int paranoid_level, bool tlb_ok, double tlb_latency_ns) const {
     if (config.verbosity < 1) {
@@ -92,12 +112,7 @@ void CLIParser::display_configuration(const BenchmarkConfig& config, bool perf_a
                 std::cout << "(adaptive, tier=" << config.adaptive_tier << ")" << std::endl;
             }
         } else {
-            std::cout << config.pauses.size() << " values (";
-            for (size_t i = 0; i < config.pauses.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << config.pauses[i];
-            }
-            std::cout << ")" << std::endl;
+            std::cout << config.pauses.size() << " values (" << string_utils::join(config.pauses, ", ") << ")" << std::endl;
         }
                 
         std::cout << "Latency measurement: " << (config.instruction_sampling ? "Instruction Sampling (PEBS/SPE)" : "Pointer Chasing") << std::endl;
@@ -114,6 +129,7 @@ CLIParser::CLIParser() {
     specs_ = {
         {"r", "ratio", true, "X[,X...]", "read/write ratios in percent; comma-separated list (GPU: whole percentages)"},
         {"", "gpu", false, "", "run the NVIDIA GPU bandwidth/latency benchmark"},
+        {"", "gpu-seq", true, "POLICY", "GPU Sequential workload: line|sector:dependent|independent[:full] (default: line:dependent)"},
         {"", "dry-run", false, "", "detect system and print configuration without running benchmark"},
         {"", "no-profile", false, "", "discard measurement files after the run (saved by default)"},
         {"", "folder", true, "DIR", "root output folder (default: measuring)"},
@@ -143,7 +159,7 @@ CLIParser::CLIParser() {
 #if defined(_WIN32)
         {"", "add-counters", true, "COUNTERS", "extra counters (not available on Windows)"}
 #elif !defined(__APPLE__)
-        {"", "add-counters", true, "COUNTERS", "comma-separated extra counters alongside BW (GPU: exact CUPTI/Nsight Compute metric names)"}
+        {"", "add-counters", true, "COUNTERS", "comma-separated extra counters alongside BW (GPU: exact CUPTI metric names, or legacy metric/event names)"}
 #endif
     };
 }
@@ -176,13 +192,20 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         return true;
     }
     
+    bool gpu_workload_flag_seen = false;
     bool total_cores_flag_seen = false;
     bool explicit_cores_flag_seen = false;
     bool repetitions_flag_seen = false;
     bool tier_flag_seen = false;
     bool point_count_flag_seen = false;
     bool gpu_flag_seen = false;
-    
+
+    auto set_verbosity = [&](const std::string& value) {
+        config.verbosity = std::stoi(value);
+        if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
+        return true;
+    };
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         
@@ -224,6 +247,12 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
             return false;
         } else if (arg.find("--measurer=") == 0) {
             config.measurer = arg.substr(11);
+        } else if (arg.find("--gpu-seq=") == 0) {
+            if (!parse_gpu_workload(arg.substr(10), config.gpu_multiseq)) {
+                std::cerr << "error: --gpu-seq expects line|sector:dependent|independent[:full] (full requires sector)\n";
+                return false;
+            }
+            gpu_workload_flag_seen = true;
         } else if (arg == "--gpu") {
             gpu_flag_seen = true;
 #ifdef __APPLE__
@@ -247,16 +276,11 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
             }
         } else if (arg == "-v") {
             if (i + 1 >= argc) { std::cerr << "error: -v requires an argument" << std::endl; return false; }
-            config.verbosity = std::stoi(argv[++i]);
-            if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
+            if (!set_verbosity(argv[++i])) return false;
         } else if (arg.find("--verbose=") == 0) {
-            std::string value = arg.substr(10);
-            config.verbosity = std::stoi(value);
-            if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
+            if (!set_verbosity(arg.substr(10))) return false;
         } else if (arg.find("-v") == 0 && arg.length() > 2) {
-            std::string value = arg.substr(2);
-            config.verbosity = std::stoi(value);
-            if (config.verbosity < 0 || config.verbosity > 4) { std::cerr << "error: verbosity must be between 0 and 4" << std::endl; return false; }
+            if (!set_verbosity(arg.substr(2))) return false;
         } else if (arg.find("--repetitions=") == 0) {
             std::string value = arg.substr(14);
             config.point_reps = std::stoi(value);
@@ -307,6 +331,10 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
 #endif
     config.generate_multiseq = true;
 
+    if (gpu_workload_flag_seen && !gpu_flag_seen) {
+        std::cerr << "error: GPU workload policies require --gpu\n";
+        return false;
+    }
     config.run_gpu = gpu_flag_seen;
     if (config.run_gpu) {
         if (total_cores_flag_seen || explicit_cores_flag_seen || !config.memory_bind_nodes.empty()) {
@@ -356,6 +384,7 @@ bool CLIParser::parse(int argc, char** argv, BenchmarkConfig& config) {
         config.point_reps = 1;
     }
 
+
     return true;
 }
 
@@ -365,42 +394,19 @@ void CLIParser::print_help(const char* argv0) {
     std::cout << "\nBasic Options:\n";
     std::vector<std::string> basic_opts = {"ratio", "gpu", "dry-run", "no-profile", "folder", "verbose", "tier", "version", "help"};
 
-    for (const auto& spec : specs_) {
-        if (std::find(basic_opts.begin(), basic_opts.end(), spec.long_opt) != basic_opts.end()) {
-            std::cout << "  ";
-            if (!spec.short_opt.empty()) {
-                std::cout << "-" << spec.short_opt << ", ";
-            } else {
-                std::cout << "    ";
-            }
-
-            std::string long_opt = "--" + spec.long_opt;
-            if (spec.has_arg) {
-                long_opt += "=" + spec.metavar;
-            }
+    auto print_options = [&](bool basic) {
+        for (const auto& spec : specs_) {
+            if ((std::find(basic_opts.begin(), basic_opts.end(), spec.long_opt) != basic_opts.end()) != basic) continue;
+            std::cout << "  " << (spec.short_opt.empty() ? "    " : "-" + spec.short_opt + ", ");
+            const std::string long_opt = "--" + spec.long_opt + (spec.has_arg ? "=" + spec.metavar : "");
             std::cout << std::left << std::setw(35) << long_opt << " " << spec.description << std::endl;
         }
-    }
+    };
+    print_options(true);
 
     std::cout << "\nAdvanced Options:\n";
     std::cout << "   Warning: These are for fine-tuning; ensure familiarity with the code\n";
-    
-    for (const auto& spec : specs_) {
-        if (std::find(basic_opts.begin(), basic_opts.end(), spec.long_opt) == basic_opts.end()) {
-            std::cout << "  ";
-            if (!spec.short_opt.empty()) {
-                std::cout << "-" << spec.short_opt << ", ";
-            } else {
-                std::cout << "    ";
-            }
-
-            std::string long_opt = "--" + spec.long_opt;
-            if (spec.has_arg) {
-                long_opt += "=" + spec.metavar;
-            }
-            std::cout << std::left << std::setw(35) << long_opt << " " << spec.description << std::endl;
-        }
-    }
+    print_options(false);
 
     std::cout << "\nExamples:\n";
     std::cout << "  " << argv0 << " --ratio=10,50,90\n";
@@ -420,30 +426,16 @@ bool CLIParser::expand_core_list(const std::string& s, std::vector<std::string>&
     std::stringstream ss(s);
     std::string segment;
     while (std::getline(ss, segment, ',')) {
-        segment.erase(segment.begin(), std::find_if(segment.begin(), segment.end(),
-            [](int ch){ return !std::isspace(ch); }));
-        segment.erase(std::find_if(segment.rbegin(), segment.rend(),
-            [](int ch){ return !std::isspace(ch); }).base(), segment.end());
+        segment = string_utils::trim(segment);
         if (segment.empty()) continue;
 
-        auto dash = segment.find('-');
-        if (dash == std::string::npos) {
-            try {
-                int v = std::stoi(segment);
-                if (v < 0) return false;
-                out.push_back(std::to_string(v));
-            } catch (...) { return false; }
-        } else {
-            try {
-                int lo = std::stoi(segment.substr(0, dash));
-                int hi = std::stoi(segment.substr(dash + 1));
-                if (lo < 0 || hi < lo) return false;
-                for (int v = lo; v <= hi; ++v) out.push_back(std::to_string(v));
-            } catch (...) { return false; }
-        }
+        int lo = 0, hi = 0;
+        if (!string_utils::parse_int_range(segment, lo, hi) || lo < 0 || hi < lo) return false;
+        for (int v = lo; v <= hi; ++v) out.push_back(std::to_string(v));
     }
     return !out.empty();
 }
+
 
 bool CLIParser::parse_bind(const std::string& s, std::vector<int>& out) {
     out.clear();
@@ -465,10 +457,7 @@ bool CLIParser::parse_ratios(const std::string& s, std::vector<double>& out) {
     std::string token;
 
     while (std::getline(ss, token, ',')) {
-        token.erase(token.begin(), std::find_if(token.begin(), token.end(),
-            [](int ch) { return !std::isspace(ch); }));
-        token.erase(std::find_if(token.rbegin(), token.rend(),
-            [](int ch) { return !std::isspace(ch); }).base(), token.end());
+        token = string_utils::trim(token);
 
         if (token.empty()) continue;
 
@@ -492,10 +481,7 @@ bool CLIParser::parse_pauses(const std::string& s, std::vector<int>& out) {
     std::string token;
 
     while (std::getline(ss, token, ',')) {
-        token.erase(token.begin(), std::find_if(token.begin(), token.end(),
-            [](int ch) { return !std::isspace(ch); }));
-        token.erase(std::find_if(token.rbegin(), token.rend(),
-            [](int ch) { return !std::isspace(ch); }).base(), token.end());
+        token = string_utils::trim(token);
 
         if (token.empty()) continue;
 

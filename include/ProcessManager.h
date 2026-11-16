@@ -42,6 +42,7 @@
 #include "Utils.h"
 #include "platform/Ipc.h"
 #include "platform/Process.h"
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -114,6 +115,7 @@ struct TrafficGenPreparation {
     bool reused_existing = false;
 };
 
+
 /**
  * @brief Launches, reuses, and tears down traffic-generator subprocesses.
  */
@@ -151,8 +153,8 @@ public:
     void kill_all_traffic_gen();
 
     bool wait_for_traffic_gen_ready(int timeout_seconds = 120);
+    bool wait_for_traffic_gen_ready(int timeout_seconds, std::function<bool()> cancellation_requested);
 
-    platform::ProcessId current_traffic_gen_pid() const { return current_traffic_gen_pid_; }
     platform::ProcessId active_traffic_gen_pid() const { return active_traffic_gen_pid_; }
     std::vector<platform::ProcessId> traffic_gen_worker_pids() const;
 
@@ -160,7 +162,6 @@ private:
     const BenchmarkConfig& config_;
     const system_info& sys_info_;
 
-    platform::ProcessId current_traffic_gen_pid_;
     platform::ProcessId active_traffic_gen_pid_;
 
     bool persistent_traffic_gen_valid_;
@@ -171,36 +172,35 @@ private:
     uint64_t persistent_traffic_gen_array_elements_;
     std::vector<int> persistent_traffic_gen_mem_nodes_;
 
-    bool launch_traffic_gen_multiseq(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
-    
+    bool launch_for_mode(ExecutionMode mode, double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid);
+    bool launch_single_mode(ExecutionMode mode, double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid);
 
-    bool launch_traffic_gen_impl(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
-    
+    bool launch_traffic_gen_impl(ExecutionMode mode, double ratio_pct, int pause, const std::vector<std::string>& cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid);
+
 #if USE_MPI_SPAWN
-    bool launch_traffic_gen_mpi(double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid) const;
+    bool launch_traffic_gen_mpi(ExecutionMode mode, double ratio_pct, int pause, int cores, const std::vector<int>& mem_nodes, const std::string& log_file, platform::ProcessId& out_pid);
 #endif
     bool read_traffic_gen_pid(const std::string& pid_filename, platform::ProcessId& traffic_gen_pid) const;
-    bool cleanup_zombie_traffic_gen() const;
+    bool cleanup_zombie_traffic_gen();
     std::string get_membind_arg(int default_node) const;
 
     std::string unique_id_;
     std::string ready_fifo_path_;
-    mutable int expected_ready_count_;
-    mutable std::string last_traffic_gen_log_file_;
+    int expected_ready_count_;
+    std::string last_traffic_gen_log_file_;
 
+    bool prepare_ready_fifo(int expected_workers);
     void generate_unique_names();
     void print_recent_traffic_gen_log_excerpt() const;
     uint64_t active_traffic_gen_array_elements() const;
 
-#if defined(_WIN32)
-    mutable platform::ProcessGroup traffic_gen_group_;
-#endif
+    platform::ProcessGroup traffic_gen_group_;
 
-    mutable std::vector<std::string> cached_core_list_;
-    mutable int cached_traffic_gen_cores_;
-    mutable std::vector<std::string> cached_explicit_cores_;
-    
-    bool resolve_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& out_cores) const;
+    std::vector<std::string> cached_core_list_;
+    int cached_traffic_gen_cores_;
+    std::vector<std::string> cached_explicit_cores_;
+
+    bool resolve_core_list(int traffic_gen_cores, const std::vector<std::string>& explicit_cores, std::vector<std::string>& out_cores);
 };
 
 #endif

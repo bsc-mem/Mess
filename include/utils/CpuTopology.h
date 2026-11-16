@@ -69,6 +69,8 @@ int distance(int src_node, int dst_node);
 
 int socket_of_node(int node);
 
+int socket_of_memory_node(int node);
+
 std::set<int> list_nodes(int max_index = 64);
 
 std::set<int> nodes_for_cpus(const std::set<int>& cpus);

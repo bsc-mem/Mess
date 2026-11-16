@@ -125,4 +125,8 @@ bool cpu_is_amd() {
     return std::string(vendor) == "AuthenticAMD";
 }
 
+SleepInhibitor::SleepInhibitor() {}
+
+SleepInhibitor::~SleepInhibitor() {}
+
 }

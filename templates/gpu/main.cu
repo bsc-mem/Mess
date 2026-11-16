@@ -49,11 +49,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "workloads.cuh"
 #include "range_profiler.cuh"
+#if __has_include(<cupti_events.h>) && __has_include(<cupti_metrics.h>)
+#include "legacy_profiler.cuh"
+#endif
 
 namespace {
 
@@ -65,20 +69,14 @@ __global__ void link_chase(struct line* chase, const uint64_t* order, uint64_t c
     }
 }
 
-__global__ void fill(dataType* values, uint64_t count, dataType value) {
+template <class T>
+__global__ void fill(T* values, uint64_t count, T value) {
     for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count;
          i += (uint64_t)gridDim.x * blockDim.x)
         values[i] = value;
 }
 
-void checkCuda(cudaError_t status, const char* call) {
-    if (status != cudaSuccess) throw std::runtime_error(std::string(call) + ": " + cudaGetErrorString(status));
-}
-
-#define CUDA_CHECK(call) checkCuda((call), #call)
-
 constexpr uint64_t kAllocationGranularity = 2ull << 20;
-constexpr uint64_t kSectorBytes = 32;
 constexpr uint64_t kWarmUpWindowNs = 1000000;
 constexpr uint64_t kMemoryReserve = 512ull << 20;
 constexpr uint64_t kMinChaseBytes = 256ull << 20;
@@ -199,8 +197,8 @@ private:
 };
 
 struct Streams {
-    Streams(int count, uint64_t elements)
-        : stride(roundUp(elements * sizeof(dataType), kAllocationGranularity) / sizeof(dataType)),
+    Streams(int count, uint64_t bytes)
+        : stride(roundUp(bytes, kAllocationGranularity) / sizeof(dataType)),
           values(count * stride), table(count) {
         std::vector<dataType*> pointers(count);
         for (int i = 0; i < count; ++i) pointers[i] = values.get() + i * stride;
@@ -211,6 +209,7 @@ struct Streams {
     DeviceBuffer<dataType> values;
     DeviceBuffer<dataType*> table;
 };
+
 
 const WorkloadVariant& findWorkload(const std::string& mode, int ratio) {
     for (const auto& workload : kWorkloads)
@@ -242,15 +241,15 @@ Grid residentGrid(const cudaDeviceProp& device) {
     return best;
 }
 
-uint64_t streamBytes(int blocks, uint64_t elements) {
-    return blocks * roundUp(elements * sizeof(dataType), kAllocationGranularity);
+uint64_t streamBytes(int blocks, uint64_t bytes) {
+    return blocks * roundUp(bytes, kAllocationGranularity);
 }
 
 void checkMemory(const cudaDeviceProp& device, const Grid& grid, const Options& options) {
     const int blocks = grid.blocks(device);
     uint64_t needed = kMemoryReserve + roundUp(options.chaseBytes, kAllocationGranularity) +
-                      streamBytes(blocks, grid.threads * (CACHE_LINE / sizeof(dataType)) * maxSections(options.iterations, &WorkloadVariant::loadOps)) +
-                      streamBytes(blocks, grid.threads * (kSectorBytes / sizeof(dataType)) * maxSections(options.iterations, &WorkloadVariant::storeOps));
+                      streamBytes(blocks, grid.threads * MESS_LOAD_SLOT_BYTES * maxSections(options.iterations, &WorkloadVariant::loadOps)) +
+                      streamBytes(blocks, grid.threads * MESS_STORE_SLOT_BYTES * maxSections(options.iterations, &WorkloadVariant::storeOps));
     size_t free = 0, total = 0;
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
     if (needed > free)
@@ -261,18 +260,22 @@ void checkMemory(const cudaDeviceProp& device, const Grid& grid, const Options& 
 class Workload {
 public:
     Workload(const cudaDeviceProp& device, const Grid& grid, const Options& options)
-        : threads_(grid.threads),
+        : sms_(device.multiProcessorCount), threads_(grid.threads),
           blocks_(grid.blocks(device)),
-          groupLD_(CACHE_LINE / sizeof(dataType)),
-          groupST_(kSectorBytes / sizeof(dataType)),
+          loadSlotBytes_(MESS_LOAD_SLOT_BYTES),
+          storeSlotBytes_(MESS_STORE_SLOT_BYTES),
           iterations_(options.iterations),
           settleNs_(options.settleNs),
           lines_(options.chaseBytes / CACHE_LINE),
-          loads_(blocks_, threads_ * groupLD_ * maxSections(iterations_, &WorkloadVariant::loadOps)),
-          stores_(blocks_, threads_ * groupST_ * maxSections(iterations_, &WorkloadVariant::storeOps)),
-          chase_(lines_), sample_(1), flags_(1), result_(1) {
+          loads_(blocks_, threads_ * loadSlotBytes_ * maxSections(iterations_, &WorkloadVariant::loadOps)),
+          stores_(blocks_, threads_ * storeSlotBytes_ * maxSections(iterations_, &WorkloadVariant::storeOps)),
+          chase_(lines_), sample_(1), flags_(1), result_(1)
+          {
         const int initBlocks = device.multiProcessorCount * 8;
-        fill<<<initBlocks, threads_>>>(loads_.values.get(), blocks_ * loads_.stride, threads_ * groupLD_ * sizeof(dataType));
+        using LoadWord = std::conditional_t<MESS_LOAD_BYTES == 4, uint32_t, uint64_t>;
+        fill<<<initBlocks, threads_>>>(reinterpret_cast<LoadWord*>(loads_.values.get()),
+                                       blocks_ * loads_.stride * sizeof(dataType) / sizeof(LoadWord),
+                                       static_cast<LoadWord>(threads_ * loadSlotBytes_));
         CUDA_CHECK(cudaGetLastError());
 
         const std::vector<uint64_t> order = chaseOrder(lines_);
@@ -287,20 +290,23 @@ public:
         resetFlags();
     }
 
-    void launch(const WorkloadVariant& workload, uint64_t pause, uint64_t windowNs) {
+    void launch(Profiler* profiler, const WorkloadVariant& workload, uint64_t pause, uint64_t windowNs
+                ) {
         const MessArgs args{chase_.get(), sample_.get(), windowNs, settleNs_, flags_.get(),
-                            loads_.table.get(), groupLD_, stores_.table.get(), groupST_, pause,
+                            loads_.table.get(), loadSlotBytes_, stores_.table.get(), storeSlotBytes_, pause,
                             sectionsFor(iterations_, workload.loadOps),
                             sectionsFor(iterations_, workload.storeOps), result_.get(),
                             };
+        if (profiler) profiler->begin_kernel();
         workload.launch(args, blocks_, threads_);
         CUDA_CHECK(cudaGetLastError());
+        if (profiler) profiler->end_kernel();
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     void warmUp() {
         for (const auto& workload : kWorkloads) {
-            launch(workload, 0, kWarmUpWindowNs);
+            launch(nullptr, workload, 0, kWarmUpWindowNs);
             collect();
         }
     }
@@ -323,10 +329,11 @@ private:
         CUDA_CHECK(cudaMemcpy(flags_.get(), &cleared, sizeof(Flags), cudaMemcpyHostToDevice));
     }
 
+    int sms_;
     int threads_;
     int blocks_;
-    uint64_t groupLD_;
-    uint64_t groupST_;
+    uint64_t loadSlotBytes_;
+    uint64_t storeSlotBytes_;
     uint64_t iterations_;
     uint64_t settleNs_;
     uint64_t lines_;
@@ -353,18 +360,24 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceGetAttribute(&memoryClockKHz, cudaDevAttrMemoryClockRate, 0));
         CUDA_CHECK(cudaDeviceGetAttribute(&busWidthBits, cudaDevAttrGlobalMemoryBusWidth, 0));
 
-        if (device.major < 7)
-            throw std::runtime_error("compute capability 7.0 or newer is required, found " + std::to_string(device.major) + "." +
-                                     std::to_string(device.minor));
         options.chaseBytes = chaseBytesFor(options);
         const Grid grid = residentGrid(device);
         checkMemory(device, grid, options);
         Workload workload(device, grid, options);
         workload.warmUp();
-        RangeProfiler profiler(context, 0, options.metrics);
+        std::unique_ptr<Profiler> profiler;
+        if (device.major >= 7) {
+            profiler = std::make_unique<RangeProfiler>(context, 0, options.metrics);
+        } else {
+#if __has_include(<cupti_events.h>) && __has_include(<cupti_metrics.h>)
+            profiler = std::make_unique<LegacyProfiler>(context, 0, options.metrics);
+#else
+            throw std::runtime_error("pre-Volta GPUs require CUDA Toolkit 12.6 through 12.9 with legacy CUPTI APIs");
+#endif
+        }
 
         std::printf("READY sms=%d blocks=%d threads=%d passes=%zu memory_clock_mhz=%d bus_width_bits=%d chase_bytes=%llu workloads=",
-                    device.multiProcessorCount, workload.blocks(), workload.threads(), profiler.passes(),
+                    device.multiProcessorCount, workload.blocks(), workload.threads(), profiler->passes(),
                     memoryClockKHz / 1000, busWidthBits, (unsigned long long)options.chaseBytes);
         for (size_t i = 0; i < std::size(kWorkloads); ++i)
             std::printf("%s%s:%d", i ? "," : "", kWorkloads[i].mode, kWorkloads[i].ratio);
@@ -374,15 +387,17 @@ int main(int argc, char** argv) {
         for (std::string request; std::getline(std::cin, request);) {
             std::istringstream fields(request);
             std::string mode, ratioText, pauseText, extra;
-            if (!(fields >> mode >> ratioText >> pauseText) || (fields >> extra))
+            if (!(fields >> mode >> ratioText >> pauseText))
                 throw std::invalid_argument("expected '<mode> <ratio> <pause>', got '" + request + "'");
+            if (fields >> extra) throw std::invalid_argument("unexpected GPU sample arguments");
             const WorkloadVariant& target = findWorkload(mode, static_cast<int>(parseCount(ratioText)));
             const uint64_t pause = parseCount(pauseText);
             Burst burst;
-            const std::vector<double> values = profiler.measure([&](size_t pass) {
+            const std::vector<double> values = profiler->measure([&](size_t pass) {
                 Burst current;
                 do {
-                    workload.launch(target, pause, options.windowNs);
+                    workload.launch(profiler.get(), target, pause, options.windowNs
+                                    );
                     current.add(workload.collect());
                 } while (!current.done(options));
                 if (pass == 0) burst = current;
@@ -391,7 +406,7 @@ int main(int argc, char** argv) {
                         (unsigned long long)pause, (unsigned long long)burst.kernels, (unsigned long long)burst.accesses,
                         (unsigned long long)burst.cycles, (unsigned long long)burst.ns);
             for (size_t i = 0; i < values.size(); ++i)
-                std::printf(" %s=%.17g", profiler.metrics()[i].c_str(), values[i]);
+                std::printf(" %s=%.17g", profiler->metrics()[i].c_str(), values[i]);
             std::printf("\n");
             std::fflush(stdout);
         }

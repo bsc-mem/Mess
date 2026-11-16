@@ -34,6 +34,7 @@
 
 import argparse
 import glob
+import json
 import os
 import re
 
@@ -41,7 +42,7 @@ import pandas as pd
 import numpy as np
 from scipy.signal import savgol_filter
 
-from libs.parser import parse_bwlat_file, parse_filename, curves_to_json_compact
+from libs.parser import curves_to_json_compact, bwlat_files, iter_bwlat_points
 from libs.processor import process_data, calculate_mean_curves, filter_incomplete_ratios
 from libs.mess_score import compute_mess_score
 from libs.visualizer import plot_curves, plot_combined_curves, check_smooth_curves, configure_plot_style, filter_large_bw_jumps, save_gradient_legends_figure
@@ -68,6 +69,10 @@ PEBS_PERCENTILE_OVERLAY_SPECS = (
         )
 
 
+def _with_latency_column(dfs_rw, metric_col):
+    return {rw: df.assign(latency_smooth=df[metric_col]) for rw, df in dfs_rw.items() if metric_col in df.columns}
+
+
 def _plot_percentile_curves(config, dfs_rw, processed_dir, cmap_name,
         draw_dots=False, draw_lines=True, legend_rw_min=None):
     """Generate separate BW-latency PDFs for each PEBS percentile."""
@@ -79,13 +84,7 @@ def _plot_percentile_curves(config, dfs_rw, processed_dir, cmap_name,
         if metric_col not in sample_df.columns:
             continue
 
-        modified_dfs = {}
-        for rw, df in dfs_rw.items():
-            if metric_col in df.columns:
-                df_mod = df.copy()
-                df_mod['latency_smooth'] = df_mod[metric_col]
-                modified_dfs[rw] = df_mod
-
+        modified_dfs = _with_latency_column(dfs_rw, metric_col)
         if modified_dfs:
             plot_curves(
                     config,
@@ -118,7 +117,7 @@ def _percentile_overlay_max_lat(dfs_rw):
 
 
 def _plot_percentile_overlay(config, dfs_rw, processed_dir, measuring_dir,
-        limit_lat_override=None, draw_dots=False, draw_lines=True,
+        limit_lat, draw_dots=False, draw_lines=True,
         legend_rw_min=None):
     """Overlay p99/p95/p50 latency bands for a single dataset on one chart.
 
@@ -133,32 +132,17 @@ def _plot_percentile_overlay(config, dfs_rw, processed_dir, measuring_dir,
 
     label = os.path.basename(os.path.normpath(measuring_dir))
     overlay_datasets = []
-    global_max_lat = 0.0
 
     for metric_col, cmap_name, pct_label in PEBS_PERCENTILE_OVERLAY_SPECS:
         if metric_col not in sample_df.columns:
             continue
 
-        modified_dfs = {}
-        for rw, df in dfs_rw.items():
-            if metric_col in df.columns:
-                df_mod = df.copy()
-                df_mod['latency_smooth'] = df_mod[metric_col]
-                modified_dfs[rw] = df_mod
-                series = df_mod['latency_smooth'].dropna()
-                if not series.empty:
-                    global_max_lat = max(global_max_lat, series.max())
-
+        modified_dfs = _with_latency_column(dfs_rw, metric_col)
         if modified_dfs:
             overlay_datasets.append((f'{label} {pct_label}', modified_dfs, config, cmap_name, measuring_dir))
 
     if len(overlay_datasets) < 2:
         return
-
-    if limit_lat_override is not None:
-        limit_lat = limit_lat_override
-    else:
-        limit_lat = max(900.0, global_max_lat * 1.1) if global_max_lat > 0 else 900.0
 
     plot_combined_curves(
             overlay_datasets,
@@ -201,6 +185,8 @@ def _build_metric_curves(df_for_metrics, ratio_col, metric_col, apply_smoothing=
     if missing:
         return {}
 
+    if "source_row" in df_for_metrics.columns:
+        required.append("source_row")
     dfs_metric = {}
     for rw in sorted(df_for_metrics[ratio_col].dropna().unique()):
         df_rw = df_for_metrics[df_for_metrics[ratio_col] == rw][required].copy()
@@ -225,32 +211,11 @@ def _build_metric_curves(df_for_metrics, ratio_col, metric_col, apply_smoothing=
     return dfs_metric
 
 
+
+
 def _collect_bwlat_rows(measuring_dir, config):
-    rows = []
-    for source_dir in (measuring_dir, os.path.join(measuring_dir, "curves")):
-        if not os.path.exists(source_dir):
-            continue
-        for filename in os.listdir(source_dir):
-            if not (filename.startswith("bwlat_") and filename.endswith(".txt")):
-                continue
-            rd_percentage, pause = parse_filename(filename)
-            if rd_percentage is None:
-                continue
-            filepath = os.path.join(source_dir, filename)
-            data_points = parse_bwlat_file(filepath, config)
-            if not data_points:
-                continue
-            for point in data_points:
-                rows.append(
-                        {
-                            "bandwidth": point["bandwidth"],
-                            "latency": point["latency"],
-                            "rd_percentage": rd_percentage,
-                            "read_pct_rounded": rd_percentage,
-                            "pause": pause,
-                            }
-                        )
-    return rows
+    return [{"bandwidth": point["bandwidth"], "latency": point["latency"], "rd_percentage": rd, "read_pct_rounded": rd, "pause": pause}
+            for rd, pause, point in iter_bwlat_points(measuring_dir, config)]
 
 
 def _build_curves_table(dfs_rw, read_label):
@@ -595,8 +560,6 @@ def _build_plot_curves(df_for_csv, read_label, apply_smoothing=False,
         return {}
 
     sort_col = "pause" if "pause" in df_for_csv.columns else bw_col
-    if apply_smoothing:
-        sort_col = bw_col
     valid_bw = df_for_csv[bw_col].dropna()
     global_span = valid_bw.max() - valid_bw.min() if not valid_bw.empty else 0.0
 
@@ -623,10 +586,6 @@ def _build_plot_curves(df_for_csv, read_label, apply_smoothing=False,
                 continue
 
         group = group.sort_values(sort_col, ascending=False).reset_index(drop=True)
-        group, n_reordered = _reorder_bw_zigzag(group, bw_col)
-        # Reordering fixes the sweep-order artifacts; it can't fix a point
-        # whose latency itself is a one-off glitch relative to its
-        # now-bandwidth-adjacent neighbors, so drop just those.
         group, n_removed = _clean_latency(group, lat_col)
 
         bw_vals = group[bw_col].to_numpy(dtype=float)
@@ -656,7 +615,7 @@ def _build_plot_curves(df_for_csv, read_label, apply_smoothing=False,
 
 def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
                       ignore_guards=False, apply_smoothing=False,
-                      include_low_ratios=False, draw_dots=False,
+                      include_low_ratios=False, draw_dots=False, json_power=False,
                       ):
     """Process one measurement directory: bucket, filter, plot, write CSV/JSON."""
     if not os.path.exists(measuring_dir):
@@ -669,10 +628,7 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
     df_bw, df_lat, config = process_data(measuring_dir)
 
     has_bw_lat_dirs = os.path.exists(os.path.join(measuring_dir, "bw")) and os.path.exists(os.path.join(measuring_dir, "lat"))
-    has_bwlat_files = any(
-            filename.startswith("bwlat_") and filename.endswith(".txt")
-            for filename in os.listdir(measuring_dir)
-            )
+    has_bwlat_files = bool(bwlat_files(measuring_dir))
 
     if df_bw.empty or df_lat.empty:
         df_for_csv, read_label = _aggregate_from_csv_fallback(measuring_dir, step, group_mode)
@@ -696,16 +652,14 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
     if not ignore_guards:
         df_for_csv = filter_incomplete_ratios(df_for_csv, read_label, mode=group_mode)
 
-    dfs_rw_all = _build_plot_curves(df_for_csv, read_label,
-                                    apply_smoothing=apply_smoothing,
-                                    apply_completion_filter=not ignore_guards)
-    if not dfs_rw_all:
+    dfs_rw = _build_plot_curves(df_for_csv, read_label,
+                                apply_smoothing=apply_smoothing,
+                                apply_completion_filter=not ignore_guards)
+    if not dfs_rw:
         return None, None, None
 
-    # The CSV keeps every bucket so any run can be re-plotted later; the
-    # plotted set hides write-dominant ratios (below 50:50, affected by
-    # write-allocate evasion) unless --dots is given.
-    df_curves_all = _build_curves_table(dfs_rw_all, read_label)
+    # The CSV keeps every bucket so any run can be re-plotted later.
+    df_curves_all = _build_curves_table(dfs_rw, read_label)
 
     smooth_ok, problematic = check_smooth_curves(df_curves_all, gap_fraction=0.4, ignore_guards=ignore_guards)
     if not smooth_ok and problematic:
@@ -714,14 +668,6 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
 
     csv_path = os.path.join(processed_dir, "memory_curves.csv")
     df_curves_all.to_csv(csv_path, index=False)
-
-    if include_low_ratios:
-        dfs_rw = dfs_rw_all
-    else:
-        dfs_rw = {rw: df for rw, df in dfs_rw_all.items()}
-        if not dfs_rw:
-            print(f"\nWarning: no read-dominant (>= 50:50) curves in {measuring_dir}; nothing plotted (try --dots)")
-            return None, None, None
 
     legend_rw_min = 0 if group_mode == "perkernel" or include_low_ratios else None
 
@@ -745,7 +691,8 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
     )
 
     json_path = os.path.join(processed_dir, "memory_curves.json")
-    curves_to_json_compact(dfs_rw, json_path)
+    power_data = None
+    curves_to_json_compact(dfs_rw, json_path, power_data=power_data)
 
     # Drop legend files from previous runs (rewritten below).
     stale_patterns = ("*.legends.*",)
@@ -757,7 +704,8 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
                 pass
 
     rw_min = legend_rw_min if legend_rw_min is not None else (0 if any(float(rw) < 50 for rw in dfs_rw) else 50)
-    save_gradient_legends_figure(os.path.join(processed_dir, "curves"), [(None, cmap_name)], rw_min)
+    save_gradient_legends_figure(os.path.join(processed_dir, "curves"), [(None, cmap_name)], rw_min,
+                                 )
 
 
     summary = _build_summary(df_for_csv)
@@ -765,6 +713,10 @@ def process_directory(measuring_dir, step, group_mode, cmap_name="Blues",
     if score is not None:
         summary["mess_score"] = score["overall_score"]
     return dfs_rw, config, summary
+
+
+
+
 
 
 def main():
@@ -802,6 +754,7 @@ def main():
     )
 
     args = parser.parse_args()
+    json_power = False
     configure_plot_style()
 
     directories = [os.path.abspath(directory) for directory in args.directories]
@@ -833,6 +786,7 @@ def main():
             apply_smoothing=apply_smoothing,
             include_low_ratios=include_low_ratios,
             draw_dots=draw_dots,
+            json_power=json_power,
         )
         if not dfs_rw:
             continue
@@ -869,7 +823,7 @@ def main():
             dfs_rw,
             os.path.join(measuring_dir, "processed"),
             measuring_dir,
-            limit_lat_override=overlay_limit,
+            overlay_limit,
             draw_dots=draw_dots,
             draw_lines=draw_lines,
             legend_rw_min=legend_rw_min,

@@ -338,17 +338,27 @@ bool build_traffic_gen_windows(const std::filesystem::path& tg_dir,
 }
 #endif // _WIN32
 
-double parse_trafficgen_self_bandwidth(const std::string& output) {
+double parse_trafficgen_self_bandwidth(const std::string& output, uint64_t expected_reports) {
     const std::string key = "MESS_TGEN_SELF_BW_GBPS=";
-    const size_t pos = output.find(key);
-    if (pos == std::string::npos) {
-        return 0.0;
+    double total = 0.0;
+    uint64_t reports = 0;
+    for (size_t pos = output.find(key); pos != std::string::npos; pos = output.find(key, pos)) {
+        pos += key.size();
+        char* end = nullptr;
+        const double value = std::strtod(output.c_str() + pos, &end);
+        if (end == output.c_str() + pos || value <= 0.0) {
+            return 0.0;
+        }
+        total += value;
+        ++reports;
     }
-    const size_t begin = pos + key.size();
-    char* end = nullptr;
-    const double value = std::strtod(output.c_str() + begin, &end);
-    return (end != output.c_str() + begin && value > 0.0) ? value : 0.0;
+    return reports == expected_reports ? total : 0.0;
 }
+
+struct TrafficGenProbePlan {
+    uint64_t workers = 1;
+    bool stop_when_settled = false;
+};
 
 uint64_t calibrate_trafficgen_array_elements(
     const std::filesystem::path& root,
@@ -356,6 +366,7 @@ uint64_t calibrate_trafficgen_array_elements(
     const std::vector<uint64_t>& candidates,
     uint64_t llc_size_bytes,
     const CPUCapabilities& caps,
+    const TrafficGenProbePlan& plan,
     int verbosity) {
     TrafficGenArrayCalibrator calibrator(verbosity);
     auto elements_to_mb = [](uint64_t elements) -> uint64_t {
@@ -397,6 +408,7 @@ uint64_t calibrate_trafficgen_array_elements(
         const platform::RunResult probe_result = platform::run(binary.string(), probe_args, probe_opts);
         output    = probe_result.output;
         exit_code = probe_result.exit_status;
+        const uint64_t reporting_workers = 1;
 #else
         static const std::string timeout_cmd = detect_timeout_command();
         std::string command;
@@ -405,12 +417,21 @@ uint64_t calibrate_trafficgen_array_elements(
         } else {
             command = shell_quote(binary.string());
         }
-        command += " -r 100 -p 0 -w 1 -a " + std::to_string(elements) +
-                   extra_args + " -B " + std::to_string(probe_seconds) + " -v 0 2>&1";
+        command = "OMP_NUM_THREADS=1 " + command +
+                  " -r 100 -p 0 -w " + std::to_string(plan.workers) + " -a " + std::to_string(elements) +
+                  extra_args + " -B " + std::to_string(probe_seconds) + " -v 0 2>&1";
+        if (plan.workers > 1) {
+            std::string concurrent;
+            for (uint64_t worker = 0; worker < plan.workers; ++worker) {
+                concurrent += command + " & ";
+            }
+            command = concurrent + "wait";
+        }
 
-        output = run_command_capture("OMP_NUM_THREADS=1 " + command, exit_code);
+        output = run_command_capture(command, exit_code);
+        const uint64_t reporting_workers = plan.workers;
 #endif
-        const double bw = (exit_code == 0) ? parse_trafficgen_self_bandwidth(output) : 0.0;
+        const double bw = (exit_code == 0) ? parse_trafficgen_self_bandwidth(output, reporting_workers) : 0.0;
 
         TrafficGenArrayProbeResult result;
         result.elements = elements;
@@ -1063,6 +1084,7 @@ int main(int argc, char* argv[]) {
             sizing_config.isa_mode = resolve_effective_isa_mode(config, capabilities, *architecture);
             uint64_t min_traffic_gen_size =
                 TrafficGenArrayCalibrator::capacity_elements(sizing_config, capabilities);
+            TrafficGenProbePlan probe_plan;
 
             std::cout << "│ Compiling " << target_name << " (max array: "
                       << (min_traffic_gen_size * sizeof(double) / (1000*1000))
@@ -1129,11 +1151,15 @@ int main(int argc, char* argv[]) {
                     candidates.push_back(TrafficGenArrayCalibrator::fallback_elements(sizing_config, capabilities));
                 }
 
-                std::cout << "│ Calibrating " << target_name << " array size..." << std::endl;
+                std::cout << "│ Calibrating " << target_name << " array size";
+                if (probe_plan.workers > 1) {
+                    std::cout << " (" << probe_plan.workers << " concurrent workers)";
+                }
+                std::cout << "..." << std::endl;
                 uint64_t calibrated_traffic_gen_size =
                     calibrate_trafficgen_array_elements(generation_root, target_name, candidates,
                                                         static_cast<uint64_t>(capabilities.l3_size),
-                                                        capabilities,
+                                                        capabilities, probe_plan,
                                                         debug_mode ? 2 : 1);
                 if (calibrated_traffic_gen_size == 0) {
                     calibrated_traffic_gen_size =

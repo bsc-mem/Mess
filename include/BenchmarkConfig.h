@@ -145,6 +145,7 @@ struct BenchmarkConfig {
     bool profile_output = true;
     bool dry_run = false;
     bool run_gpu = false;
+    KernelConfigMultiSeq gpu_multiseq;
     bool generate_multiseq = true;
     bool instruction_sampling = false;
     bool persistent_traffic_gen = false;
@@ -153,7 +154,7 @@ struct BenchmarkConfig {
 
     int traffic_gen_cores = 0;
     std::vector<std::string> traffic_gen_explicit_cores;
-    mutable uint64_t traffic_gen_array_elements = 0;
+    uint64_t traffic_gen_array_elements = 0;
     std::string output_root = "measuring";
 
     std::vector<std::string> add_counters;

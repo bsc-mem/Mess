@@ -35,6 +35,13 @@
 import math
 
 
+def config_number(config, key, default, cast=float):
+    try:
+        return cast(config.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
 def read_cpu_frequency_ghz(config):
     """Read a saved cycles-to-nanoseconds conversion; never invent a frequency."""
     try:
@@ -71,17 +78,10 @@ def resolve_pointer_chase_timing(cycles, wall_seconds, config):
 
 
 def _legacy_cpu_frequency_ghz(cycles, seconds_user, config):
-
-    def _as_float(key, default=0.0):
-        try:
-            return float(config.get(key, default))
-        except (ValueError, TypeError):
-            return default
-
     measured = (cycles / seconds_user) / 1e9 if seconds_user > 0 else 0.0
-    base_ghz = _as_float('CPU_BASE_FREQ', 0.0)
-    max_ghz = _as_float('CPU_MAX_FREQ', 0.0)
-    cfg_ghz = _as_float('CPU_FREQ', 0.0)
+    base_ghz = config_number(config, 'CPU_BASE_FREQ', 0.0)
+    max_ghz = config_number(config, 'CPU_MAX_FREQ', 0.0)
+    cfg_ghz = config_number(config, 'CPU_FREQ', 0.0)
     if base_ghz <= 0.0:
         base_ghz = cfg_ghz
     if max_ghz <= 0.0:

@@ -51,9 +51,10 @@ GpuWorker::GpuWorker(std::string executable, std::vector<std::string> args, std:
     : executable_(std::move(executable)), args_(std::move(args)), working_dir_(std::move(working_dir)),
       log_(log_path, std::ios::app) {}
 
-bool GpuWorker::sample(const std::string& mode, int ratio_pct, int pause, std::string& line, std::string& error) {
+bool GpuWorker::sample(const std::string& mode, int ratio_pct, int pause, std::string& line, std::string& error
+    ) {
     if (!process_ && !start(error)) return false;
-    const std::string request = mode + " " + std::to_string(ratio_pct) + " " + std::to_string(pause);
+    std::string request = mode + " " + std::to_string(ratio_pct) + " " + std::to_string(pause);
     log_ << "> " << request << '\n';
     if (!process_->write_line(request)) {
         error = "GPU worker stopped accepting requests";

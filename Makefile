@@ -116,11 +116,9 @@ BUILD_OPTFLAGS = -g -O0
 endif
 
 CXXFLAGS = $(CXXSTD) -Wall -Wextra -Wunused $(BUILD_OPTFLAGS) -pthread -I. -I./include -I./src -I./src/libraries -I./include/arch
-CFLAGS = $(OPTFLAGS) -I. -I./include -I./src -I./src/libraries -I./include/arch
 LDFLAGS = -pthread -lm
 LDFLAGS += $(shell [ $(GCC_VERSION) -lt 9 ] 2>/dev/null && echo "-lstdc++fs" || true)
 
-UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     CXXFLAGS += -fblocks
     LDFLAGS += -framework CoreFoundation -framework IOKit
@@ -141,8 +139,15 @@ PLATFORM_SRCS = src/platform/posix/Process.cpp \
                 src/platform/posix/Sys.cpp \
                 src/platform/posix/Console.cpp
 
-PERF_COUNTER_SRCS = src/measurement/bw_measurers/PerfBandwidthMeasurer.cpp \
-                    src/measurement/PerfStatCsv.cpp
+MEASURER_SRCS = src/measurement/BandwidthMeasurerFactory.cpp \
+                src/measurement/bw_measurers/PerfBandwidthMeasurer.cpp \
+                src/measurement/PerfStatCsv.cpp \
+                src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp \
+                src/measurement/bw_measurers/VtuneBandwidthMeasurer.cpp \
+                src/measurement/VtuneCounterParser.cpp \
+                src/measurement/VtuneCollection.cpp \
+                src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp \
+                src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp
 
 SRCS = Mess.cpp \
        src/SystemDetection.cpp \
@@ -151,19 +156,13 @@ SRCS = Mess.cpp \
        src/KernelGenerator.cpp \
        src/measurement/MeasurementStorage.cpp \
        src/measurement/TrafficGenArrayCalibrator.cpp \
+       src/measurement/CasSizeCalibrator.cpp \
        src/measurement/LatencyMeasurer.cpp \
        src/measurement/BurstCompletion.cpp \
        src/measurement/OutlierDetector.cpp \
        src/measurement/MeasurementUtils.cpp \
        src/measurement/ResultFormatter.cpp \
-       src/measurement/BandwidthMeasurerFactory.cpp \
-       $(PERF_COUNTER_SRCS) \
-       src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp \
-       src/measurement/bw_measurers/VtuneBandwidthMeasurer.cpp \
-       src/measurement/VtuneCounterParser.cpp \
-       src/measurement/VtuneCollection.cpp \
-       src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp \
-       src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp \
+       $(MEASURER_SRCS) \
        src/process/TrafficGenProcessManager.cpp \
        src/process/PtrchaseProcessManager.cpp \
        src/utils/ProgressTracker.cpp \
@@ -219,14 +218,8 @@ ARCH_SRCS = src/arch/ArchitectureRegistry.cpp \
 PROFILER_SRCS = src/SystemDetection.cpp \
                      src/BenchmarkConfig.cpp \
                      src/measurement/MeasurementUtils.cpp \
-                     src/measurement/BandwidthMeasurerFactory.cpp \
-                     $(PERF_COUNTER_SRCS) \
-                     src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp \
-                     src/measurement/bw_measurers/VtuneBandwidthMeasurer.cpp \
-                     src/measurement/VtuneCounterParser.cpp \
-                     src/measurement/VtuneCollection.cpp \
-                     src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp \
-                     src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp \
+                     src/measurement/CasSizeCalibrator.cpp \
+                     $(MEASURER_SRCS) \
                      src/measurement/MeasurementStorage.cpp \
                      src/process/TrafficGenProcessManager.cpp \
                      src/profiler/ProcessBinding.cpp \
@@ -264,7 +257,9 @@ $(OBJ_DIR)/%.o: %.cpp Makefile
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-$(OBJ_DIR)/src/measurement/CpuFrequencyProbe.o $(OBJ_DIR)/src/measurement/PointerChaseTiming.o $(OBJ_DIR)/src/gpu/GpuMeasurement.o: CXXFLAGS += -fno-fast-math
+-include $(ALL_OBJS:.o=.d)
+
+$(OBJ_DIR)/src/CliParser.o $(OBJ_DIR)/src/measurement/CpuFrequencyProbe.o $(OBJ_DIR)/src/measurement/PointerChaseTiming.o $(OBJ_DIR)/src/measurement/UprofParser.o $(OBJ_DIR)/src/measurement/bw_measurers/PcmBandwidthMeasurer.o $(OBJ_DIR)/src/gpu/GpuMeasurement.o: CXXFLAGS += -fno-fast-math
 
 $(BIN_DIR)/mess: $(MESS_OBJS) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
@@ -295,5 +290,6 @@ clean:
 
 distclean: clean
 	rm -f *.log *.csv *.json
+
 
 endif

@@ -71,6 +71,7 @@
 #include "Utils.h"
 #include "PtrchasePerfHelper.h"
 #include "measurement/InstructionSamplerFactory.h"
+#include "measurement/CasSizeCalibrator.h"
 #if defined(_WIN32)
 #include "measurement/bw_measurers/WindowsImcBandwidthMeasurer.h"
 #include "measurement/bw_measurers/AMDuProfBandwidthMeasurer.h"
@@ -276,14 +277,6 @@ uint64_t read_generated_trafficgen_array_elements() {
 }
 
 #ifdef __linux__
-bool is_numeric_pid_dirname(const std::string& name) {
-    if (name.empty()) return false;
-    for (unsigned char c : name) {
-        if (!std::isdigit(c)) return false;
-    }
-    return true;
-}
-
 bool pid_owned_by_current_user(const std::filesystem::path& proc_dir) {
     std::ifstream status_file(proc_dir / "status");
     if (!status_file.is_open()) return false;
@@ -323,7 +316,7 @@ void signal_processes_by_name(const std::vector<std::string>& names, platform::S
         if (!entry.is_directory(ec)) continue;
 
         const std::string pid_name = entry.path().filename().string();
-        if (!is_numeric_pid_dirname(pid_name)) continue;
+        if (!string_utils::is_digits(pid_name)) continue;
         if (!pid_owned_by_current_user(entry.path())) continue;
         if (!process_comm_matches(entry.path(), names)) continue;
 
@@ -387,12 +380,17 @@ bool parse_first_traffic_gen_core(const BenchmarkConfig& config, int& core) {
 }
 
 int resolve_traffic_gen_cores(const BenchmarkConfig& config, const system_info& info) {
-    int cores = config.traffic_gen_cores;
-    if (cores <= 0) {
-        cores = get_default_traffic_gen_cores(info);
-    }
-    return std::max(cores, 1);
+    return get_traffic_gen_worker_count(config, info);
 }
+
+std::vector<int> resolve_traffic_gen_cpus(const BenchmarkConfig& config, const system_info& info) {
+    std::vector<std::string> cores;
+    if (!resolve_traffic_gen_core_list(resolve_traffic_gen_cores(config, info), config.traffic_gen_explicit_cores, cores)) return {};
+    std::vector<int> cpus;
+    for (const auto& core : cores) cpus.push_back(std::stoi(core));
+    return cpus;
+}
+
 
 }
 
@@ -423,6 +421,7 @@ void signal_handler(int signal) {
         raise(signal);
     }
 }
+
 
 void print_enhanced_header(const SystemDetector& detector) {
     std::cout << "\n";
@@ -605,6 +604,10 @@ int main(int argc, char **argv) {
 
         std::cout << status_prefix << "\033[33mWaiting for counter discovery...\033[0m" << std::string(5, ' ') << "\r" << std::flush;
         counter_discovery_future.get();
+        if (bw_strategy.get_selection().fatal_discovery_failure) {
+            std::cerr << "Error: " << bw_strategy.get_selection().failure_reason << std::endl;
+            return EXIT_FAILURE;
+        }
         cache_future.get();
 
         if (has_explicit_src_cpu) {
@@ -616,6 +619,12 @@ int main(int argc, char **argv) {
             } else {
                 cache.ptr_chase_node = get_numa_node_of_cpu(src_cpu);
             }
+        }
+
+        CasSizeCalibration cas_size_calibration;
+        if (perf_accessible && !config->run_gpu && bw_strategy.needs_cas_size_calibration()) {
+            std::cout << status_prefix << "\033[33mMeasuring HBM bytes per CAS...\033[0m" << std::string(5, ' ') << "\r" << std::flush;
+            cas_size_calibration = calibrate_strategy_cas_size(bw_strategy, resolve_traffic_gen_cpus(*config, detector.get_system_info()), target_nodes);
         }
 
         const std::string sampler_diagnostic = config->instruction_sampling
@@ -667,6 +676,11 @@ int main(int argc, char **argv) {
                 std::cerr << "Benchmark cannot run on this system. Please check the configuration and try again.\n" << std::endl;
                 return EXIT_FAILURE;
             }
+        }
+
+        if (cas_size_calibration.attempted) {
+            (cas_size_calibration.ok() ? std::cout : std::cerr)
+                << describe_cas_size_calibration(cas_size_calibration, bw_strategy.get_selection().cas.bytes_per_cas) << std::endl;
         }
 
         uint64_t tlb1_raw = 0, tlb2_raw = 0;
@@ -783,13 +797,20 @@ int main(int argc, char **argv) {
         std::vector<double> iteration_times;
 
         {
+            platform::SleepInhibitor sleep_inhibitor;
             BenchmarkExecutor executor(*config, detector.get_system_info(), capabilities,
                                      tlb_measurement.latency_ns, tlb_measurement.cache_line_size);
             g_executor = &executor;
 
             terminal::CursorGuard cursor_guard;
 
-            if (!executor.run()) {
+            const bool run_ok = executor.run();
+            const bool shutdown_ok = executor.shutdown_measurement_backends();
+            if (!shutdown_ok) {
+                std::cerr << "Bandwidth backend shutdown failed" << std::endl;
+                return EXIT_FAILURE;
+            }
+            if (!run_ok) {
                 g_executor = nullptr;
                 std::cerr << "\n\nBenchmark execution failed" << std::endl;
                 return EXIT_FAILURE;

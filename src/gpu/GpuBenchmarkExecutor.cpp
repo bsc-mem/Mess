@@ -35,6 +35,7 @@
  */
 
 #include "gpu/GpuBenchmarkExecutor.h"
+#include "ExecutionModes.h"
 #include "Utils.h"
 #include "gpu/GpuKernelGenerator.h"
 #include "gpu/GpuMeasurement.h"
@@ -66,18 +67,7 @@ static const uint64_t WORKLOAD_GENERATOR_ITER_SIZE = 400;
 static const int PTX_UNROLL_OPS = 400;
 
 namespace {
-const char* worker_mode(ExecutionMode mode) {
-    (void)mode;
-    return "multiseq";
-}
-
-const char* mode_directory(ExecutionMode mode) {
-    (void)mode;
-    return "multisequential";
-}
-
-const char* mode_label(ExecutionMode mode) {
-    (void)mode;
+const char* mode_label([[maybe_unused]] ExecutionMode mode) {
     return "MULTISEQ";
 }
 }
@@ -135,8 +125,7 @@ bool GpuBenchmarkExecutor::check_environment() {
 
 GpuBenchmarkExecutor::GpuBenchmarkExecutor(const BenchmarkConfig& config, const system_info&, const CPUCapabilities& caps, const GPUCapabilities& gpu_caps)
     : config_(config), caps_(caps), gpu_caps_(gpu_caps),
-      progress_tracker_(std::make_unique<ProgressTracker>(0)) {
-    modes_.push_back(ExecutionMode::MULTISEQUENTIAL);
+      modes_(enabled_modes(config)), progress_tracker_(std::make_unique<ProgressTracker>(0)) {
     for (ExecutionMode mode : modes_)
         storage_[mode] = std::make_unique<MeasurementStorage>(config, 128, config.verbosity, config.output_root + "/gpu/" + mode_directory(mode));
 }
@@ -201,13 +190,12 @@ bool GpuBenchmarkExecutor::build_worker(const std::vector<int>& ratios, const st
         return static_cast<bool>(file);
     };
     if (!write("loopGPU.h", GpuKernelGenerator::generate_pointer_chase()) ||
-        !write("workloads.cuh", GpuKernelGenerator::generate_workload_table(PTX_UNROLL_OPS, ratios, modes_)))
+        !write("workloads.cuh", GpuKernelGenerator::generate_workload_table(PTX_UNROLL_OPS, ratios, modes_, config_.gpu_multiseq)))
         return false;
     for (ExecutionMode mode : modes_) {
         for (int ratio : ratios) {
-            if (mode == ExecutionMode::MULTISEQUENTIAL &&
-                !write(GpuKernelGenerator::workload_file(ratio), GpuKernelGenerator::generate_workload(PTX_UNROLL_OPS, ratio)))
-                return false;
+            const auto [file, source] = GpuKernelGenerator::mode_workload(mode, PTX_UNROLL_OPS, ratio, config_);
+            if (!write(file, source)) return false;
         }
     }
 
@@ -226,7 +214,8 @@ bool GpuBenchmarkExecutor::build_worker(const std::vector<int>& ratios, const st
 
 bool GpuBenchmarkExecutor::measure_sample(ExecutionMode mode, int ratio_pct, int pause, BenchmarkResult& result) {
     std::string line, error;
-    if (!worker_->sample(worker_mode(mode), ratio_pct, pause, line, error) || !gpu::parse_sample(line, metrics_, result, error)) {
+    if (!worker_->sample(GpuKernelGenerator::mode_name(mode), ratio_pct, pause, line, error
+                         ) || !gpu::parse_sample(line, metrics_, result, error)) {
         std::cerr << "\nGPU measurement failed: " << error << '\n';
         return false;
     }
@@ -270,7 +259,7 @@ measurement::MeasuredPoint GpuBenchmarkExecutor::adaptive_probe(ExecutionMode mo
 
     if (replace_existing) {
         results_.erase(std::remove_if(results_.begin(), results_.end(), [&](const BenchmarkResult& value) {
-            return value.mode == mode && value.ratio_pct == ratio_pct && value.pause == pause;
+            return same_point(value, ratio_pct, pause, mode);
         }), results_.end());
     }
     storage.cleanup_measurement_files(ratio_pct, pause);
@@ -329,18 +318,6 @@ bool GpuBenchmarkExecutor::run() try {
       for (int ratio = 100; ratio >= 0; ratio -= 2) ratios.push_back(ratio);
 
   const bool adaptive_mode = config_.pauses.empty();
-  int total_measurements = 0;
-  if (!adaptive_mode) {
-      total_measurements = ratios.size() * config_.pauses.size() * config_.point_reps * modes_.size();
-  } else {
-      const auto tier = CurveTracer::resolve_tier(config_.adaptive_tier, config_.adaptive_point_count);
-      total_measurements = ratios.size() * tier.max_budget * config_.point_reps * modes_.size();
-  }
-  progress_tracker_->start_benchmark(total_measurements);
-  if (adaptive_mode) {
-      const auto tier = CurveTracer::resolve_tier(config_.adaptive_tier, config_.adaptive_point_count);
-      progress_tracker_->set_adaptive_info(ratios.size() * modes_.size(), config_.point_reps, tier.max_budget, modes_.size());
-  }
 
   struct TemporaryDirectory {
       std::filesystem::path path;
@@ -386,25 +363,52 @@ bool GpuBenchmarkExecutor::run() try {
   GPUCapabilities measured_gpu = gpu_caps_;
   if (measured_gpu.gpus.empty()) measured_gpu.gpus.emplace_back();
   if (gpu::parse_memory(worker_->ready(), measured_gpu.gpus.front())) measured_gpu.has_gpu = true;
-  for (const auto& [mode, storage] : storage_) storage->write_plotter_file(caps_, "local", 0.0, 128, -1.0, -1.0, &measured_gpu);
+  int traffic_sms = -1;
+  std::istringstream ready_fields(worker_->ready());
+  for (std::string field; ready_fields >> field;) {
+      if (field.rfind("sms=", 0) == 0) traffic_sms = std::stoi(field.substr(4)) - 1;
+  }
+  if (traffic_sms < 1) {
+      std::cerr << "GPU measurements require at least two SMs.\n";
+      return false;
+  }
+
+  std::vector<int> splits{-1};
+
+  const auto tier = CurveTracer::resolve_tier(config_.adaptive_tier, config_.adaptive_point_count);
+  int total_measurements = ratios.size() * (adaptive_mode ? tier.max_budget : config_.pauses.size())
+                         * config_.point_reps * modes_.size() * splits.size();
+  progress_tracker_->start_benchmark(total_measurements);
+  if (adaptive_mode) {
+      progress_tracker_->set_adaptive_info(ratios.size() * modes_.size() * splits.size(), config_.point_reps,
+                                           tier.max_budget, modes_.size());
+  }
 
   int current_ratio = 0;
-  for (int ratio_pct : ratios) {
-    current_ratio++;
-    progress_tracker_->set_current_ratio(ratio_pct, current_ratio, ratios.size());
-    if (config_.verbosity >= 2) {
-      std::cout << "\n\n=== GPU " << ratio_pct << "% loads (" << current_ratio
-                << "/" << ratios.size() << " load ratios) ===" << std::endl;
-    }
-    if (adaptive_mode) {
-        if (!run_adaptive_for_ratio(ratio_pct, total_measurements)) return false;
-    } else {
-        for (int pause : config_.pauses) {
-            for (ExecutionMode mode : modes_) {
-                if (adaptive_probe(mode, ratio_pct, pause, total_measurements, 0.0).stats.n_reps == 0)
-                    return false;
-            }
-        }
+  for ([[maybe_unused]] int split : splits) {
+      for (const auto& [mode, storage] : storage_) {
+          storage->ensure_directories_exist();
+          storage->write_plotter_file(caps_, "local", 0.0, 128, traffic_sms,
+              -1.0, -1.0, &measured_gpu);
+      }
+
+    for (int ratio_pct : ratios) {
+      current_ratio++;
+      progress_tracker_->set_current_ratio(ratio_pct, current_ratio, ratios.size() * splits.size());
+      if (config_.verbosity >= 2) {
+        std::cout << "\n\n=== GPU " << ratio_pct << "% loads (" << current_ratio
+                  << "/" << ratios.size() * splits.size() << " load ratios) ===" << std::endl;
+      }
+      if (adaptive_mode) {
+          if (!run_adaptive_for_ratio(ratio_pct, total_measurements)) return false;
+      } else {
+          for (int pause : config_.pauses) {
+              for (ExecutionMode mode : modes_) {
+                  if (adaptive_probe(mode, ratio_pct, pause, total_measurements, 0.0).stats.n_reps == 0)
+                      return false;
+              }
+          }
+      }
     }
   }
   worker_.reset();

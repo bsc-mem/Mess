@@ -37,6 +37,10 @@
 
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#endif
+
 namespace platform {
 
 int online_cpu_count() {
@@ -63,5 +67,23 @@ bool large_pages_available() {
 bool cpu_is_amd() {
     return false;
 }
+
+#ifdef __APPLE__
+SleepInhibitor::SleepInhibitor() {
+    IOPMAssertionID id = kIOPMNullAssertionID;
+    if (IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+                                    CFSTR("Mess benchmark run"), &id) == kIOReturnSuccess) {
+        assertion_ = id;
+    }
+}
+
+SleepInhibitor::~SleepInhibitor() {
+    if (assertion_ != kIOPMNullAssertionID) IOPMAssertionRelease(assertion_);
+}
+#else
+SleepInhibitor::SleepInhibitor() {}
+
+SleepInhibitor::~SleepInhibitor() {}
+#endif
 
 }

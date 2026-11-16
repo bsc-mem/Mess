@@ -35,6 +35,7 @@
  */
 
 #include "gpu/GpuKernelGenerator.h"
+#include "BenchmarkConfig.h"
 #include <vector>
 #include <algorithm>
 #include <random>
@@ -42,6 +43,77 @@
 
 namespace {
 constexpr int kPausePollThreshold = 256;
+constexpr int kOpsPerPauseBlock = 10;
+
+struct MultiSeqLayout {
+    int loadSlotBytes;
+    int loadBytes;
+    int storeSlotBytes;
+    int storeBytes;
+};
+
+MultiSeqLayout multiSeqLayout(const KernelConfigMultiSeq& config) {
+    if (config.granularity == GpuAccessGranularity::LINE) return {4, 4, 4, 4};
+    return {128, 8, 32, config.full_sector_stores ? 32 : 8};
+}
+
+std::string sinkDeclarations() {
+    const std::string count = std::to_string(kOpsPerPauseBlock);
+    return "        \".reg .u64 sink<" + count + ">;\"\n"
+           "        \".reg .u32 sinkWord<" + count + ">;\"\n";
+}
+
+// Independent loads get their own register and are consumed only at the next pause block;
+// warps issue in order, so consuming a load right away would stall the following ones.
+class LoadSinks {
+public:
+    explicit LoadSinks(bool wide) : wide_(wide) {}
+
+    std::string load(const std::string& address) {
+        const std::string index = std::to_string(pending_.size());
+        pending_.push_back(index);
+        return wide_ ? "                \"ld.global.cv.u64 sink" + index + ", [" + address + "];\"\n"
+                     : "                \"ld.global.cv.u32 sinkWord" + index + ", [" + address + "];\"\n";
+    }
+
+    std::string consume() {
+        std::string code;
+        for (const std::string& index : pending_) {
+            if (!wide_) code += "                \"cvt.u64.u32 sink" + index + ", sinkWord" + index + ";\"\n";
+            code += "                \"add.u64 loadedElem, loadedElem, sink" + index + ";\"\n";
+        }
+        pending_.clear();
+        return code;
+    }
+
+private:
+    bool wide_;
+    std::vector<std::string> pending_;
+};
+
+struct ModeSymbols {
+    const char* name;
+    const char* prefix;
+};
+
+ModeSymbols mode_symbols([[maybe_unused]] ExecutionMode mode) {
+    return {"multiseq", "ratio_"};
+}
+
+std::string launcher(const std::string& name, const std::string& kernel) {
+    return "\nvoid launch_" + name + "(const MessArgs& args, int blocks, int threads) {\n"
+           "    " + kernel + "<<<blocks, threads>>>(args);\n}\n\n"
+           "int blocks_" + name + "(int threads) {\n"
+           "    return resident_blocks(" + kernel + ", threads);\n}\n";
+}
+
+std::string storeCode(int bytes, const std::string& address, const std::string& value, const std::string& valueReg) {
+    if (bytes == 4) return "                \"st.global.wt.u32 [" + address + "], " + value + ";\"\n";
+    if (bytes == 8) return "                \"st.global.wt.u64 [" + address + "], " + value + ";\"\n";
+    const std::string pair = "{" + valueReg + ", " + valueReg + "}";
+    return "                \"st.global.wt.v2.u64 [" + address + "], " + pair + ";\"\n"
+           "                \"st.global.wt.v2.u64 [" + address + "+16], " + pair + ";\"\n";
+}
 }
 
 std::string GpuKernelGenerator::generate_pointer_chase() {
@@ -56,49 +128,51 @@ std::string GpuKernelGenerator::generate_pointer_chase() {
     return result;
 }
 
-std::string GpuKernelGenerator::workload_file(int ratio_pct) {
-    return "workload_" + std::to_string(ratio_pct) + ".cu";
+const char* GpuKernelGenerator::mode_name(ExecutionMode mode) {
+    return mode_symbols(mode).name;
 }
 
-std::string GpuKernelGenerator::generate_workload(int minTotalOps, int ratio_pct) {
-    int totalOps = 0;
-    int targetLoads = 0;
-    int targetStores = 0;
-    computeLoadStoreOps(minTotalOps, ratio_pct, totalOps, targetLoads, targetStores);
+std::pair<std::string, std::string> GpuKernelGenerator::mode_workload([[maybe_unused]] ExecutionMode mode, int minTotalOps, int ratio_pct, const BenchmarkConfig& config) {
+    const std::string suffix = std::to_string(ratio_pct) + ".cu";
+    return {"workload_" + suffix, generate_workload(minTotalOps, ratio_pct, config.gpu_multiseq)};
+}
 
+std::string GpuKernelGenerator::generate_multiseq_body(int minTotalOps, int ratio_pct, const KernelConfigMultiSeq& config) {
+    int totalOps = 0, loads = 0, stores = 0;
+    computeLoadStoreOps(minTotalOps, ratio_pct, totalOps, loads, stores);
+    return "struct WorkloadRatio" + std::to_string(ratio_pct) + " {\n" + genFunctInit() +
+        loadStoreOpsGen(totalOps, loads, stores, config) + genFunctEnd(loads, stores, config) + "\n};\n";
+}
+
+std::string GpuKernelGenerator::generate_workload(int minTotalOps, int ratio_pct, const KernelConfigMultiSeq& config) {
     const std::string ratio = std::to_string(ratio_pct);
-    const std::string workload = "WorkloadRatio" + ratio;
-    std::string result = "#include \"kernels.cuh\"\n\nstruct " + workload + " {\n";
-    result += genFunctInit();
-    result += loadStoreOpsGen(totalOps, targetLoads, targetStores);
-    result += genFunctEnd(totalOps, targetLoads, targetStores);
-    result += "\n};\n\nvoid launch_ratio_" + ratio + "(const MessArgs& args, int blocks, int threads) {\n"
-              "    mess<" + workload + "><<<blocks, threads>>>(args);\n}\n\n"
-              "int blocks_ratio_" + ratio + "(int threads) {\n"
-              "    return resident_blocks(mess<" + workload + ">, threads);\n}\n";
-    return result;
+    return "#include \"kernels.cuh\"\n\n" + generate_multiseq_body(minTotalOps, ratio_pct, config) +
+        launcher("ratio_" + ratio, "mess<WorkloadRatio" + ratio + ">");
 }
 
-std::string GpuKernelGenerator::generate_workload_table(int minTotalOps, const std::vector<int>& ratios_pct, const std::vector<ExecutionMode>& modes) {
+std::string GpuKernelGenerator::generate_workload_table(int minTotalOps, const std::vector<int>& ratios_pct, const std::vector<ExecutionMode>& modes,
+                                                        const KernelConfigMultiSeq& config) {
     std::string declarations;
     std::string entries;
-    auto add = [&](const std::string& mode, const std::string& suffix, int ratio_pct) {
-        int totalOps = 0;
-        int loads = 0;
-        int stores = 0;
-        computeLoadStoreOps(minTotalOps, ratio_pct, totalOps, loads, stores);
-        const std::string ratio = std::to_string(ratio_pct);
-        declarations += "void launch_" + suffix + ratio + "(const MessArgs& args, int blocks, int threads);\n";
-        declarations += "int blocks_" + suffix + ratio + "(int threads);\n";
-        entries += "    {\"" + mode + "\", " + ratio + ", " + std::to_string(loads) + ", " + std::to_string(stores) +
-                   ", launch_" + suffix + ratio + ", blocks_" + suffix + ratio + "},\n";
-    };
     for (ExecutionMode mode : modes) {
+        const ModeSymbols symbols = mode_symbols(mode);
         for (int ratio_pct : ratios_pct) {
-            if (mode == ExecutionMode::MULTISEQUENTIAL) add("multiseq", "ratio_", ratio_pct);
+            int totalOps = 0;
+            int loads = 0;
+            int stores = 0;
+            computeLoadStoreOps(minTotalOps, ratio_pct, totalOps, loads, stores);
+            const std::string name = symbols.prefix + std::to_string(ratio_pct);
+            declarations += "void launch_" + name + "(const MessArgs& args, int blocks, int threads);\n";
+            declarations += "int blocks_" + name + "(int threads);\n";
+            entries += "    {\"" + std::string(symbols.name) + "\", " + std::to_string(ratio_pct) + ", " + std::to_string(loads) + ", " + std::to_string(stores) +
+                       ", launch_" + name + ", blocks_" + name + "},\n";
         }
     }
-    return "#include \"kernels.cuh\"\n\n" + declarations +
+    const MultiSeqLayout layout = multiSeqLayout(config);
+    return "#include \"kernels.cuh\"\n\n"
+           "#define MESS_LOAD_SLOT_BYTES " + std::to_string(layout.loadSlotBytes) + "\n"
+           "#define MESS_LOAD_BYTES " + std::to_string(layout.loadBytes) + "\n"
+           "#define MESS_STORE_SLOT_BYTES " + std::to_string(layout.storeSlotBytes) + "\n\n" + declarations +
            "\nconst WorkloadVariant kWorkloads[] = {\n" + entries + "};\n";
 }
 
@@ -112,60 +186,53 @@ void GpuKernelGenerator::computeLoadStoreOps(int minTotalOps, double loadPercent
 
 std::string GpuKernelGenerator::genFunctInit() {
     return R"(
-__device__ static void run(uint64_t elmSizeBytes, uint64_t threadPointer_LD, uint64_t threadPointer_ST,
-        uint64_t pauseValue, uint64_t numElmPerThreadGroupLD, uint64_t numElmPerThreadGroupST,
-        uint64_t endFlagPointer, uint64_t startFlagPointer, uint64_t sectionsLD,
-        uint64_t sectionsST, uint64_t storeStrideBytes, uint64_t firstPause, int* result){
+__device__ static void run(uint64_t threadPointer_LD, uint64_t threadPointer_ST, uint64_t pauseValue,
+        uint64_t loadStrideBytes, uint64_t storeStrideBytes, uint64_t endFlagPointer, uint64_t startFlagPointer,
+        uint64_t sectionsLD, uint64_t sectionsST, uint64_t firstPause, int* result){
 
     uint64_t loopAccum = 0;
     uint64_t loadedElem = 0;
 
     asm volatile ( "{"
 
-        ".reg .pred pausePred, linesPerSectPred, ElmPerThreadGroupSTPred, ElmPerThreadGroupLDPred, endFlagPred, startFlagPred, numberSTPred, numberLDPred;"
-        ".reg .pred pollPred, endNowPred;"
-        ".reg .u64 elmSizeBytes;"
+        ".reg .pred pausePred, laneSTPred, laneLDPred, endFlagPred, startFlagPred, numberSTPred, numberLDPred;"
+        ".reg .pred pollPred, pollNowPred, endNowPred;"
         ".reg .u64 threadPointerLD;"
         ".reg .u64 threadPointerST;"
-        ".reg .u64 loadedElem;"
-        ".reg .u64 pauseValue, nopIter, loopAccum, firstNop;"
-        ".reg .u64 numberLD, numberST;"
-        ".reg .u64 numElmPerThreadGroupLD, ElmPerThreadGroupLDIter, elemOffsetLD;"
-        ".reg .u64 numElmPerThreadGroupST, ElmPerThreadGroupSTIter, elemOffsetST;"
+        ".reg .u64 loadedElem, storeValue;"
+        ".reg .u32 loadedWord;"
+        ".reg .u64 pauseValue, nopIter, pollIter, loopAccum, firstNop;"
+        ".reg .u64 numberLD, numberST, elemOffsetLD, elemOffsetST;"
         ".reg .u64 endFlagPointer;"
         ".reg .u32 endFlagValue, endFlagTrue;"
         ".reg .u64 startFlagPointer;"
-        ".reg .u64 sectionsLD, sectionsST, storeStrideBytes, groupBytesLD, groupBytesST;"
-        "mov.u64 sectionsLD, %10;"
-        "mov.u64 sectionsST, %11;"
-        "mov.u64 storeStrideBytes, %12;"
-        "mov.u64 firstNop, %13;"
+        ".reg .u64 sectionsLD, sectionsST, loadStrideBytes, storeStrideBytes;"
+)" + sinkDeclarations() + R"(
+        "mov.u64 threadPointerLD, %2;"
+        "mov.u64 threadPointerST, %3;"
+        "mov.u64 pauseValue, %4;"
+        "mov.u64 loadStrideBytes, %5;"
+        "mov.u64 storeStrideBytes, %6;"
+        "mov.u64 endFlagPointer, %7;"
+        "mov.u64 startFlagPointer, %8;"
+        "mov.u64 sectionsLD, %9;"
+        "mov.u64 sectionsST, %10;"
+        "mov.u64 firstNop, %11;"
         "mov.u64 loopAccum, 0;"
         "mov.u64 loadedElem, 0;"
-
-        "mov.u64 elmSizeBytes, %2;"
-        "mov.u64 threadPointerLD, %3;"
-        "mov.u64 threadPointerST, %4;"
-        "mov.u64 pauseValue, %5;"
-        "mov.u64 numElmPerThreadGroupLD, %6;"
-        "mov.u64 numElmPerThreadGroupST, %7;"
-        "mov.u64 endFlagPointer, %8;"
-        "mov.u64 startFlagPointer, %9;"
-        "mul.lo.u64 groupBytesLD, numElmPerThreadGroupLD, elmSizeBytes;"
-        "mul.lo.u64 groupBytesST, numElmPerThreadGroupST, elmSizeBytes;"
+        "mov.u64 storeValue, 1024;"
 
         "mov.u32 endFlagTrue, 1;"
         "mov.u32 endFlagValue, 0;"
         "mov.pred startFlagPred, 1;"
         "mov.pred endNowPred, 0;"
+        "mov.pred pollNowPred, 0;"
         "setp.ge.u64 pollPred, pauseValue, )" + std::to_string(kPausePollThreshold) + R"(;"
 
         "mov.u64 numberLD, 0;"
         "mov.u64 elemOffsetLD, 0;"
-        "mov.u64 ElmPerThreadGroupLDIter, 0;"
         "mov.u64 numberST, 0;"
         "mov.u64 elemOffsetST, 0;"
-        "mov.u64 ElmPerThreadGroupSTIter, 0;"
 
         // Access to different elements in the cache line
         "cache_line_loop:"
@@ -180,11 +247,24 @@ std::string GpuKernelGenerator::genPauseBlock(int index) {
                 "@pollPred ld.global.cv.u32 endFlagValue, [endFlagPointer];"
                 "setp.ne.u64 pausePred, pauseValue, 0;"
                 "@pausePred mov.u64 nopIter, )" + std::string(index == 0 ? "firstNop" : "0") + R"(;"
+                "@pollPred bra poll_)" + label + R"(;"
                 ")" + label + R"(:"
                     "@pausePred add.u64 nopIter, nopIter, 1;"
                     "@pausePred setp.lt.u64 pausePred, nopIter, pauseValue;"
                     "@pausePred add.u64 loopAccum, loopAccum, nopIter;"
                     "@pausePred bra )" + label + R"(;"
+                "bra pause_done_)" + label + R"(;"
+                "poll_)" + label + R"(:"
+                    "@pausePred add.u64 nopIter, nopIter, 1;"
+                    "@pausePred setp.lt.u64 pausePred, nopIter, pauseValue;"
+                    "@pausePred add.u64 loopAccum, loopAccum, nopIter;"
+                    "and.b64 pollIter, nopIter, )" + std::to_string(kPausePollThreshold - 1) + R"(;"
+                    "setp.eq.u64 pollNowPred, pollIter, 0;"
+                    "@pollNowPred ld.global.cv.u32 endFlagValue, [endFlagPointer];"
+                    "setp.eq.u32 endNowPred, endFlagValue, endFlagTrue;"
+                    "@endNowPred bra workload_done;"
+                    "@pausePred bra poll_)" + label + R"(;"
+                "pause_done_)" + label + R"(:"
                 "@pollPred setp.eq.u32 endNowPred, endFlagValue, endFlagTrue;"
                 "@endNowPred bra workload_done;"
 
@@ -201,49 +281,60 @@ std::vector<bool> GpuKernelGenerator::operationOrder(int totalOps, int targetLoa
     return loads;
 }
 
-std::string GpuKernelGenerator::loadStoreOpsGen(int totalOps, int targetLoads, int targetStores) {
+std::string GpuKernelGenerator::loadStoreOpsGen(int totalOps, int targetLoads, int targetStores, const KernelConfigMultiSeq& config) {
     const std::vector<bool> operations = operationOrder(totalOps, targetLoads, targetStores);
+    const MultiSeqLayout layout = multiSeqLayout(config);
+    const bool wideLoads = layout.loadBytes == 8;
 
     std::string ptxCode = "";
     int pauseBlockIndex = 0;
 
-    const std::string LOAD_STR =
-        "                \"ld.global.cv.u64 loadedElem, [threadPointerLD];\"\n"
-        "                \"add.u64 threadPointerLD, threadPointerLD, loadedElem;\"\n";
+    const std::string LOAD_STR = wideLoads
+        ? "                \"ld.global.cv.u64 loadedElem, [threadPointerLD];\"\n"
+        : "                \"ld.global.cv.u32 loadedWord, [threadPointerLD];\"\n"
+          "                \"cvt.u64.u32 loadedElem, loadedWord;\"\n";
+    const std::string ADVANCE_LOAD_STR = "                \"add.u64 threadPointerLD, threadPointerLD, " +
+        std::string(config.dependent_loads ? "loadedElem" : "loadStrideBytes") + ";\"\n";
 
-    const std::string STORE_STR =
-        "                \"st.global.wt.u64 [threadPointerST], 1024;\"\n"
+    const std::string STORE_STR = storeCode(layout.storeBytes, "threadPointerST", "1024", "storeValue") +
         "                \"add.u64 threadPointerST, threadPointerST, storeStrideBytes;\"\n";
 
+    LoadSinks sinks(wideLoads);
     for (size_t i = 0; i < operations.size(); ++i) {
-        if (operations[i]) {
-            ptxCode += LOAD_STR;
-        } else {
+        if (!operations[i]) {
             ptxCode += STORE_STR;
+        } else {
+            ptxCode += (config.dependent_loads ? LOAD_STR : sinks.load("threadPointerLD")) + ADVANCE_LOAD_STR;
         }
 
-        if ((i + 1) % 10 == 0) {
+        if ((i + 1) % kOpsPerPauseBlock == 0) {
+            ptxCode += sinks.consume();
             ptxCode += genPauseBlock(pauseBlockIndex++);
             ptxCode += "\n";
         }
     }
+    ptxCode += sinks.consume();
     return ptxCode;
 }
 
-std::string GpuKernelGenerator::genFunctEnd(int, int loadOps, int storeOps) {
+std::string GpuKernelGenerator::genFunctEnd(int loadOps, int storeOps, const KernelConfigMultiSeq& config) {
+    const MultiSeqLayout layout = multiSeqLayout(config);
     std::string result;
     // Host allocations contain whole unrolled batches; change lane only on wrap.
     for (const auto& stream : {std::pair<std::string, int>{"LD", loadOps}, {"ST", storeOps}}) {
         if (stream.second == 0) continue;
         const auto& suffix = stream.first;
-        const std::string base = suffix == "LD" ? "%3" : "%4";
+        const bool load = suffix == "LD";
+        const std::string base = load ? "%2" : "%3";
+        const std::string laneBytes = std::to_string(load ? layout.loadBytes : layout.storeBytes);
+        const std::string slotBytes = std::to_string(load ? layout.loadSlotBytes : layout.storeSlotBytes);
         auto emit = [&](const std::string& instruction) { result += "        \"" + instruction + ";\"\n"; };
         emit("add.u64 number" + suffix + ", number" + suffix + ", " + std::to_string(stream.second));
         emit("setp.ge.u64 number" + suffix + "Pred, number" + suffix + ", sections" + suffix);
         emit("@number" + suffix + "Pred mov.u64 number" + suffix + ", 0");
-        emit("@number" + suffix + "Pred add.u64 elemOffset" + suffix + ", elemOffset" + suffix + ", elmSizeBytes");
-        emit("setp.ge.u64 ElmPerThreadGroup" + suffix + "Pred, elemOffset" + suffix + ", groupBytes" + suffix);
-        emit("@ElmPerThreadGroup" + suffix + "Pred mov.u64 elemOffset" + suffix + ", 0");
+        emit("@number" + suffix + "Pred add.u64 elemOffset" + suffix + ", elemOffset" + suffix + ", " + laneBytes);
+        emit("setp.ge.u64 lane" + suffix + "Pred, elemOffset" + suffix + ", " + slotBytes);
+        emit("@lane" + suffix + "Pred mov.u64 elemOffset" + suffix + ", 0");
         emit("@number" + suffix + "Pred add.u64 threadPointer" + suffix + ", " + base + ", elemOffset" + suffix);
     }
     result += R"(
@@ -258,9 +349,9 @@ std::string GpuKernelGenerator::genFunctEnd(int, int loadOps, int storeOps) {
         "mov.u64 %1, loadedElem;"
         "}"
         : "=l"(loopAccum), "=l"(loadedElem)
-        : "l"(elmSizeBytes), "l"(threadPointer_LD), "l"(threadPointer_ST), "l"(pauseValue),
-          "l"(numElmPerThreadGroupLD), "l"(numElmPerThreadGroupST), "l"(endFlagPointer),
-          "l"(startFlagPointer), "l"(sectionsLD), "l"(sectionsST), "l"(storeStrideBytes), "l"(firstPause)
+        : "l"(threadPointer_LD), "l"(threadPointer_ST), "l"(pauseValue), "l"(loadStrideBytes),
+          "l"(storeStrideBytes), "l"(endFlagPointer), "l"(startFlagPointer), "l"(sectionsLD),
+          "l"(sectionsST), "l"(firstPause)
         : "memory"
     );
     if (threadIdx.x == 0) atomicAdd(result, static_cast<int>(loopAccum + loadedElem));

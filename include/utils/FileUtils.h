@@ -37,6 +37,7 @@
 #define UTILS_FILE_UTILS_H
 
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <filesystem>
 #include <fstream>
@@ -47,7 +48,7 @@
 
 namespace file_utils {
 
-inline bool read_first_line(const std::string& path, std::string& out) {
+inline bool read_first_line(const std::filesystem::path& path, std::string& out) {
     std::ifstream f(path);
     if (!f.is_open()) return false;
     if (!std::getline(f, out)) return false;
@@ -55,6 +56,7 @@ inline bool read_first_line(const std::string& path, std::string& out) {
         out.pop_back();
     return true;
 }
+
 
 inline std::string read_token(const std::string& path) {
     std::ifstream f(path);
@@ -80,18 +82,6 @@ inline bool read_long_long_file(const std::filesystem::path& path, long long& va
     }
     file >> value;
     return file.good() || file.eof();
-}
-
-inline bool read_string_file(const std::filesystem::path& path, std::string& out) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return false;
-    }
-    std::getline(file, out);
-    while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
-        out.pop_back();
-    }
-    return true;
 }
 
 inline std::string choose_temp_dir() {

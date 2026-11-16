@@ -49,7 +49,8 @@ public:
     GpuWorker(std::string executable, std::vector<std::string> args, std::string working_dir, const std::string& log_path);
 
     bool start(std::string& error);
-    bool sample(const std::string& mode, int ratio_pct, int pause, std::string& line, std::string& error);
+    bool sample(const std::string& mode, int ratio_pct, int pause, std::string& line, std::string& error
+    );
     void stop();
     const std::string& ready() const { return ready_; }
 

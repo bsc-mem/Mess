@@ -295,18 +295,18 @@ ProcessId ProcessGroup::spawn(const std::string& program,
     }
     if (pid == 0) {
         close(errors[0]);
-        auto fail = [&]() {
-            const int error = errno;
+        auto fail = [&](int operation) {
+            const int failure[] = {errno, operation};
             ssize_t n;
-            do { n = write(errors[1], &error, sizeof(error)); } while (n < 0 && errno == EINTR);
+            do { n = write(errors[1], failure, sizeof(failure)); } while (n < 0 && errno == EINTR);
             _exit(127);
         };
-        if (setpgid(0, p_->leader) < 0) fail();
-        if (!opts.working_dir.empty() && chdir(opts.working_dir.c_str()) < 0) fail();
+        if (setpgid(0, p_->leader) < 0) fail(0);
+        if (!opts.working_dir.empty() && chdir(opts.working_dir.c_str()) < 0) fail(1);
         if (!opts.log_path.empty()) {
             const int fd = open(opts.log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd < 0) fail();
-            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) fail();
+            if (fd < 0) fail(2);
+            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) fail(3);
             close(fd);
         }
 #ifdef __linux__
@@ -314,20 +314,24 @@ ProcessId ProcessGroup::spawn(const std::string& program,
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(opts.pin.cpu, &set);
-            if (sched_setaffinity(0, sizeof(set), &set) < 0) fail();
+            if (sched_setaffinity(0, sizeof(set), &set) < 0) fail(4);
         }
 #endif
         execvp(program.c_str(), argv.data());
-        fail();
+        fail(5);
     }
     close(errors[1]);
-    setpgid(pid, p_->leader);
-    int error = 0;
+    // The child establishes its group before exec closes the error pipe.
+    // Waiting for that handshake avoids racing a second setpgid in the parent.
+    int failure[2] = {EIO, 0};
     ssize_t n;
-    do { n = read(errors[0], &error, sizeof(error)); } while (n < 0 && errno == EINTR);
+    do { n = read(errors[0], failure, sizeof(failure)); } while (n < 0 && errno == EINTR);
     close(errors[0]);
     if (n != 0) {
-        p_->error = std::string("spawn: ") + std::strerror(n > 0 ? error : errno);
+        const char* operations[] = {"setpgid", "chdir", "open log", "dup2", "sched_setaffinity", "execvp"};
+        p_->error = n == sizeof(failure)
+            ? std::string("spawn ") + operations[failure[1]] + ": " + std::strerror(failure[0])
+            : std::string("spawn: ") + std::strerror(n < 0 ? errno : EIO);
         kill(pid, SIGKILL);
         reap_until(pid, std::chrono::steady_clock::now() + std::chrono::seconds(2));
         return 0;

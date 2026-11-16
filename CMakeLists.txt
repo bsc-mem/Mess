@@ -60,11 +60,8 @@ set(MESS_BACKEND_SRCS ${MESS_VTUNE_SRCS})
 if(MESS_PLATFORM_WINDOWS)
     list(APPEND MESS_BACKEND_SRCS ${MESS_WINDOWS_ONLY_SRCS})
 else()
-    set(MESS_SAMPLER_SRCS ${MESS_POSIX_ONLY_SRCS})
-    list(FILTER MESS_SAMPLER_SRCS INCLUDE REGEX "/instruction_samplers/")
     list(APPEND MESS_SRCS ${MESS_SAMPLER_SRCS})
-    list(APPEND MESS_BACKEND_SRCS ${MESS_POSIX_ONLY_SRCS})
-    list(FILTER MESS_BACKEND_SRCS EXCLUDE REGEX "/instruction_samplers/")
+    list(APPEND MESS_BACKEND_SRCS ${MESS_POSIX_BACKEND_SRCS})
 endif()
 
 
@@ -89,8 +86,11 @@ set_target_properties(mess_arch PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(mess_backends OBJECT ${MESS_BACKEND_SRCS})
 target_link_libraries(mess_backends PUBLIC mess_build_options mess_platform)
 
-add_executable(mess ${MESS_SRCS})
-target_link_libraries(mess PRIVATE mess_arch mess_lib mess_platform mess_backends)
+add_library(mess_core OBJECT ${MESS_SRCS})
+target_link_libraries(mess_core PUBLIC mess_build_options mess_platform)
+
+add_executable(mess Mess.cpp)
+target_link_libraries(mess PRIVATE mess_core mess_arch mess_lib mess_platform mess_backends)
 
 add_executable(generate_code ${MESS_GC_SRCS})
 target_link_libraries(generate_code PRIVATE mess_arch mess_lib mess_platform)
@@ -101,6 +101,8 @@ target_link_libraries(mess-profiler PRIVATE mess_arch mess_lib mess_platform mes
 set_source_files_properties(
     src/measurement/CpuFrequencyProbe.cpp
     src/measurement/PointerChaseTiming.cpp
+    src/measurement/UprofParser.cpp
+    src/gpu/GpuMeasurement.cpp
     PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
 )
 
@@ -108,12 +110,9 @@ include(CTest)
 if(BUILD_TESTING AND EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
     include("${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
 endif()
-set_source_files_properties(src/measurement/UprofParser.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 # Kernel generation is explicit: it detects/calibrates the machine on which it runs.
 if(NOT CMAKE_CROSSCOMPILING)
     add_custom_target(kernels COMMAND $<TARGET_FILE:generate_code>
         DEPENDS generate_code USES_TERMINAL VERBATIM)
 endif()
-
-set_source_files_properties(src/gpu/GpuMeasurement.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")

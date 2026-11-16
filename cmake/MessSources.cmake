@@ -37,13 +37,13 @@ set(MESS_LIB_SRCS
 )
 
 set(MESS_CORE_SRCS
-    Mess.cpp
     src/SystemDetection.cpp
     src/BenchmarkConfig.cpp
     src/CliParser.cpp
     src/KernelGenerator.cpp
     src/measurement/MeasurementStorage.cpp
     src/measurement/TrafficGenArrayCalibrator.cpp
+    src/measurement/CasSizeCalibrator.cpp
     src/measurement/LatencyMeasurer.cpp
     src/measurement/BurstCompletion.cpp
     src/measurement/OutlierDetector.cpp
@@ -71,12 +71,15 @@ set(MESS_CORE_SRCS
     src/CurveTracer.cpp
 )
 
-set(MESS_POSIX_ONLY_SRCS
+set(MESS_POSIX_BACKEND_SRCS
     src/measurement/PerfStatCsv.cpp
     src/measurement/bw_measurers/PerfBandwidthMeasurer.cpp
     src/measurement/bw_measurers/LikwidBandwidthMeasurer.cpp
     src/measurement/bw_measurers/PcmBandwidthMeasurer.cpp
     src/measurement/bw_measurers/IOReportBandwidthMeasurer.cpp
+)
+
+set(MESS_SAMPLER_SRCS
     src/measurement/instruction_samplers/IntelPebsSampler.cpp
     src/measurement/instruction_samplers/ArmSpeSampler.cpp
 )
@@ -167,6 +170,7 @@ set(MESS_PROFILER_SRCS
     src/BenchmarkConfig.cpp
     src/measurement/MeasurementUtils.cpp
     src/measurement/BandwidthMeasurerFactory.cpp
+    src/measurement/CasSizeCalibrator.cpp
     src/measurement/MeasurementStorage.cpp
     src/process/TrafficGenProcessManager.cpp
     src/profiler/ProcessBinding.cpp

@@ -100,7 +100,7 @@ enum class MeasurerType {
     PCM,
     IOREPORT,
     IMC,
-    UPROF
+    UPROF,
 };
 
 std::string measurer_type_to_string(MeasurerType type);
@@ -151,6 +151,7 @@ struct BandwidthCounterSelection {
     bool perf_available = false;
     bool cross_socket = false;
     std::string failure_reason;
+    bool fatal_discovery_failure = false;
 
     CounterType type = CounterType::CAS_COUNT;
 
@@ -164,6 +165,12 @@ struct BandwidthCounterSelection {
     std::string get_popen_events_string() const;
     bool is_valid() const;
 };
+
+inline bool is_pcm_cxl_selection(const BandwidthCounterSelection& selection) {
+    const auto& cas = selection.cas;
+    return (!cas.read_events.empty() && cas.read_events[0].find("pcm_cxl/") != std::string::npos) ||
+           (!cas.write_events.empty() && cas.write_events[0].find("pcm_cxl/") != std::string::npos);
+}
 
 /**
  * @brief Classifies parsed event values into read, write, combined, or extra buckets.
@@ -204,6 +211,9 @@ public:
 
     bool is_hbm() const { return is_hbm_; }
     bool needs_upi() const { return selection_.type == CounterType::UPI_FLITS; }
+    bool needs_cas_size_calibration() const;
+    CasCounterSelection cas_size_calibration_counters() const;
+    void set_bytes_per_cas(int bytes_per_cas) { selection_.cas.bytes_per_cas = bytes_per_cas; }
 
     MeasurerType get_resolved_measurer_type() const { return resolved_measurer_type_; }
     MeasurerType get_requested_measurer_type() const { return requested_measurer_type_; }

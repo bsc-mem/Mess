@@ -37,7 +37,12 @@
 #include "measurement/WorkerReadiness.h"
 #include "architecture/ArchitectureRegistry.h"
 #include "architecture/BandwidthCounterStrategy.h"
+#include "measurement/BandwidthStabilizer.h"
 #include "Utils.h"
+
+#include <chrono>
+#include <iostream>
+#include <thread>
 
 BandwidthMeasurer::BandwidthMeasurer(const BenchmarkConfig& config, const system_info& sys_info, const CPUCapabilities& caps, MeasurementStorage* storage, TrafficGenProcessManager* traffic_gen_manager, std::function<std::vector<int>()> numa_resolver, ExecutionMode mode)
     : config_(config),
@@ -75,41 +80,79 @@ double BandwidthMeasurer::calculate_bandwidth_gbps(long long cas_rd, long long c
     return (cas_rd + cas_wr) * cache_line_size * scaling_factor / (elapsed_s * 1e9);
 }
 
-void BandwidthMeasurer::ensure_scaling_factor_cached() const {
-    if (scaling_factor_initialized_) return;
-    scaling_factor_initialized_ = true;
-    
-    if (counter_selection_.type == CounterType::UPI_FLITS) {
+void BandwidthMeasurer::set_counter_selection(const BandwidthCounterSelection& selection) {
+    counter_selection_ = selection;
+    cached_scaling_factor_ = 1.0;
+    if (selection.type == CounterType::UPI_FLITS) {
         auto arch = ArchitectureRegistry::instance().getArchitecture(caps_);
         if (arch) {
-            const_cast<BandwidthMeasurer*>(this)->cached_scaling_factor_ = arch->getUpiScalingFactor(caps_);
-        } else {
-            const_cast<BandwidthMeasurer*>(this)->cached_scaling_factor_ = 1.0;
+            cached_scaling_factor_ = arch->getUpiScalingFactor(caps_);
         }
     }
+    if (sys_info_.socket_count > 0 && sys_info_.sockets[0].cache_count > 0) {
+        cached_cache_line_size_ = sys_info_.sockets[0].caches[0].line_size_bytes;
+    }
+    if (selection.cas.uses_read_subtract_formula) {
+        cached_cache_line_size_ = 256;
+    }
+    if (selection.cas.bytes_per_cas > 0) {
+        cached_cache_line_size_ = selection.cas.bytes_per_cas;
+    }
+}
+
+double BandwidthMeasurer::bandwidth_gbps(long long rd, long long wr, double seconds) const {
+    return calculate_bandwidth_gbps(rd, wr, seconds, counter_selection_.type, cached_cache_line_size_, cached_scaling_factor_);
 }
 
 int BandwidthMeasurer::get_traffic_gen_cores() const {
-    int cores = get_default_traffic_gen_cores(sys_info_);
-    int max_cores = sys_info_.sockets[0].core_count - 1;
-
-
-    if (config_.traffic_gen_cores > 0 && config_.traffic_gen_cores <= max_cores) {
-        cores = config_.traffic_gen_cores;
-    }
-    return cores;
+    return get_traffic_gen_worker_count(config_, sys_info_);
 }
 
-bool BandwidthMeasurer::relaunch_traffic_gen(int ratio, int pause, int traffic_gen_cores) {
+TrafficGenHealthChecker BandwidthMeasurer::traffic_gen_health() const {
+    TrafficGenHealthChecker checker;
+    checker.count_running_instances = [this]() -> int {
+        return static_cast<int>(traffic_gen_manager_->traffic_gen_worker_pids().size());
+    };
+    checker.expected_instance_count = get_traffic_gen_cores();
+    return checker;
+}
+
+double BandwidthMeasurer::achievable_peak_gbps(bool remote) const {
+    const int socket_cores = (sys_info_.socket_count > 0) ? sys_info_.sockets[0].core_count : 0;
+    return TheoreticalPeakCalculator::calculate_achievable_peak(caps_, get_traffic_gen_cores(), socket_cores, remote);
+}
+
+BandwidthStabilizer BandwidthMeasurer::make_stabilizer(double peak_gbps, int pause, size_t window, bool allow_forced) {
+    BandwidthStabilizer stabilizer(peak_gbps, pause, traffic_gen_health(), window, 0.05, config_.verbosity, allow_forced);
+    stability_noise_floor_gbps_ = stabilizer.get_noise_floor();
+    return stabilizer;
+}
+
+bool BandwidthMeasurer::ensure_traffic_gen_running(int ratio, int pause, int& relaunch_attempts) {
+    if (traffic_gen_manager_->is_traffic_gen_running(traffic_gen_manager_->active_traffic_gen_pid())) {
+        return true;
+    }
+    if (config_.verbosity >= 2) {
+        std::cout << "    TrafficGen not running, relaunching..." << '\n';
+    }
+    if (!relaunch_traffic_gen(ratio, pause)) {
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    relaunch_attempts++;
+    return true;
+}
+
+bool BandwidthMeasurer::relaunch_traffic_gen(int ratio, int pause) {
     if (!traffic_gen_manager_ || !storage_) {
         return false;
     }
     std::vector<int> traffic_gen_mem_nodes = numa_resolver_ ? numa_resolver_() : std::vector<int>{0};
     std::string traffic_gen_log_file = storage_->traffic_gen_log_file_path(ratio, pause);
-    if (!traffic_gen_manager_->relaunch_traffic_gen(ratio, pause, traffic_gen_cores,
+    if (!traffic_gen_manager_->relaunch_traffic_gen(ratio, pause, get_traffic_gen_cores(),
                                                   traffic_gen_mem_nodes, traffic_gen_log_file, mode_)) {
         traffic_gen_manager_->kill_all_traffic_gen();
         return false;
     }
-    return measurement::wait_for_ready_workers(*traffic_gen_manager_);
+    return measurement::wait_for_ready_workers(*traffic_gen_manager_, 120, cancellation_check_);
 }

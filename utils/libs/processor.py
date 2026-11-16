@@ -36,7 +36,7 @@ import sys
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
-from .parser import parse_bandwidth_file, parse_latency_file, parse_bwlat_file, parse_filename
+from .parser import parse_bandwidth_file, parse_latency_file, parse_filename, iter_bwlat_points
 
 def _file_contains_pcm_cxl_counters(filepath):
     try:
@@ -101,60 +101,12 @@ def process_data(measuring_dir):
                             })
                             lat_data.append(measurement)
     
-    if os.path.exists(measuring_dir):
-        files = os.listdir(measuring_dir)
-        for filename in files:
-            if filename.startswith('bwlat_') and filename.endswith('.txt'):
-                filepath = os.path.join(measuring_dir, filename)
-                rd_percentage, pause = parse_filename(filename)
-                
-                if rd_percentage is not None:
-                    data_points = parse_bwlat_file(filepath, config)
-                    if data_points:
-                        for point in data_points:
-                            bw_metrics = {
-                                'bandwidth': point['bandwidth'],
-                                'rd_percentage': rd_percentage,
-                                'pause': pause
-                            }
-                            lat_metrics = {
-                                'latency': point['latency'],
-                                'rd_percentage': rd_percentage,
-                                'pause': pause
-                            }
-                            bw_data.append(bw_metrics)
-                            lat_data.append(lat_metrics)
-    curves_dir = os.path.join(measuring_dir, 'curves')
-    if os.path.exists(curves_dir):
-        files = os.listdir(curves_dir)
-        for filename in files:
-            if filename.startswith('bwlat_') and filename.endswith('.txt'):
-                filepath = os.path.join(curves_dir, filename)
-                rd_percentage, pause = parse_filename(filename)
-                
-                if rd_percentage is not None:
-                    data_points = parse_bwlat_file(filepath, config)
-                    if data_points:
-                        for point in data_points:
-                            bw_metrics = {
-                                'bandwidth': point['bandwidth'],
-                                'rd_percentage': rd_percentage,
-                                'pause': pause
-                            }
-                            lat_metrics = {
-                                'latency': point['latency'],
-                                'rd_percentage': rd_percentage,
-                                'pause': pause
-                            }
-                            bw_data.append(bw_metrics)
-                            lat_data.append(lat_metrics)
-    
+    for rd_percentage, pause, point in iter_bwlat_points(measuring_dir, config):
+        bw_data.append({'bandwidth': point['bandwidth'], 'rd_percentage': rd_percentage, 'pause': pause})
+        lat_data.append({'latency': point['latency'], 'rd_percentage': rd_percentage, 'pause': pause})
+
     df_bw = pd.DataFrame(bw_data) if bw_data else pd.DataFrame()
     df_lat = pd.DataFrame(lat_data) if lat_data else pd.DataFrame()
-    if not df_lat.empty and 'latency' in df_lat.columns:
-        df = pd.concat([df_bw, df_lat[['latency']]], axis=1)
-    else:
-        df = df_bw.copy()
 
     if is_intel_pcm:
         config['IS_INTEL_PCM'] = 'true'

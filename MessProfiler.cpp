@@ -39,6 +39,7 @@
 #include "BenchmarkConfig.h"
 #include "profiler/ProfilerConfig.h"
 #include "profiler/ProcessBinding.h"
+#include "measurement/CasSizeCalibrator.h"
 #include "Utils.h"
 #include "platform/Console.h"
 #include "utils/SubprocessCapture.h"
@@ -510,6 +511,12 @@ ProfetResolution resolve_profet_counters() {
     return resolution;
 }
 
+std::vector<int> cas_calibration_cpus(const ProfilerConfig& config, const system_info& sys_info) {
+    if (!config.cpu_list.empty()) return std::vector<int>(config.cpu_list.begin(), config.cpu_list.end());
+    const int cores = sys_info.socket_count > 0 ? sys_info.sockets[0].core_count : 1;
+    return select_worker_cpus(std::max(1, cores), -1);
+}
+
 int detect_cache_line_size(const system_info& sys_info) {
     if (sys_info.socket_count > 0) {
         for (int s = 0; s < sys_info.socket_count; ++s) {
@@ -639,10 +646,21 @@ int main(int argc, char* argv[]) {
     strategy.set_memory_type(caps.memory_type);
     strategy.initialize(representative_cpu, target_mem_nodes, caps);
 
+    if (strategy.needs_cas_size_calibration()) {
+        if (prof_config.target_pid > 0) {
+            std::cerr << "  HBM bytes per CAS: using default " << strategy.get_selection().cas.bytes_per_cas
+                      << " (not calibrated while attached to a running process)\n";
+        } else {
+            std::cerr << "  Measuring HBM bytes per CAS...\n" << std::flush;
+            const CasSizeCalibration calibration = calibrate_strategy_cas_size(strategy, cas_calibration_cpus(prof_config, sys_info), target_mem_nodes);
+            std::cerr << "  " << describe_cas_size_calibration(calibration, strategy.get_selection().cas.bytes_per_cas) << '\n';
+        }
+    }
+
     BandwidthCounterSelection selection = strategy.get_selection();
     selection.extra_counters = prof_config.profet_counters;
 
-    const int cache_line_size = detect_cache_line_size(sys_info);
+    const int cache_line_size = selection.cas.bytes_per_cas > 0 ? selection.cas.bytes_per_cas : detect_cache_line_size(sys_info);
 
     if (prof_config.dry_run) {
         std::cout << "=== Mess Profiler - Dry Run ===\n\n";

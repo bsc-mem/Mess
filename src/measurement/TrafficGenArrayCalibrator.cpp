@@ -218,6 +218,7 @@ uint64_t TrafficGenArrayCalibrator::capacity_elements(
     return candidates.back();
 }
 
+
 TrafficGenArrayCalibrationResult TrafficGenArrayCalibrator::run(
     const std::vector<uint64_t>& candidates,
     ProbeFn probe) const {
@@ -295,3 +296,4 @@ TrafficGenArrayCalibrationResult TrafficGenArrayCalibrator::run(
 
     return result;
 }
+

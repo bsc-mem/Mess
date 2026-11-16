@@ -39,6 +39,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -239,7 +240,7 @@ int socket_of_node(int node) {
     }
 
     std::string cpulist;
-    if (!file_utils::read_string_file(node_path(node) + "/cpulist", cpulist)) return -1;
+    if (!file_utils::read_first_line(node_path(node) + "/cpulist", cpulist)) return -1;
     trim(cpulist);
 
     const int first_cpu = parse_first_cpu_in_list(cpulist);
@@ -254,6 +255,22 @@ int socket_of_node(int node) {
     (void)node;
     return -1;
 #endif
+}
+
+int socket_of_memory_node(int node) {
+    const int socket = socket_of_node(node);
+    if (socket >= 0) return socket;
+    int nearest_socket = -1;
+    int nearest_distance = std::numeric_limits<int>::max();
+    for (int cpu_node : list_nodes()) {
+        const int cpu_socket = socket_of_node(cpu_node);
+        const int d = distance(node, cpu_node);
+        if (cpu_socket >= 0 && d >= 0 && d < nearest_distance) {
+            nearest_distance = d;
+            nearest_socket = cpu_socket;
+        }
+    }
+    return nearest_socket;
 }
 
 std::set<int> list_nodes(int max_index) {

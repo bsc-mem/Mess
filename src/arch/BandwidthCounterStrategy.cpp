@@ -35,6 +35,7 @@
 
 #include "architecture/BandwidthCounterStrategy.h"
 #include "architecture/ArchitectureRegistry.h"
+#include "platform/Fs.h"
 #include "platform/Sys.h"
 #include "SystemDetection.h"
 #include "Utils.h"
@@ -87,6 +88,8 @@ MeasurerType string_to_measurer_type(const std::string& str) {
 
 namespace {
 
+constexpr int kIntelHbmBytesPerCas = 32;
+
 std::string join_events(const std::vector<std::string>& events, const std::string& sep = ",") {
     std::string result;
     for (size_t i = 0; i < events.size(); ++i) {
@@ -110,21 +113,16 @@ bool has_usable_bandwidth_counters(const BandwidthCounterSelection& selection) {
     }
 }
 
+bool is_intel_hbm_selector(const std::string& event) {
+    return string_utils::contains_ci(event, "uncore_hbm") || string_utils::contains_ci(event, "uncore_type_14_");
+}
+
 bool selection_uses_perf_hbm(const BandwidthCounterSelection& selection) {
     if (selection.type != CounterType::CAS_COUNT) {
         return false;
     }
-    for (const auto& event : selection.cas.read_events) {
-        if (string_utils::contains_ci(event, "uncore_hbm_") || string_utils::contains_ci(event, "uncore_type_14_")) {
-            return true;
-        }
-    }
-    for (const auto& event : selection.cas.write_events) {
-        if (string_utils::contains_ci(event, "uncore_hbm_") || string_utils::contains_ci(event, "uncore_type_14_")) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(selection.cas.read_events.begin(), selection.cas.read_events.end(), is_intel_hbm_selector) ||
+           std::any_of(selection.cas.write_events.begin(), selection.cas.write_events.end(), is_intel_hbm_selector);
 }
 
 void append_unique_events(std::vector<std::string>& target, const std::vector<std::string>& extra) {
@@ -133,6 +131,22 @@ void append_unique_events(std::vector<std::string>& target, const std::vector<st
             target.push_back(event);
         }
     }
+}
+
+bool perf_binary_available() {
+    static const bool available = platform::which("perf").has_value();
+    return available;
+}
+
+CasCounterSelection read_write_selection(std::vector<std::string> reads, std::vector<std::string> writes) {
+    CasCounterSelection selection;
+    selection.perf_available = true;
+    selection.has_read_write = true;
+    selection.has_combined_counter = false;
+    selection.requires_channel_aggregation = reads.size() > 1;
+    selection.read_events = std::move(reads);
+    selection.write_events = std::move(writes);
+    return selection;
 }
 
 bool has_vtune_binary_available() {
@@ -166,38 +180,8 @@ bool perf_event_probe_succeeds(const std::string& events) {
            output.find("<not supported>") == std::string::npos;
 }
 
-std::string intel_hbm_type14_event(const std::string& pmu_name, const char* umask, const std::string& label) {
-    return pmu_name + "/event=0x05,umask=" + umask + ",name=" + label + "/";
-}
-
-std::string pick_canonical_alias(std::vector<std::string> candidates, const std::string& canonical) {
-    std::sort(candidates.begin(), candidates.end());
-    for (const auto& candidate : candidates) {
-        if (string_utils::contains_ci(candidate, canonical)) {
-            return candidate;
-        }
-    }
-    return candidates.front();
-}
-
-bool discover_hbm_alias_events(const std::vector<std::string>& pmus,
-                               std::vector<std::string>& read_events,
-                               std::vector<std::string>& write_events) {
-    auto is_cas = [](const std::string& event, const char* a, const char* b) {
-        return string_utils::contains_ci(event, "cas") && (string_utils::contains_ci(event, a) || string_utils::contains_ci(event, b));
-    };
-    for (const auto& pmu : pmus) {
-        const auto reads = pmu_sysfs::list_events(pmu, [&](const std::string& e) { return is_cas(e, "rd", "read"); });
-        const auto writes = pmu_sysfs::list_events(pmu, [&](const std::string& e) { return is_cas(e, "wr", "write"); });
-        if (reads.empty() || writes.empty()) {
-            read_events.clear();
-            write_events.clear();
-            return false;
-        }
-        read_events.push_back(pick_canonical_alias(reads, "cas_count_rd"));
-        write_events.push_back(pick_canonical_alias(writes, "cas_count_wr"));
-    }
-    return !read_events.empty() && read_events.size() == write_events.size();
+std::string intel_hbm_cas_event(const std::string& pmu, const char* umask, const std::string& label) {
+    return pmu + "/event=0x05,umask=" + umask + ",name=" + label + "/";
 }
 
 std::vector<std::string> scan_pmu_event_dir(const std::string& pmu_name,
@@ -373,6 +357,7 @@ void BandwidthCounterStrategy::initialize(int src_cpu, const std::vector<int>& t
     if (arch) {
         delegate_strategy_ = arch->createCounterStrategy(caps);
     }
+
 
     if (caps.isAppleSilicon()) {
         selection_ = BandwidthCounterSelection{};
@@ -579,6 +564,15 @@ std::string BandwidthCounterStrategy::get_tool_name() const {
     }
 }
 
+bool BandwidthCounterStrategy::needs_cas_size_calibration() const {
+    const bool cas_measurer = resolved_measurer_type_ == MeasurerType::PERF || resolved_measurer_type_ == MeasurerType::LIKWID;
+    return initialized_ && is_hbm_ && cached_is_intel_cpu_ && cas_measurer && selection_.type == CounterType::CAS_COUNT;
+}
+
+CasCounterSelection BandwidthCounterStrategy::cas_size_calibration_counters() const {
+    return selection_uses_perf_hbm(selection_) ? selection_.cas : discoverIntelHbmFromPerf();
+}
+
 std::string BandwidthCounterStrategy::get_measurer_name() const {
     return measurer_type_to_string(resolved_measurer_type_);
 }
@@ -635,6 +629,7 @@ void BandwidthCounterStrategy::print_counter_info(std::ostream& out) const {
         case MeasurerType::PCM:
             out << "  PCM Counters: (CXL support via Intel PCM)" << std::endl;
             break;
+
         case MeasurerType::IOREPORT:
             out << "IOReport Counters (Apple Silicon AMC):" << std::endl;
             if (selection_.cas.has_read_write) {
@@ -963,68 +958,56 @@ std::string CasCounterSelection::get_popen_events_string() const {
 
 CasCounterSelection BandwidthCounterStrategy::discoverIntelHbmFromPerf() {
     CasCounterSelection selection;
-    if (!run_command_success("which perf > /dev/null 2>&1")) {
+    if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
+        return selection;
+    }
+
+    const std::vector<std::string> named_pmus = find_pmu_instances("uncore_hbm");
+    const std::vector<std::string> type14_pmus = find_pmu_instances("uncore_type_14");
+    if (named_pmus.empty() && type14_pmus.empty()) {
+        selection.failure_reason = "Intel HBM PMUs are not exposed by the kernel";
         return selection;
     }
 
     std::vector<std::string> read_events;
     std::vector<std::string> write_events;
 
-    const std::vector<std::string> named_hbm_pmus = find_pmu_instances("uncore_hbm");
-    bool found_hbm_pmus = !named_hbm_pmus.empty();
-    if (found_hbm_pmus) {
-        discover_hbm_alias_events(named_hbm_pmus, read_events, write_events);
-    }
-
-    if (read_events.empty() || write_events.empty()) {
-        read_events.clear();
-        write_events.clear();
-
-        const std::vector<std::string> type14_pmus = find_pmu_instances("uncore_type_14");
-        found_hbm_pmus = found_hbm_pmus || !type14_pmus.empty();
-        read_events.reserve(type14_pmus.size());
-        write_events.reserve(type14_pmus.size());
-
-        for (size_t i = 0; i < type14_pmus.size(); ++i) {
-            const std::string tag = "hbm" + std::to_string(i);
-            read_events.push_back(intel_hbm_type14_event(type14_pmus[i], "0xcf", tag + "_rd"));
-            write_events.push_back(intel_hbm_type14_event(type14_pmus[i], "0xf0", tag + "_wr"));
-        }
-
-        if (!read_events.empty()) {
-            selection.bytes_per_cas = 32;
+    if (!named_pmus.empty()) {
+        read_events = {intel_hbm_cas_event("uncore_hbm", "0xcf", "hbm_rd")};
+        write_events = {intel_hbm_cas_event("uncore_hbm", "0xf0", "hbm_wr")};
+        if (!perf_event_probe_succeeds(read_events.front() + "," + write_events.front())) {
+            read_events.clear();
+            write_events.clear();
         }
     }
 
-    if (read_events.empty() || write_events.empty()) {
-        selection.failure_reason = found_hbm_pmus
-            ? "Intel HBM PMUs are exposed but no perf CAS_COUNT read/write events were found"
-            : "Intel HBM PMUs are not exposed by the kernel";
+    if (read_events.empty() && !type14_pmus.empty()) {
+        const size_t suffix_pos = std::string("uncore_type_14_").size();
+        for (const auto& pmu : type14_pmus) {
+            const std::string tag = "hbm" + pmu.substr(suffix_pos);
+            read_events.push_back(intel_hbm_cas_event(pmu, "0xcf", tag + "_rd"));
+            write_events.push_back(intel_hbm_cas_event(pmu, "0xf0", tag + "_wr"));
+        }
+        if (!perf_event_probe_succeeds(join_events(read_events) + "," + join_events(write_events))) {
+            read_events.clear();
+            write_events.clear();
+        }
+    }
+
+    if (read_events.empty()) {
+        selection.failure_reason = "Intel HBM PMUs are present but perf cannot open the HBM CAS events";
         return selection;
     }
 
-    std::vector<std::string> probe_events;
-    probe_events.reserve(read_events.size() + write_events.size());
-    probe_events.insert(probe_events.end(), read_events.begin(), read_events.end());
-    probe_events.insert(probe_events.end(), write_events.begin(), write_events.end());
-    if (!perf_event_probe_succeeds(join_events(probe_events))) {
-        selection.failure_reason = "Intel HBM PMUs are present but perf cannot open all CAS_COUNT events";
-        return selection;
-    }
-
-    selection.perf_available = true;
-    selection.read_events = std::move(read_events);
-    selection.write_events = std::move(write_events);
-    selection.has_read_write = true;
-    selection.has_combined_counter = false;
-    selection.requires_channel_aggregation = true;
+    selection = read_write_selection(std::move(read_events), std::move(write_events));
+    selection.bytes_per_cas = kIntelHbmBytesPerCas;
     return selection;
 }
 
 CasCounterSelection BandwidthCounterStrategy::discoverIntelConsumerImcFromPerf() {
     CasCounterSelection selection;
-    if (!run_command_success("which perf > /dev/null 2>&1")) {
+    if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
         return selection;
     }
@@ -1068,18 +1051,12 @@ CasCounterSelection BandwidthCounterStrategy::discoverIntelConsumerImcFromPerf()
         return selection;
     }
 
-    selection.perf_available = true;
-    selection.read_events = std::move(read_events);
-    selection.write_events = std::move(write_events);
-    selection.has_read_write = true;
-    selection.has_combined_counter = false;
-    selection.requires_channel_aggregation = (selection.read_events.size() > 1);
-    return selection;
+    return read_write_selection(std::move(read_events), std::move(write_events));
 }
 
 CasCounterSelection BandwidthCounterStrategy::discoverAmdUmcFromPerf() {
     CasCounterSelection selection;
-    if (!run_command_success("which perf > /dev/null 2>&1")) {
+    if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
         return selection;
     }
@@ -1136,13 +1113,7 @@ CasCounterSelection BandwidthCounterStrategy::discoverAmdUmcFromPerf() {
             continue;
         }
 
-        selection.perf_available = true;
-        selection.read_events = std::move(candidate.first);
-        selection.write_events = std::move(candidate.second);
-        selection.has_read_write = true;
-        selection.has_combined_counter = false;
-        selection.requires_channel_aggregation = (selection.read_events.size() > 1);
-        return selection;
+        return read_write_selection(std::move(candidate.first), std::move(candidate.second));
     }
 
     selection.failure_reason = "amd_umc PMUs are present but perf cannot open umc_cas_cmd read/write events";
@@ -1151,7 +1122,7 @@ CasCounterSelection BandwidthCounterStrategy::discoverAmdUmcFromPerf() {
 
 CasCounterSelection BandwidthCounterStrategy::discoverFromPerf() {
     CasCounterSelection selection;
-    if (!run_command_success("which perf > /dev/null 2>&1")) {
+    if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
         return selection;
     }
@@ -1823,7 +1794,7 @@ std::vector<std::string> BandwidthCounterStrategy::extractUpiFlitEventsFromVtune
 
 UpiFlitSelection BandwidthCounterStrategy::discoverUpiFlitsFromPerf() {
     UpiFlitSelection selection;
-    if (!run_command_success("which perf > /dev/null 2>&1")) {
+    if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
         return selection;
     }
@@ -2021,6 +1992,7 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
         strategy->set_measurer_type(measurer_type);
     }
 
+
     bool has_remote_target = false;
     bool has_local_target = false;
     for (int node : target_mem_nodes) {
@@ -2055,6 +2027,9 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
     }
 
     if (measurer_type == MeasurerType::LIKWID) {
+        if (strategy && strategy->is_hbm() && strategy->cached_is_intel_cpu_) {
+            selection.cas.bytes_per_cas = kIntelHbmBytesPerCas;
+        }
         return selection;
     }
 
@@ -2063,7 +2038,7 @@ BandwidthCounterSelection BandwidthCounterStrategy::discoverBandwidthCounters(Ba
             selection.failure_reason = "vtune binary not found";
             return selection;
         }
-    } else if (!run_command_success("which perf > /dev/null 2>&1")) {
+    } else if (!perf_binary_available()) {
         selection.failure_reason = "perf binary not found";
         return selection;
     }
